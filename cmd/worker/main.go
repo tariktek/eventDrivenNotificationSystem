@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/breaker"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/callback"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
@@ -95,12 +96,13 @@ func run() error {
 		return nil
 	})
 
+	id := workerID(cfg.Worker.ID)
 	urls := map[domain.Channel]string{}
 	for _, ch := range domain.Channels {
 		urls[ch] = cfg.Provider.URLFor(string(ch))
 	}
 	w := worker.New(worker.Config{
-		ID:            workerID(cfg.Worker.ID),
+		ID:            id,
 		Channels:      domain.Channels,
 		Concurrency:   cfg.Worker.Concurrency,
 		BatchSize:     cfg.Worker.BatchSize,
@@ -151,6 +153,26 @@ func run() error {
 			PruneInterval: cfg.Outbox.PruneInterval,
 		}, log)
 
+	// Status callbacks: one consumer group shared by all workers turns
+	// final-status events into callback_deliveries rows; dispatchers on
+	// every worker send them.
+	enqueuer := &callback.Enqueuer{Store: store}
+	callbackEvents := events.NewGroup(rdb, events.GroupConfig{
+		Stream: cfg.Events.Stream, Group: "callbacks", Consumer: id,
+		Count: 100, Block: 5 * time.Second, MinIdle: 30 * time.Second, RetryEvery: time.Second, Log: log,
+	})
+	callbacks := callback.NewDispatcher(store, callback.DispatcherConfig{
+		Client: callback.ClientConfig{
+			Timeout: cfg.Callback.Timeout, AllowInsecure: cfg.Callback.AllowInsecure, AllowPrivate: cfg.Callback.AllowPrivate,
+		},
+		Secret:       []byte(cfg.Callback.SigningSecret),
+		Concurrency:  cfg.Callback.Concurrency,
+		MaxAttempts:  cfg.Callback.MaxAttempts,
+		Backoff:      retry.Policy{Base: cfg.Callback.RetryBaseDelay, Max: cfg.Callback.RetryMaxDelay},
+		Lease:        cfg.Callback.Lease,
+		PollInterval: cfg.Callback.PollInterval,
+	}, log)
+
 	// The worker has no public API; this small "ops" server exposes probes
 	// (and, later, Prometheus metrics) for the orchestrator.
 	mux := http.NewServeMux()
@@ -163,6 +185,8 @@ func run() error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return w.Run(gctx) })
 	g.Go(func() error { relay.Run(gctx); return nil })
+	g.Go(func() error { callbackEvents.Run(gctx, enqueuer.Handle); return nil })
+	g.Go(func() error { callbacks.Run(gctx); return nil })
 	g.Go(func() error {
 		log.Info("ops server listening", "addr", cfg.HTTP.Addr)
 		return httpserver.ListenAndServe(gctx, srv, cfg.ShutdownTimeout)

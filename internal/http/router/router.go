@@ -16,6 +16,7 @@ import (
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/idempotency"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/health"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/realtime"
 )
 
 // Deps are the collaborators the routes need.
@@ -28,6 +29,8 @@ type Deps struct {
 	Idempotency    idempotency.Store
 	IdempotencyTTL time.Duration
 	Now            func() time.Time
+	// Realtime serves the WebSocket endpoint; optional.
+	Realtime *realtime.Handler
 }
 
 // idempotentRoutes are the operations whose spec declares the
@@ -67,6 +70,14 @@ func New(d Deps) http.Handler {
 	r.Get("/ready", d.Health.ReadinessHandler())
 	r.Get("/openapi.yaml", docs.SpecHandler())
 	r.Get("/docs", docs.UIHandler())
+
+	// The WebSocket endpoint: authenticated, but no body buffering or
+	// idempotency (it is a long-lived GET).
+	if d.Realtime != nil {
+		d.Realtime.Errors = errs.Write
+		r.With(middleware.QueryAPIKey, middleware.APIKeyAuth(d.APIKeys, errs.Write)).
+			Get("/api/v1/ws", d.Realtime.ServeHTTP)
+	}
 
 	// API routes generated from the OpenAPI spec. Authentication runs first
 	// so unauthenticated requests never reach body parsing or the database.

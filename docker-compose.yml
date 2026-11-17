@@ -27,6 +27,10 @@ x-app: &app
     # callbacks can target containers. Refused when APP_ENV=production.
     CALLBACK_ALLOW_INSECURE: "true"
     CALLBACK_ALLOW_PRIVATE: "true"
+    # Signs status callbacks. The mock provider's /callbacks endpoint
+    # verifies with the same value, so http://mockprovider:9000/callbacks
+    # works as a callback_url out of the box.
+    CALLBACK_SIGNING_SECRET: ${CALLBACK_SIGNING_SECRET:-dev-callback-secret-change-me}
   depends_on:
     postgres:
       condition: service_healthy
@@ -107,6 +111,7 @@ services:
       MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0}
       MOCK_RATE_LIMIT_RATE: ${MOCK_RATE_LIMIT_RATE:-0}
       MOCK_PERMANENT_FAILURE_RATE: ${MOCK_PERMANENT_FAILURE_RATE:-0}
+      MOCK_CALLBACK_SECRET: ${CALLBACK_SIGNING_SECRET:-dev-callback-secret-change-me}
     ports:
       - "9000:9000"
     healthcheck:

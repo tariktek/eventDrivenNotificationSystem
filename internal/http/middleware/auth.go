@@ -56,3 +56,20 @@ func ClientID(ctx context.Context) string {
 	id, _ := ctx.Value(clientKey{}).(string)
 	return id
 }
+
+// QueryAPIKey lets a request carry its API key as the api_key query
+// parameter when it has no X-API-Key header. Only for the WebSocket
+// endpoint: browsers cannot set headers on a WebSocket handshake. Query
+// strings can end up in proxy logs, so headers stay the default
+// everywhere else; this service logs paths without query strings.
+func QueryAPIKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(HeaderAPIKey) == "" {
+			if key := r.URL.Query().Get("api_key"); key != "" {
+				r = r.Clone(r.Context())
+				r.Header.Set(HeaderAPIKey, key)
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}

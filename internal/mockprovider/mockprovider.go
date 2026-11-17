@@ -99,6 +99,11 @@ func (s *Server) reset() {
 
 // Handler exposes the provider and admin endpoints.
 func (s *Server) Handler() http.Handler {
+	return s.Mux()
+}
+
+// Mux returns the endpoints as a mux others can add routes to.
+func (s *Server) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /send", s.send)
 	mux.HandleFunc("GET /admin/stats", s.getStats)

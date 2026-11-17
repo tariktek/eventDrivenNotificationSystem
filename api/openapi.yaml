@@ -54,6 +54,8 @@ tags:
     description: Notifications created together in one request.
   - name: templates
     description: Reusable message templates with `{{.variable}}` placeholders.
+  - name: realtime
+    description: Live status events over WebSocket.
   - name: ops
     description: Health probes for orchestrators. No authentication.
 
@@ -273,6 +275,59 @@ paths:
         "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "422": { $ref: "#/components/responses/ValidationFailed" }
         "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ws:
+    get:
+      tags: [realtime]
+      operationId: streamEvents
+      summary: Live status events over WebSocket
+      description: |
+        Upgrades to a WebSocket that pushes notification events as they
+        happen. Choose what to receive with the query parameters (repeat
+        them for several ids) and change it later by sending:
+
+        ```json
+        {"action": "subscribe", "batch_ids": ["…"], "notification_ids": ["…"], "channels": ["sms"], "all": false}
+        {"action": "unsubscribe", "batch_ids": ["…"]}
+        ```
+
+        Messages from the server:
+
+        ```json
+        {"type": "subscribed", "subscription": {"all": false, "notification_ids": [], "batch_ids": ["…"], "channels": []}}
+        {"type": "event", "event_id": 42, "event_type": "notification.status_changed", "data": {"notification_id": "…", "status": "sent", "previous_status": "processing", "…": "…"}}
+        {"type": "error", "error": "unknown channel \"fax\""}
+        ```
+
+        Event types: `notification.created`, `notification.status_changed`,
+        `batch.completed`. One notification's events always arrive in
+        order. Events carry state, never recipients or content.
+
+        **Subscribe before you create**, or reload the current state over
+        REST after subscribing: events from before the subscription are not
+        replayed. A client that falls too far behind is disconnected with
+        close code `1008` and should reconnect and resync. The server pings
+        every 30 seconds.
+
+        Browsers cannot set headers on a WebSocket, so this endpoint also
+        accepts the API key as the `api_key` query parameter.
+      parameters:
+        - { name: notification_id, in: query, schema: { type: array, items: { type: string, format: uuid } }, explode: true }
+        - { name: batch_id, in: query, schema: { type: array, items: { type: string, format: uuid } }, explode: true }
+        - { name: channel, in: query, schema: { type: array, items: { $ref: "#/components/schemas/Channel" } }, explode: true }
+        - { name: all, in: query, schema: { type: boolean, default: false }, description: Receive every event. }
+        - { name: api_key, in: query, schema: { type: string }, description: "Alternative to the X-API-Key header, for browsers." }
+      responses:
+        "101":
+          description: Switched to the WebSocket protocol.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503":
+          description: The instance has reached its connection limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /api/v1/batches/{id}:
     parameters:
@@ -920,6 +975,7 @@ components:
         - request_in_progress
         - payload_too_large
         - validation_failed
+        - service_unavailable
         - internal_error
 
     FieldError:

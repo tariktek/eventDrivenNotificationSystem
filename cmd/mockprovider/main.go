@@ -25,6 +25,9 @@ type settings struct {
 	PermanentRate float64       `env:"MOCK_PERMANENT_FAILURE_RATE" envDefault:"0"`
 	Latency       time.Duration `env:"MOCK_LATENCY"                envDefault:"20ms"`
 	LatencyJitter time.Duration `env:"MOCK_LATENCY_JITTER"         envDefault:"30ms"`
+	// CallbackSecret verifies status callbacks posted to /callbacks; it
+	// must match the workers' CALLBACK_SIGNING_SECRET.
+	CallbackSecret string `env:"MOCK_CALLBACK_SECRET" envDefault:"dev-callback-secret-change-me"`
 }
 
 func main() {
@@ -51,10 +54,13 @@ func run() error {
 		LatencyJitter: mockprovider.Duration(s.LatencyJitter),
 	}, nil)
 
+	mux := mock.Mux()
+	mockprovider.NewCallbackReceiver([]byte(s.CallbackSecret), nil).Register(mux)
+
 	srv := httpserver.New(config.HTTPConfig{
 		Addr: s.Addr, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second,
 		WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second,
-	}, mock.Handler())
+	}, mux)
 
 	log.Info("mock provider listening", "addr", s.Addr,
 		"failure_rate", s.FailureRate, "rate_limit_rate", s.RateLimitRate, "permanent_rate", s.PermanentRate)

@@ -46,15 +46,16 @@ func TestLoadFrom_MultipleAPIKeysForRotation(t *testing.T) {
 
 func TestLoadFrom_Overrides(t *testing.T) {
 	cfg, err := config.LoadFrom(map[string]string{
-		"APP_ENV":            "production",
-		"LOG_LEVEL":          "debug",
-		"LOG_FORMAT":         "text",
-		"HTTP_ADDR":          ":9999",
-		"DATABASE_URL":       "postgresql://u:p@db:5432/app",
-		"DATABASE_MAX_CONNS": "50",
-		"REDIS_URL":          "rediss://cache:6380/1",
-		"SHUTDOWN_TIMEOUT":   "45s",
-		"API_KEYS":           "a-production-key-that-is-long-enough",
+		"APP_ENV":                 "production",
+		"LOG_LEVEL":               "debug",
+		"LOG_FORMAT":              "text",
+		"HTTP_ADDR":               ":9999",
+		"DATABASE_URL":            "postgresql://u:p@db:5432/app",
+		"DATABASE_MAX_CONNS":      "50",
+		"REDIS_URL":               "rediss://cache:6380/1",
+		"SHUTDOWN_TIMEOUT":        "45s",
+		"API_KEYS":                "a-production-key-that-is-long-enough",
+		"CALLBACK_SIGNING_SECRET": "a-production-signing-secret-long-enough",
 	})
 	require.NoError(t, err)
 
@@ -100,6 +101,9 @@ func TestLoadFrom_Invalid(t *testing.T) {
 		{"tiny stream", map[string]string{"EVENTS_STREAM_MAX_LEN": "10"}, "EVENTS_STREAM_MAX_LEN"},
 		{"zero outbox batch", map[string]string{"OUTBOX_BATCH_SIZE": "0"}, "OUTBOX_BATCH_SIZE"},
 		{"zero outbox poll", map[string]string{"OUTBOX_POLL_INTERVAL": "0s"}, "OUTBOX_POLL_INTERVAL"},
+		{"dev callback secret in production", map[string]string{"APP_ENV": "production", "API_KEYS": "0123456789abcdef0123456789abcdef"}, "CALLBACK_SIGNING_SECRET"},
+		{"callback lease below timeout", map[string]string{"CALLBACK_TIMEOUT": "10s", "CALLBACK_LEASE": "5s"}, "CALLBACK_LEASE"},
+		{"zero callback attempts", map[string]string{"CALLBACK_MAX_ATTEMPTS": "0"}, "CALLBACK_MAX_ATTEMPTS"},
 		{"zero body limit", map[string]string{"HTTP_MAX_BODY_BYTES": "0"}, "HTTP_MAX_BODY_BYTES"},
 		{"insecure callbacks in production", map[string]string{"APP_ENV": "production", "CALLBACK_ALLOW_PRIVATE": "true"}, "CALLBACK_ALLOW"},
 		// Parse errors come from the env library and name the struct field and

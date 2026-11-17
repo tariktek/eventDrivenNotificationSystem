@@ -10,7 +10,8 @@ generate:
   strict-server: true
   embedded-spec: true
 output-options:
-  # Health probes are hand-written (internal/platform/health) and documented
-  # in the spec only.
+  # Health probes (internal/platform/health) and the WebSocket endpoint
+  # (internal/realtime) are hand-written and documented in the spec only.
   exclude-tags:
     - ops
+    - realtime

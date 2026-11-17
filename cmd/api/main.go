@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/handler"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/router"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
@@ -18,6 +19,7 @@ import (
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/httpserver"
 	pgplatform "github.com/tariktek/eventDrivenNotificationSystem/internal/platform/postgres"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/redisx"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/realtime"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/service"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/validation"
@@ -77,6 +79,14 @@ func run() error {
 	meta := func(ctx context.Context) service.RequestMeta {
 		return service.RequestMeta{CorrelationID: observability.CorrelationID(ctx)}
 	}
+	// Live events: this instance tails the event stream and pushes matching
+	// events to its WebSocket clients.
+	hub := realtime.NewHub(realtime.Config{MaxClients: cfg.WS.MaxClients, BufferSize: cfg.WS.BufferSize}, log)
+	go hub.Run(ctx, func(ctx context.Context, publish func(events.Event)) {
+		events.Tail(ctx, rdb, events.TailConfig{
+			Stream: cfg.Events.Stream, Count: 500, Block: 5 * time.Second, RetryEvery: time.Second, Log: log,
+		}, publish)
+	})
 	routes := router.New(router.Deps{
 		Health:         checks,
 		API:            handler.New(svc, meta),
@@ -86,6 +96,12 @@ func run() error {
 		Idempotency:    store.Idempotency(),
 		IdempotencyTTL: cfg.Auth.IdempotencyTTL,
 		Now:            time.Now,
+		Realtime: &realtime.Handler{
+			Hub:            hub,
+			OriginPatterns: cfg.WS.AllowedOrigins,
+			Log:            log,
+			Shutdown:       ctx,
+		},
 	})
 	srv := httpserver.New(cfg.HTTP, routes)
 

@@ -63,7 +63,22 @@ type TailConfig struct {
 // a Redis error it resumes from the last event it saw, so an outage
 // shorter than the stream's retention loses nothing.
 func Tail(ctx context.Context, rdb redis.UniversalClient, cfg TailConfig, handle func(Event)) {
-	last := "$"
+	// Start after the current last entry. Not "$": every XREAD with "$"
+	// means "after whatever is last now", so events appended between one
+	// read timing out and the next one starting would be skipped.
+	last := ""
+	for ctx.Err() == nil && last == "" {
+		msgs, err := rdb.XRevRangeN(ctx, cfg.Stream, "+", "-", 1).Result()
+		switch {
+		case err != nil:
+			cfg.Log.WarnContext(ctx, "read event stream position", "stream", cfg.Stream, "error", err)
+			sleep(ctx, cfg.RetryEvery)
+		case len(msgs) == 0:
+			last = "0-0" // empty or missing stream: everything that comes is new
+		default:
+			last = msgs[0].ID
+		}
+	}
 	for ctx.Err() == nil {
 		res, err := rdb.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{cfg.Stream, last},

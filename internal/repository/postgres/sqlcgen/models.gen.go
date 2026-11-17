@@ -34,6 +34,8 @@ type CallbackDelivery struct {
 	DeliveredAt    *time.Time
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	EventID        int64
+	Url            string
 }
 
 type IdempotencyKey struct {

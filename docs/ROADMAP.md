@@ -586,9 +586,9 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
 
 ### Faz 4: Event'ler ve gerçek zamanlılık
 - [x] 14. **Outbox ve relay:** Redis Streams publisher, consumer group yönetimi.
-- [ ] 15. **WebSocket hub:** Abonelik, filtreleme, ping/pong, backpressure.
-- [ ] 16. **Status callback'leri:** HMAC imzası, retry, SSRF koruması.
-- [ ] 17. **Scheduled bildirimler:** Uçtan uca test (scheduled → pending → sent ve iptal).
+- [x] 15. **WebSocket hub:** Abonelik, filtreleme, ping/pong, backpressure.
+- [x] 16. **Status callback'leri:** HMAC imzası, retry, SSRF koruması.
+- [x] 17. **Scheduled bildirimler:** Uçtan uca test (scheduled → pending → sent ve iptal).
     - **DoD:** Bir batch gönderildiğinde WebSocket client'ı tüm durum değişikliklerini sırayla görüyor; callback alıcısı imzayı doğrulayabiliyor.
 
 ### Faz 5: Gözlemlenebilirlik

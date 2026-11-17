@@ -42,6 +42,19 @@ type Config struct {
 	Breaker  BreakerConfig  `envPrefix:"BREAKER_"`
 	Events   EventsConfig   `envPrefix:"EVENTS_"`
 	Outbox   OutboxConfig   `envPrefix:"OUTBOX_"`
+	WS       WSConfig       `envPrefix:"WS_"`
+}
+
+// WSConfig tunes the WebSocket endpoint.
+type WSConfig struct {
+	MaxClients int `env:"MAX_CLIENTS" envDefault:"1000"`
+	// BufferSize is how many events may queue for one client before it is
+	// disconnected as too slow.
+	BufferSize int `env:"BUFFER_SIZE" envDefault:"256"`
+	// AllowedOrigins are extra browser origins (host patterns such as
+	// "app.example.com" or "localhost:*"); the API's own host is always
+	// allowed.
+	AllowedOrigins []string `env:"ALLOWED_ORIGINS" envSeparator:","`
 }
 
 // EventsConfig locates the domain event stream.
@@ -166,7 +179,21 @@ type RedisConfig struct {
 type CallbackConfig struct {
 	AllowInsecure bool `env:"ALLOW_INSECURE" envDefault:"false"` // permit http://
 	AllowPrivate  bool `env:"ALLOW_PRIVATE"  envDefault:"false"` // permit localhost/private IPs
+	// SigningSecret keys the HMAC in X-Signature; clients verify with it.
+	SigningSecret  string        `env:"SIGNING_SECRET"   envDefault:"dev-callback-secret-change-me"`
+	Timeout        time.Duration `env:"TIMEOUT"          envDefault:"5s"`
+	MaxAttempts    int           `env:"MAX_ATTEMPTS"     envDefault:"5"`
+	Concurrency    int           `env:"CONCURRENCY"      envDefault:"20"`
+	RetryBaseDelay time.Duration `env:"RETRY_BASE_DELAY" envDefault:"5s"`
+	RetryMaxDelay  time.Duration `env:"RETRY_MAX_DELAY"  envDefault:"10m"`
+	// Lease hides a claimed callback from other workers while it is sent.
+	Lease        time.Duration `env:"LEASE"         envDefault:"1m"`
+	PollInterval time.Duration `env:"POLL_INTERVAL" envDefault:"1s"`
 }
+
+// DevCallbackSecret is the default signing secret for local development;
+// rejected in production.
+const DevCallbackSecret = "dev-callback-secret-change-me" //nolint:gosec // public on purpose; rejected in production
 
 // Load reads configuration from the process environment and validates it.
 func Load() (Config, error) {
@@ -273,6 +300,27 @@ func (c Config) Validate() error {
 	}
 	if c.Outbox.PollInterval <= 0 || c.Outbox.Retention <= 0 || c.Outbox.PruneInterval <= 0 {
 		errs = append(errs, errors.New("OUTBOX_POLL_INTERVAL/OUTBOX_RETENTION/OUTBOX_PRUNE_INTERVAL: must be positive"))
+	}
+
+	if c.WS.MaxClients < 1 || c.WS.BufferSize < 1 {
+		errs = append(errs, errors.New("WS_MAX_CLIENTS/WS_BUFFER_SIZE: must be at least 1"))
+	}
+
+	cb := c.Callback
+	switch {
+	case cb.SigningSecret == "":
+		errs = append(errs, errors.New("CALLBACK_SIGNING_SECRET: must be set"))
+	case c.Env == EnvProduction && (cb.SigningSecret == DevCallbackSecret || len(cb.SigningSecret) < 32):
+		errs = append(errs, errors.New("CALLBACK_SIGNING_SECRET: production secrets must be at least 32 characters and not the development default"))
+	}
+	if cb.Timeout <= 0 || cb.Lease <= cb.Timeout {
+		errs = append(errs, errors.New("CALLBACK_TIMEOUT/CALLBACK_LEASE: need 0 < timeout < lease"))
+	}
+	if cb.MaxAttempts < 1 || cb.MaxAttempts > 20 || cb.Concurrency < 1 {
+		errs = append(errs, errors.New("CALLBACK_MAX_ATTEMPTS/CALLBACK_CONCURRENCY: need 1..20 attempts and concurrency >= 1"))
+	}
+	if cb.RetryBaseDelay <= 0 || cb.RetryMaxDelay < cb.RetryBaseDelay || cb.PollInterval <= 0 {
+		errs = append(errs, errors.New("CALLBACK_RETRY_BASE_DELAY/CALLBACK_RETRY_MAX_DELAY/CALLBACK_POLL_INTERVAL: need 0 < base <= max and a positive poll interval"))
 	}
 
 	if c.Env == EnvProduction && (c.Callback.AllowInsecure || c.Callback.AllowPrivate) {
