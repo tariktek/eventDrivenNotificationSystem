@@ -209,6 +209,54 @@ func (r *Repo) RetryNotification(ctx context.Context, id uuid.UUID, now time.Tim
 	return toNotification(&row)
 }
 
+// DeadLetterFilter selects failed notifications for a bulk retry. Nil
+// fields do not filter; FailedTo is exclusive.
+type DeadLetterFilter struct {
+	Channel    *domain.Channel
+	BatchID    *uuid.UUID
+	ErrorCode  *string
+	FailedFrom *time.Time
+	FailedTo   *time.Time
+}
+
+// RetryFailedNotifications moves up to limit matching failed notifications
+// (oldest first) back to pending with a fresh attempt budget and returns
+// how many it moved.
+func (r *Repo) RetryFailedNotifications(ctx context.Context, f DeadLetterFilter, limit int, now time.Time) (int64, error) {
+	maxRows, err := narrow[int32](limit, "limit")
+	if err != nil {
+		return 0, err
+	}
+	n, err := r.q.RetryFailedNotifications(ctx, sqlcgen.RetryFailedNotificationsParams{
+		Now: now, Channel: channelArg(f.Channel), BatchID: f.BatchID, ErrorCode: f.ErrorCode,
+		FailedFrom: f.FailedFrom, FailedTo: f.FailedTo, MaxRows: maxRows,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("retry failed notifications: %w", err)
+	}
+	return n, nil
+}
+
+// CountFailedNotifications counts the failed notifications matching f.
+func (r *Repo) CountFailedNotifications(ctx context.Context, f DeadLetterFilter) (int64, error) {
+	n, err := r.q.CountFailedNotifications(ctx, sqlcgen.CountFailedNotificationsParams{
+		Channel: channelArg(f.Channel), BatchID: f.BatchID, ErrorCode: f.ErrorCode,
+		FailedFrom: f.FailedFrom, FailedTo: f.FailedTo,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("count failed notifications: %w", err)
+	}
+	return n, nil
+}
+
+func channelArg(c *domain.Channel) *string {
+	if c == nil {
+		return nil
+	}
+	s := string(*c)
+	return &s
+}
+
 // explainNoTransition turns "the conditional UPDATE matched no row" into
 // either ErrNotFound or a TransitionError naming the current status.
 func (r *Repo) explainNoTransition(ctx context.Context, err error, id uuid.UUID, to domain.Status) error {

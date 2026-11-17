@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -317,6 +318,75 @@ func TestCancelAndRetry(t *testing.T) {
 	res = call(t, http.MethodPost, "/api/v1/notifications/"+id+"/retry", nil)
 	require.Equal(t, http.StatusOK, res.Code)
 	assert.Equal(t, "pending", res.json(t)["status"])
+}
+
+// TestRetryFailed_BulkRedrive fails six notifications with different
+// channels, error codes and times, then redrives them by filter.
+func TestRetryFailed_BulkRedrive(t *testing.T) {
+	reset(t)
+	fail := func(ch, code string, at time.Time) string {
+		body := sms()
+		if ch != "sms" {
+			body = map[string]any{"channel": ch, "recipient": "ada@example.com", "subject": "Hi", "content": "Hello"}
+		}
+		id := call(t, http.MethodPost, "/api/v1/notifications", body).json(t)["id"].(string)
+		_, err := pool.Exec(t.Context(), `UPDATE notifications SET status='failed', attempts=5, failed_at=$2, last_error_code=$3 WHERE id=$1`, id, at, code)
+		require.NoError(t, err)
+		return id
+	}
+	outage := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	for range 3 {
+		fail("sms", "http_503", outage.Add(10*time.Minute))
+	}
+	fail("sms", "http_503", outage.Add(-time.Hour)) // before the outage window
+	fail("sms", "http_400", outage.Add(10*time.Minute))
+	fail("email", "http_503", outage.Add(10*time.Minute))
+
+	redrive := func(body map[string]any) map[string]any {
+		t.Helper()
+		res := call(t, http.MethodPost, "/api/v1/notifications/retry-failed", body)
+		require.Equal(t, http.StatusOK, res.Code, "%s", res.Body)
+		return res.json(t)
+	}
+	window := map[string]any{
+		"channel": "sms", "error_code": "http_503",
+		"failed_from": outage.Format(time.RFC3339), "failed_to": outage.Add(time.Hour).Format(time.RFC3339),
+	}
+
+	dry := maps.Clone(window)
+	dry["dry_run"] = true
+	assert.Equal(t, map[string]any{"requeued": 0.0, "remaining": 3.0}, redrive(dry), "dry run only counts")
+	assert.Equal(t, 6, countStatus(t, "failed"))
+
+	page := maps.Clone(window)
+	page["limit"] = 2
+	assert.Equal(t, map[string]any{"requeued": 2.0, "remaining": 1.0}, redrive(page), "capped by limit")
+	assert.Equal(t, map[string]any{"requeued": 1.0, "remaining": 0.0}, redrive(page), "next call takes the rest")
+	assert.Equal(t, 3, countStatus(t, "pending"), "only the outage window's sms/http_503 failures")
+
+	var attempts int
+	require.NoError(t, pool.QueryRow(t.Context(),
+		`SELECT max(attempts) FROM notifications WHERE status='pending'`).Scan(&attempts))
+	assert.Zero(t, attempts, "fresh attempt budget")
+
+	assert.Equal(t, map[string]any{"requeued": 3.0, "remaining": 0.0}, redrive(map[string]any{}), "{} takes every failed one")
+
+	res := call(t, http.MethodPost, "/api/v1/notifications/retry-failed", map[string]any{
+		"channel": "fax", "limit": 0, "error_code": "",
+		"failed_from": outage.Format(time.RFC3339), "failed_to": outage.Format(time.RFC3339),
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, res.Code)
+	assert.ElementsMatch(t, []string{"channel", "limit", "error_code", "failed_to"}, errorFields(t, res))
+
+	res = call(t, http.MethodPost, "/api/v1/notifications/retry-failed", map[string]any{"status": "failed"})
+	assert.Equal(t, http.StatusBadRequest, res.Code, "unknown fields are rejected")
+}
+
+func countStatus(t *testing.T, status string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM notifications WHERE status=$1`, status).Scan(&n))
+	return n
 }
 
 func TestListNotifications(t *testing.T) {

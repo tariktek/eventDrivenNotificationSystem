@@ -1,14 +1,21 @@
 // Package worker delivers queued notifications.
 //
-// Each channel has its own dispatcher, so a slow or rate-limited channel
-// never holds up the others. A dispatcher loop:
+// Each channel has its own dispatcher and circuit breaker, so a slow,
+// rate-limited or failing channel never holds up the others. A dispatcher
+// loop:
 //
 //  1. waits for free delivery capacity (Concurrency per channel);
-//  2. reserves send slots from the rate limiter (≤ Rate per second, shared
+//  2. asks the channel's circuit breaker how much it may send: everything
+//     when closed, nothing when open, a few probes when half-open;
+//  3. reserves send slots from the rate limiter (≤ Rate per second, shared
 //     by every worker instance);
-//  3. claims that many due notifications, highest effective priority first;
-//  4. hands each one a slot: a goroutine waits for the slot time, calls the
+//  4. claims that many due notifications, highest effective priority first;
+//  5. hands each one a slot: a goroutine waits for the slot time, calls the
 //     provider, and records the outcome (sent / retry later / failed).
+//
+// While a breaker is open its channel's notifications stay queued and keep
+// their attempt budget: a provider outage delays them instead of failing
+// them.
 //
 // Around the dispatchers: a heartbeat keeps the leases of in-flight
 // deliveries alive, a reaper recovers work from crashed workers, and an
@@ -23,6 +30,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/breaker"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/provider"
@@ -49,6 +57,8 @@ type Config struct {
 	// ShutdownGrace is how long in-flight provider calls may finish after
 	// shutdown begins. Deliveries still waiting for a slot are released.
 	ShutdownGrace time.Duration
+	// Breaker configures each channel's circuit breaker.
+	Breaker breaker.Config
 }
 
 // Notifier signals when work becomes due on a channel (e.g. PostgreSQL
@@ -72,7 +82,8 @@ type Deps struct {
 type Worker struct {
 	cfg Config
 	Deps
-	wake map[domain.Channel]chan struct{}
+	wake     map[domain.Channel]chan struct{}
+	breakers map[domain.Channel]*breaker.Breaker
 
 	mu       sync.Mutex
 	inflight map[uuid.UUID]struct{}
@@ -83,11 +94,31 @@ func New(cfg Config, d Deps) *Worker {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
-	w := &Worker{cfg: cfg, Deps: d, wake: map[domain.Channel]chan struct{}{}, inflight: map[uuid.UUID]struct{}{}}
+	if cfg.Breaker == (breaker.Config{}) {
+		cfg.Breaker = breaker.DefaultConfig()
+	}
+	w := &Worker{
+		cfg: cfg, Deps: d,
+		wake:     map[domain.Channel]chan struct{}{},
+		breakers: map[domain.Channel]*breaker.Breaker{},
+		inflight: map[uuid.UUID]struct{}{},
+	}
 	for _, ch := range cfg.Channels {
 		w.wake[ch] = make(chan struct{}, 1)
+		w.breakers[ch] = breaker.New(string(ch), cfg.Breaker, func(from, to breaker.State) {
+			w.Log.Warn("circuit breaker state changed", "channel", ch, "from", from, "to", to)
+		})
 	}
 	return w
+}
+
+// BreakerStates reports each channel's circuit breaker state.
+func (w *Worker) BreakerStates() map[domain.Channel]breaker.State {
+	out := make(map[domain.Channel]breaker.State, len(w.breakers))
+	for ch, b := range w.breakers {
+		out[ch] = b.State()
+	}
+	return out
 }
 
 // Run delivers until ctx is cancelled, then shuts down gracefully: stops
@@ -141,6 +172,7 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 		deliveries sync.WaitGroup
 		slots      = make(chan struct{}, w.cfg.Concurrency) // in-flight deliveries
 		freed      = make(chan struct{}, 1)
+		cb         = w.breakers[ch]
 	)
 	defer deliveries.Wait()
 
@@ -150,8 +182,17 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 			waitAny(ctx, freed, nil, w.cfg.PollInterval)
 			continue
 		}
+		want := cb.Capacity(min(free, w.cfg.BatchSize))
+		if want == 0 {
+			// Breaker open (or all half-open probes out): claim nothing, so
+			// queued notifications keep their attempts. Re-check when a
+			// probe finishes or after a poll interval; the breaker moves to
+			// half-open on its own once its timeout passes.
+			waitAny(ctx, freed, nil, w.cfg.PollInterval)
+			continue
+		}
 
-		res, err := w.Limiter.Reserve(ctx, string(ch), min(free, w.cfg.BatchSize))
+		res, err := w.Limiter.Reserve(ctx, string(ch), want)
 		if err != nil {
 			if ctx.Err() == nil {
 				w.Log.ErrorContext(ctx, "reserve send slots", "channel", ch, "error", err)
@@ -188,7 +229,13 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 			continue
 		}
 
+		var rejected []uuid.UUID
 		for i, n := range ns {
+			ticket := cb.Admit()
+			if ticket == nil { // the breaker opened since Capacity
+				rejected = append(rejected, n.ID)
+				continue
+			}
 			slots <- struct{}{}
 			w.track(n.ID, true)
 			at := base.Add(res.Delay(i))
@@ -201,23 +248,36 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 					default:
 					}
 				}()
-				w.deliver(ctx, sendCtx, n, at)
+				w.deliver(ctx, sendCtx, n, at, ticket)
 			})
 		}
+		w.release(sendCtx, rejected)
+	}
+}
+
+// release hands claimed-but-unsent notifications back to the queue with
+// their attempt refunded.
+func (w *Worker) release(ctx context.Context, ids []uuid.UUID) {
+	if len(ids) == 0 {
+		return
+	}
+	if _, err := w.Queue.Release(ctx, w.cfg.ID, ids); err != nil {
+		// The reaper requeues them once their lease expires.
+		w.Log.ErrorContext(ctx, "release unsent notifications", "error", err, "count", len(ids))
 	}
 }
 
 // deliver waits for the notification's send slot, sends it and records the
 // outcome.
-func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, at time.Time) {
+func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, at time.Time, ticket *breaker.Ticket) {
 	logCtx := observability.WithCorrelationID(sendCtx, n.CorrelationID)
 	log := w.Log.With("notification_id", n.ID, "channel", n.Channel, "attempt", n.Attempts)
 
-	if !sleep(ctx, time.Until(at)) {
-		// Shutdown before this delivery started: give it back untouched.
-		if _, err := w.Queue.Release(logCtx, w.cfg.ID, []uuid.UUID{n.ID}); err != nil {
-			log.ErrorContext(logCtx, "release unsent notification", "error", err)
-		}
+	// Not sent yet when shutdown begins or the breaker opens while this
+	// delivery waited for its slot: give it back untouched.
+	if !sleep(ctx, time.Until(at)) || ticket.Open() {
+		ticket.Skip()
+		w.release(logCtx, []uuid.UUID{n.ID})
 		return
 	}
 
@@ -229,6 +289,16 @@ func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, a
 		Content:        n.Content,
 		CorrelationID:  n.CorrelationID,
 	})
+	switch {
+	case sendCtx.Err() != nil:
+		ticket.Skip() // cut off by shutdown; says nothing about the provider
+	case res.Outcome == domain.OutcomeTransientError:
+		ticket.Failure()
+	default:
+		// A permanent error (bad recipient, rejected content) is about the
+		// message, not the provider's health.
+		ticket.Success()
+	}
 	now := w.Now()
 	verdict := w.Policy.Decide(n, &res, now)
 

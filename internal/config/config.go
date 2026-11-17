@@ -39,6 +39,7 @@ type Config struct {
 	Provider ProviderConfig `envPrefix:"PROVIDER_"`
 	Worker   WorkerConfig   `envPrefix:"WORKER_"`
 	Retry    RetryConfig    `envPrefix:"RETRY_"`
+	Breaker  BreakerConfig  `envPrefix:"BREAKER_"`
 }
 
 // WorkerConfig tunes the delivery pipeline.
@@ -65,6 +66,17 @@ type WorkerConfig struct {
 type RetryConfig struct {
 	BaseDelay time.Duration `env:"BASE_DELAY" envDefault:"2s"`
 	MaxDelay  time.Duration `env:"MAX_DELAY"  envDefault:"5m"`
+}
+
+// BreakerConfig tunes the per-channel circuit breaker in front of the
+// provider: it opens when at least MIN_REQUESTS deliveries in WINDOW
+// failed at FAILURE_RATIO or more, and probes again after OPEN_TIMEOUT.
+type BreakerConfig struct {
+	Window       time.Duration `env:"WINDOW"        envDefault:"10s"`
+	MinRequests  int           `env:"MIN_REQUESTS"  envDefault:"20"`
+	FailureRatio float64       `env:"FAILURE_RATIO" envDefault:"0.5"`
+	OpenTimeout  time.Duration `env:"OPEN_TIMEOUT"  envDefault:"30s"`
+	Probes       int           `env:"PROBES"        envDefault:"5"`
 }
 
 // ProviderConfig locates the external notification provider. URL serves
@@ -223,6 +235,16 @@ func (c Config) Validate() error {
 	errs = append(errs, c.Worker.validate()...)
 	if c.Retry.BaseDelay <= 0 || c.Retry.MaxDelay < c.Retry.BaseDelay {
 		errs = append(errs, errors.New("RETRY_BASE_DELAY/RETRY_MAX_DELAY: need 0 < base <= max"))
+	}
+
+	if c.Breaker.Window <= 0 || c.Breaker.OpenTimeout <= 0 {
+		errs = append(errs, errors.New("BREAKER_WINDOW/BREAKER_OPEN_TIMEOUT: must be positive"))
+	}
+	if c.Breaker.MinRequests < 1 || c.Breaker.Probes < 1 {
+		errs = append(errs, errors.New("BREAKER_MIN_REQUESTS/BREAKER_PROBES: must be at least 1"))
+	}
+	if c.Breaker.FailureRatio <= 0 || c.Breaker.FailureRatio > 1 {
+		errs = append(errs, errors.New("BREAKER_FAILURE_RATIO: must be in (0, 1]"))
 	}
 
 	if c.Env == EnvProduction && (c.Callback.AllowInsecure || c.Callback.AllowPrivate) {

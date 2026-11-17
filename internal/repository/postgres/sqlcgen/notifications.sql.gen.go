@@ -84,6 +84,37 @@ func (q *Queries) CancelNotification(ctx context.Context, arg CancelNotification
 	return i, err
 }
 
+const countFailedNotifications = `-- name: CountFailedNotifications :one
+SELECT count(*) FROM notifications
+WHERE status = 'failed'
+  AND ($1::text IS NULL OR channel = $1::text)
+  AND ($2::uuid IS NULL OR batch_id = $2::uuid)
+  AND ($3::text IS NULL OR last_error_code = $3::text)
+  AND ($4::timestamptz IS NULL OR failed_at >= $4::timestamptz)
+  AND ($5::timestamptz IS NULL OR failed_at < $5::timestamptz)
+`
+
+type CountFailedNotificationsParams struct {
+	Channel    *string
+	BatchID    *uuid.UUID
+	ErrorCode  *string
+	FailedFrom *time.Time
+	FailedTo   *time.Time
+}
+
+func (q *Queries) CountFailedNotifications(ctx context.Context, arg CountFailedNotificationsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countFailedNotifications,
+		arg.Channel,
+		arg.BatchID,
+		arg.ErrorCode,
+		arg.FailedFrom,
+		arg.FailedTo,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const getNotification = `-- name: GetNotification :one
 
 SELECT id, batch_id, channel, priority, recipient, subject, content, segments, template_id, template_version, template_vars, status, idempotency_key, attempts, max_attempts, next_attempt_at, locked_by, locked_until, scheduled_at, sent_at, failed_at, cancelled_at, provider_message_id, last_error, last_error_code, callback_url, metadata, correlation_id, trace_parent, created_at, updated_at FROM notifications WHERE id = $1
@@ -233,6 +264,55 @@ func (q *Queries) ListAttempts(ctx context.Context, notificationID uuid.UUID) ([
 		return nil, err
 	}
 	return items, nil
+}
+
+const retryFailedNotifications = `-- name: RetryFailedNotifications :execrows
+WITH picked AS (
+    SELECT id FROM notifications
+    WHERE status = 'failed'
+      AND ($2::text IS NULL OR channel = $2::text)
+      AND ($3::uuid IS NULL OR batch_id = $3::uuid)
+      AND ($4::text IS NULL OR last_error_code = $4::text)
+      AND ($5::timestamptz IS NULL OR failed_at >= $5::timestamptz)
+      AND ($6::timestamptz IS NULL OR failed_at < $6::timestamptz)
+    ORDER BY created_at, id
+    LIMIT $7
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE notifications n
+SET status = 'pending', attempts = 0, next_attempt_at = $1, failed_at = NULL
+FROM picked
+WHERE n.id = picked.id
+`
+
+type RetryFailedNotificationsParams struct {
+	Now        time.Time
+	Channel    *string
+	BatchID    *uuid.UUID
+	ErrorCode  *string
+	FailedFrom *time.Time
+	FailedTo   *time.Time
+	MaxRows    int32
+}
+
+// Bulk dead-letter redrive, e.g. after a provider outage. The filters are
+// optional; LIMIT keeps one call's write bounded (callers repeat until
+// nothing matches). SKIP LOCKED lets two concurrent redrives split the work
+// instead of blocking each other. Oldest first, via the status index.
+func (q *Queries) RetryFailedNotifications(ctx context.Context, arg RetryFailedNotificationsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, retryFailedNotifications,
+		arg.Now,
+		arg.Channel,
+		arg.BatchID,
+		arg.ErrorCode,
+		arg.FailedFrom,
+		arg.FailedTo,
+		arg.MaxRows,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const retryNotification = `-- name: RetryNotification :one

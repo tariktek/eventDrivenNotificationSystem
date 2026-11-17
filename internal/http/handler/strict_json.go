@@ -23,6 +23,9 @@ var requestBodies = map[string]func() any{
 	"CreateTemplate":          func() any { return new(api.TemplateWrite) },
 	"UpdateTemplate":          func() any { return new(api.TemplateWrite) },
 	"PreviewTemplate":         func() any { return new(api.TemplatePreviewRequest) },
+	// Here an ignored "chanel" filter would widen the redrive to every
+	// channel, so strictness is a safety feature, not just a nicety.
+	"RetryFailedNotifications": func() any { return new(api.RetryFailedRequest) },
 }
 
 // strictJSON rejects request bodies that are not valid UTF-8 or that have

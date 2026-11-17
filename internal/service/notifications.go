@@ -210,6 +210,29 @@ func (s *Service) RetryNotification(ctx context.Context, id uuid.UUID) (*domain.
 	return s.store.RetryNotification(ctx, id, s.clock())
 }
 
+// RedriveResult reports a bulk dead-letter retry.
+type RedriveResult struct {
+	Requeued  int64 // moved back to pending by this call
+	Remaining int64 // still failed and matching the filter
+}
+
+// RetryFailedNotifications re-queues up to limit failed notifications that
+// match f; with dryRun it only counts them. Callers repeat while Remaining
+// is positive, which keeps each call's transaction small.
+func (s *Service) RetryFailedNotifications(ctx context.Context, f postgres.DeadLetterFilter, limit int, dryRun bool) (RedriveResult, error) {
+	var res RedriveResult
+	if !dryRun {
+		n, err := s.store.RetryFailedNotifications(ctx, f, limit, s.clock())
+		if err != nil {
+			return res, err
+		}
+		res.Requeued = n
+	}
+	n, err := s.store.CountFailedNotifications(ctx, f)
+	res.Remaining = n
+	return res, err
+}
+
 // GetBatch returns a batch with per-status counts.
 func (s *Service) GetBatch(ctx context.Context, id uuid.UUID) (*domain.BatchSummary, error) {
 	return s.store.GetBatchSummary(ctx, id)

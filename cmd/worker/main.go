@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/breaker"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
@@ -105,6 +107,13 @@ func run() error {
 		ReapInterval:  cfg.Worker.ReapInterval,
 		Aging:         cfg.Worker.PriorityAging,
 		ShutdownGrace: cfg.ShutdownTimeout,
+		Breaker: breaker.Config{
+			Window:       cfg.Breaker.Window,
+			MinRequests:  uint32(cfg.Breaker.MinRequests), //nolint:gosec // validated >= 1 at startup
+			FailureRatio: cfg.Breaker.FailureRatio,
+			OpenTimeout:  cfg.Breaker.OpenTimeout,
+			Probes:       uint32(cfg.Breaker.Probes), //nolint:gosec // validated >= 1 at startup
+		},
 	}, worker.Deps{
 		Queue:    store.Queue(),
 		Limiter:  limiter,
@@ -112,6 +121,21 @@ func run() error {
 		Policy:   retry.Policy{Base: cfg.Retry.BaseDelay, Max: cfg.Retry.MaxDelay},
 		Notifier: store.Queue(),
 		Log:      log,
+	})
+
+	// An open breaker means a provider is failing: the worker still runs
+	// (other channels deliver, the failing one waits), so it is "degraded".
+	checks.Register("circuit_breakers", false, func(context.Context) error {
+		var open []string
+		for _, ch := range domain.Channels {
+			if s := w.BreakerStates()[ch]; s != breaker.StateClosed {
+				open = append(open, string(ch)+"="+string(s))
+			}
+		}
+		if len(open) > 0 {
+			return fmt.Errorf("provider failing, deliveries paused: %s", strings.Join(open, ", "))
+		}
+		return nil
 	})
 
 	// The worker has no public API; this small "ops" server exposes probes

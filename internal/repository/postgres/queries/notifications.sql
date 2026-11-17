@@ -32,6 +32,37 @@ SET status = 'pending', attempts = 0, next_attempt_at = @now, failed_at = NULL
 WHERE id = @id AND status = 'failed'
 RETURNING *;
 
+-- Bulk dead-letter redrive, e.g. after a provider outage. The filters are
+-- optional; LIMIT keeps one call's write bounded (callers repeat until
+-- nothing matches). SKIP LOCKED lets two concurrent redrives split the work
+-- instead of blocking each other. Oldest first, via the status index.
+-- name: RetryFailedNotifications :execrows
+WITH picked AS (
+    SELECT id FROM notifications
+    WHERE status = 'failed'
+      AND (sqlc.narg(channel)::text IS NULL OR channel = sqlc.narg(channel)::text)
+      AND (sqlc.narg(batch_id)::uuid IS NULL OR batch_id = sqlc.narg(batch_id)::uuid)
+      AND (sqlc.narg(error_code)::text IS NULL OR last_error_code = sqlc.narg(error_code)::text)
+      AND (sqlc.narg(failed_from)::timestamptz IS NULL OR failed_at >= sqlc.narg(failed_from)::timestamptz)
+      AND (sqlc.narg(failed_to)::timestamptz IS NULL OR failed_at < sqlc.narg(failed_to)::timestamptz)
+    ORDER BY created_at, id
+    LIMIT @max_rows
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE notifications n
+SET status = 'pending', attempts = 0, next_attempt_at = @now, failed_at = NULL
+FROM picked
+WHERE n.id = picked.id;
+
+-- name: CountFailedNotifications :one
+SELECT count(*) FROM notifications
+WHERE status = 'failed'
+  AND (sqlc.narg(channel)::text IS NULL OR channel = sqlc.narg(channel)::text)
+  AND (sqlc.narg(batch_id)::uuid IS NULL OR batch_id = sqlc.narg(batch_id)::uuid)
+  AND (sqlc.narg(error_code)::text IS NULL OR last_error_code = sqlc.narg(error_code)::text)
+  AND (sqlc.narg(failed_from)::timestamptz IS NULL OR failed_at >= sqlc.narg(failed_from)::timestamptz)
+  AND (sqlc.narg(failed_to)::timestamptz IS NULL OR failed_at < sqlc.narg(failed_to)::timestamptz);
+
 -- name: ListAttempts :many
 SELECT * FROM notification_attempts
 WHERE notification_id = $1

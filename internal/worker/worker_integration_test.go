@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,8 +23,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/breaker"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/provider"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/queue"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/ratelimit"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/retry"
@@ -106,11 +110,12 @@ func alwaysAccept(string, int) int { return http.StatusAccepted }
 type opts struct {
 	rate        int
 	concurrency int
+	breaker     breaker.Config
 }
 
 // startWorker runs a worker until the test ends; stop() shuts it down and
 // waits for Run to return.
-func startWorker(t *testing.T, p *fakeProvider, o opts) (stop func()) {
+func startWorker(t *testing.T, p *fakeProvider, o opts) (w *worker.Worker, stop func()) {
 	t.Helper()
 	if o.rate == 0 {
 		o.rate = 200
@@ -119,7 +124,7 @@ func startWorker(t *testing.T, p *fakeProvider, o opts) (stop func()) {
 		o.concurrency = 50
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	w := worker.New(worker.Config{
+	w = worker.New(worker.Config{
 		ID:            "test-" + uuid.NewString()[:8],
 		Channels:      domain.Channels,
 		Concurrency:   o.concurrency,
@@ -129,6 +134,7 @@ func startWorker(t *testing.T, p *fakeProvider, o opts) (stop func()) {
 		ReapInterval:  time.Second,
 		Aging:         5 * time.Minute,
 		ShutdownGrace: 2 * time.Second,
+		Breaker:       o.breaker,
 	}, worker.Deps{
 		Queue:    store.Queue(),
 		Limiter:  ratelimit.NewLocal(ratelimit.Config{Rate: o.rate, Horizon: 500 * time.Millisecond}, nil),
@@ -152,7 +158,7 @@ func startWorker(t *testing.T, p *fakeProvider, o opts) (stop func()) {
 		})
 	}
 	t.Cleanup(stop)
-	return stop
+	return w, stop
 }
 
 func create(t *testing.T, n int, mutate func(i int, p *domain.NewNotificationParams)) []*domain.Notification {
@@ -359,7 +365,7 @@ func TestWorker_GracefulShutdownLeavesNothingStuck(t *testing.T) {
 	p := newFakeProvider(t, alwaysAccept)
 	p.latency = 100 * time.Millisecond
 	create(t, 200, nil)
-	stop := startWorker(t, p, opts{rate: 50})
+	_, stop := startWorker(t, p, opts{rate: 50})
 
 	time.Sleep(700 * time.Millisecond)
 	stop()
@@ -395,4 +401,162 @@ func TestWorker_ScheduledNotificationWaitsForItsTime(t *testing.T) {
 	n, err := store.GetNotification(t.Context(), ns[0].ID)
 	require.NoError(t, err)
 	assert.False(t, n.SentAt.Before(at), "sent at %s, scheduled for %s", n.SentAt, at)
+}
+
+func attemptsByOutcome(t *testing.T) map[domain.AttemptOutcome]int {
+	t.Helper()
+	rows, err := pool.Query(t.Context(), `SELECT outcome, count(*) FROM notification_attempts GROUP BY outcome`)
+	require.NoError(t, err)
+	defer rows.Close()
+	out := map[domain.AttemptOutcome]int{}
+	for rows.Next() {
+		var o string
+		var c int
+		require.NoError(t, rows.Scan(&o, &c))
+		out[domain.AttemptOutcome(o)] = c
+	}
+	return out
+}
+
+// TestWorker_CircuitBreakerPreservesAttempts takes the provider down with a
+// backlog queued. Without a breaker every notification would burn through
+// its attempts and fail. With it, the breaker opens after a handful of
+// failures, the backlog waits untouched (attempts refunded for anything
+// claimed but not sent), probes test the provider periodically, and once
+// it recovers everything is delivered.
+func TestWorker_CircuitBreakerPreservesAttempts(t *testing.T) {
+	reset(t)
+	var healthy atomic.Bool
+	p := newFakeProvider(t, func(string, int) int {
+		if healthy.Load() {
+			return http.StatusAccepted
+		}
+		return http.StatusServiceUnavailable
+	})
+	const total = 60
+	create(t, total, func(_ int, p *domain.NewNotificationParams) { p.MaxAttempts = 10 })
+	w, _ := startWorker(t, p, opts{breaker: breaker.Config{
+		Window: 10 * time.Second, MinRequests: 5, FailureRatio: 0.5, OpenTimeout: 300 * time.Millisecond, Probes: 2,
+	}})
+
+	waitFor(t, 5*time.Second, func() bool { return w.BreakerStates()[domain.ChannelSMS] != breaker.StateClosed })
+	assert.Equal(t, breaker.StateClosed, w.BreakerStates()[domain.ChannelEmail], "other channels are unaffected")
+
+	time.Sleep(1500 * time.Millisecond) // ~5 open/probe cycles of outage
+
+	counts := statusCounts(t)
+	assert.Zero(t, counts[domain.StatusFailed], "nothing failed because of the outage: %v", counts)
+	// What reached the provider: the burst in flight when the breaker
+	// tripped, then up to Probes per OpenTimeout. Each probe spends one
+	// attempt of one notification, so the cost depends on the outage's
+	// length, not on the backlog's size.
+	failedCalls := attemptsByOutcome(t)[domain.OutcomeTransientError]
+	t.Logf("provider calls during the outage: %d (without a breaker: up to %d)", failedCalls, total*10)
+	assert.Less(t, failedCalls, 40, "only the trip burst and the probes reached the provider")
+	var untouched, maxAttempts int
+	require.NoError(t, pool.QueryRow(t.Context(),
+		`SELECT count(*) FILTER (WHERE attempts = 0), max(attempts) FROM notifications`).Scan(&untouched, &maxAttempts))
+	assert.GreaterOrEqual(t, untouched, total-failedCalls, "everything not sent kept its full attempt budget")
+	assert.LessOrEqual(t, maxAttempts, 3, "no notification was retried into the ground")
+
+	healthy.Store(true)
+	waitFor(t, 10*time.Second, func() bool { return statusCounts(t)[domain.StatusSent] == total })
+	assert.Equal(t, breaker.StateClosed, w.BreakerStates()[domain.ChannelSMS], "probes succeeded, breaker closed")
+	var locked int
+	require.NoError(t, pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM notifications WHERE locked_by IS NOT NULL`).Scan(&locked))
+	assert.Zero(t, locked)
+}
+
+// TestWorker_PermanentErrorsDoNotTripTheBreaker: a stream of invalid
+// recipients is a problem with the messages, not with the provider.
+func TestWorker_PermanentErrorsDoNotTripTheBreaker(t *testing.T) {
+	reset(t)
+	p := newFakeProvider(t, func(string, int) int { return http.StatusBadRequest })
+	w, _ := startWorker(t, p, opts{breaker: breaker.Config{
+		Window: 10 * time.Second, MinRequests: 5, FailureRatio: 0.5, OpenTimeout: time.Minute, Probes: 2,
+	}})
+	create(t, 20, nil)
+	waitFor(t, 10*time.Second, func() bool { return statusCounts(t)[domain.StatusFailed] == 20 })
+	assert.Equal(t, breaker.StateClosed, w.BreakerStates()[domain.ChannelSMS])
+}
+
+// TestWorker_RecoversWorkOfACrashedWorker simulates a worker that claimed
+// notifications and died: no heartbeat, no release. Once the lease
+// expires the reaper requeues them and a live worker delivers them.
+func TestWorker_RecoversWorkOfACrashedWorker(t *testing.T) {
+	reset(t)
+	p := newFakeProvider(t, alwaysAccept)
+	ns := create(t, 10, nil)
+	claimed, err := store.Queue().Claim(t.Context(), queue.ClaimRequest{
+		Channel: domain.ChannelSMS, WorkerID: "crashed-worker", Limit: 10,
+		Now: time.Now(), Lease: 300 * time.Millisecond, Aging: time.Minute,
+	})
+	require.NoError(t, err)
+	require.Len(t, claimed, 10)
+
+	startWorker(t, p, opts{})
+	time.Sleep(200 * time.Millisecond)
+	assert.Equal(t, 10, statusCounts(t)[domain.StatusProcessing], "not stolen while the lease is valid")
+
+	waitFor(t, 5*time.Second, func() bool { return statusCounts(t)[domain.StatusSent] == 10 })
+	n, err := store.GetNotification(t.Context(), ns[0].ID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n.Attempts, "the crashed attempt counts: the message may have been sent")
+}
+
+// TestWorker_Chaos runs two workers against a provider that fails 30% of
+// requests at random with 503, 429 or 500, and stops one worker halfway.
+// Every notification must be delivered successfully exactly once, and
+// nothing may be left claimed.
+func TestWorker_Chaos(t *testing.T) {
+	reset(t)
+	var rndMu sync.Mutex
+	rnd := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // test fault injection
+	faults := []int{http.StatusServiceUnavailable, http.StatusTooManyRequests, http.StatusInternalServerError}
+	p := newFakeProvider(t, func(string, int) int {
+		rndMu.Lock()
+		defer rndMu.Unlock()
+		if rnd.Float64() < 0.3 {
+			return faults[rnd.IntN(len(faults))]
+		}
+		return http.StatusAccepted
+	})
+	p.latency = 5 * time.Millisecond
+	const total = 300
+	create(t, total, func(i int, p *domain.NewNotificationParams) {
+		p.MaxAttempts = 10
+		p.Channel = domain.Channels[i%3]
+		if p.Channel == domain.ChannelEmail {
+			p.Subject = "Hi"
+		}
+		p.Priority = []domain.Priority{domain.PriorityHigh, domain.PriorityNormal, domain.PriorityLow}[i%3]
+	})
+	// A 30% error rate is degraded, not down: the breaker must stay closed.
+	tolerant := breaker.Config{Window: 10 * time.Second, MinRequests: 20, FailureRatio: 0.8, OpenTimeout: time.Second, Probes: 2}
+	_, stopA := startWorker(t, p, opts{rate: 100, breaker: tolerant})
+	startWorker(t, p, opts{rate: 100, breaker: tolerant})
+
+	waitFor(t, 15*time.Second, func() bool { return statusCounts(t)[domain.StatusSent] >= total/2 })
+	stopA()
+	waitFor(t, 20*time.Second, func() bool { return statusCounts(t)[domain.StatusSent] == total })
+
+	var dup, locked int
+	require.NoError(t, pool.QueryRow(t.Context(), `
+		SELECT count(*) FROM (
+			SELECT notification_id FROM notification_attempts WHERE outcome = 'success'
+			GROUP BY notification_id HAVING count(*) > 1) d`).Scan(&dup))
+	assert.Zero(t, dup, "no notification was successfully delivered twice")
+	require.NoError(t, pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM notifications WHERE locked_by IS NOT NULL`).Scan(&locked))
+	assert.Zero(t, locked)
+
+	p.mu.Lock()
+	seen := len(p.perKey)
+	p.mu.Unlock()
+	assert.Equal(t, total, seen, "the provider saw every notification")
+	outcomes := attemptsByOutcome(t)
+	t.Logf("attempts by outcome: %v", outcomes)
+	assert.Equal(t, total, outcomes[domain.OutcomeSuccess])
+	assert.Positive(t, outcomes[domain.OutcomeTransientError], "faults were injected and retried")
 }

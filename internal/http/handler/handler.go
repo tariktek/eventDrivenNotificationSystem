@@ -7,6 +7,7 @@ package handler
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/api"
@@ -121,6 +122,51 @@ func (h *Handler) RetryNotification(ctx context.Context, req api.RetryNotificati
 		return nil, err
 	}
 	return api.RetryNotification200JSONResponse(toAPINotification(n)), nil
+}
+
+// Redrive limits for POST /api/v1/notifications/retry-failed.
+const (
+	defaultRedriveLimit = 1000
+	maxRedriveLimit     = 10000
+	maxErrorCodeLen     = 64
+)
+
+// RetryFailedNotifications implements POST /api/v1/notifications/retry-failed.
+func (h *Handler) RetryFailedNotifications(ctx context.Context, req api.RetryFailedNotificationsRequestObject) (api.RetryFailedNotificationsResponseObject, error) {
+	b := req.Body
+	var (
+		f    = postgres.DeadLetterFilter{BatchID: b.BatchId, ErrorCode: b.ErrorCode, FailedFrom: b.FailedFrom, FailedTo: b.FailedTo}
+		errs []error
+	)
+	if b.Channel != nil {
+		c, err := domain.ParseChannel(string(*b.Channel))
+		if err != nil {
+			errs = append(errs, validation.Field("channel", "must be one of sms, email, push"))
+		}
+		f.Channel = &c
+	}
+	if b.ErrorCode != nil && (*b.ErrorCode == "" || len(*b.ErrorCode) > maxErrorCodeLen || strings.ContainsRune(*b.ErrorCode, 0)) {
+		errs = append(errs, validation.Field("error_code", "must be 1 to %d characters without NUL", maxErrorCodeLen))
+	}
+	if f.FailedFrom != nil && f.FailedTo != nil && !f.FailedFrom.Before(*f.FailedTo) {
+		errs = append(errs, validation.Field("failed_to", "must be after failed_from"))
+	}
+	limit := defaultRedriveLimit
+	if b.Limit != nil {
+		limit = *b.Limit
+		if limit < 1 || limit > maxRedriveLimit {
+			errs = append(errs, validation.Field("limit", "must be between 1 and %d", maxRedriveLimit))
+		}
+	}
+	if err := validation.Merge(errs...); err != nil {
+		return nil, err
+	}
+
+	res, err := h.svc.RetryFailedNotifications(ctx, f, limit, deref(b.DryRun))
+	if err != nil {
+		return nil, err
+	}
+	return api.RetryFailedNotifications200JSONResponse{Requeued: int(res.Requeued), Remaining: int(res.Remaining)}, nil
 }
 
 // ---- batches ---------------------------------------------------------------

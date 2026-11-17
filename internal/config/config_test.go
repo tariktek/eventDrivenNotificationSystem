@@ -24,6 +24,7 @@ func TestLoadFrom_Defaults(t *testing.T) {
 	assert.Equal(t, "redis://localhost:6379/0", cfg.Redis.URL)
 	assert.Equal(t, []string{config.DevAPIKey}, cfg.Auth.APIKeys)
 	assert.Equal(t, 24*time.Hour, cfg.Auth.IdempotencyTTL)
+	assert.Equal(t, config.BreakerConfig{Window: 10 * time.Second, MinRequests: 20, FailureRatio: 0.5, OpenTimeout: 30 * time.Second, Probes: 5}, cfg.Breaker)
 }
 
 func TestProviderConfig_URLFor(t *testing.T) {
@@ -93,6 +94,9 @@ func TestLoadFrom_Invalid(t *testing.T) {
 		{"zero rate limit", map[string]string{"WORKER_RATE_LIMIT": "0"}, "WORKER_RATE_LIMIT"},
 		{"horizon below one slot", map[string]string{"WORKER_RATE_LIMIT": "10", "WORKER_RATE_HORIZON": "50ms"}, "WORKER_RATE_HORIZON"},
 		{"retry max below base", map[string]string{"RETRY_BASE_DELAY": "10s", "RETRY_MAX_DELAY": "1s"}, "RETRY_BASE_DELAY"},
+		{"breaker ratio above 1", map[string]string{"BREAKER_FAILURE_RATIO": "1.5"}, "BREAKER_FAILURE_RATIO"},
+		{"zero breaker probes", map[string]string{"BREAKER_PROBES": "0"}, "BREAKER_PROBES"},
+		{"zero breaker open timeout", map[string]string{"BREAKER_OPEN_TIMEOUT": "0s"}, "BREAKER_OPEN_TIMEOUT"},
 		{"zero body limit", map[string]string{"HTTP_MAX_BODY_BYTES": "0"}, "HTTP_MAX_BODY_BYTES"},
 		{"insecure callbacks in production", map[string]string{"APP_ENV": "production", "CALLBACK_ALLOW_PRIVATE": "true"}, "CALLBACK_ALLOW"},
 		// Parse errors come from the env library and name the struct field and
