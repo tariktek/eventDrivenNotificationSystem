@@ -570,7 +570,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
    - **DoD:** `docker compose up` DB'yi migrate ediyor, `make test-unit` geçiyor.
 
 ### Faz 2: API
-- [ ] 5. **OpenAPI spec (ilk tam hali)** ve `oapi-codegen` kurulumu.
+- [x] 5. **OpenAPI spec (ilk tam hali)** ve `oapi-codegen` kurulumu.
 - [ ] 6. **Repository katmanı:** sqlc sorguları, dinamik liste builder'ı, tx yöneticisi, `COPY` ile batch insert, integration testleri.
 - [ ] 7. **Servis ve handler'lar:** create, batch, get, list, cancel, retry, template CRUD ve preview.
 - [ ] 8. **Middleware'ler:** auth, correlation ID, request log, recovery, body limit; idempotency (eşzamanlılık testiyle birlikte).

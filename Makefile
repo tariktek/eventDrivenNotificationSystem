@@ -18,6 +18,14 @@ help: ## List available targets
 tidy: ## Tidy go.mod/go.sum
 	go mod tidy
 
+.PHONY: generate
+generate: ## Regenerate code from api/openapi.yaml
+	go generate ./...
+
+.PHONY: generate-check
+generate-check: generate ## Fail if generated code is out of date with the spec
+	@git diff --exit-code -- '*.gen.go' || (echo "generated code is stale: run 'make generate' and commit" && exit 1)
+
 .PHONY: fmt
 fmt: ## Format code (gofumpt + goimports)
 	golangci-lint fmt ./...

@@ -1,0 +1,16 @@
+# Configuration for `go generate ./...` (see generate.go).
+package: api
+output: api.gen.go
+generate:
+  models: true
+  chi-server: true
+  # Strict server: handlers receive typed request objects and return typed
+  # response objects, so a handler cannot return a status code or body the
+  # spec does not declare.
+  strict-server: true
+  embedded-spec: true
+output-options:
+  # Health probes are hand-written (internal/platform/health) and documented
+  # in the spec only.
+  exclude-tags:
+    - ops

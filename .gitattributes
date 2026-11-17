@@ -3,3 +3,6 @@
 * text=auto eol=lf
 *.pdf binary
 *.png binary
+
+# Collapse generated code in GitHub diffs and exclude it from language stats.
+*.gen.go linguist-generated=true
