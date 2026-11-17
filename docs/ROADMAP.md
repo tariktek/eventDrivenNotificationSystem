@@ -566,7 +566,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
 - [x] 1. **İskelet:** `go mod init`, klasör yapısı, config (fail-fast), logger, Makefile, `.golangci.yml`, `.gitignore`, `.env.example`, `git init`. İlk CI iskeleti (lint + build).
 - [x] 2. **Altyapı:** Dockerfile ve docker-compose'un ilk hali (postgres, redis, migrate), graceful shutdown iskeleti, `/health` ve `/ready`.
 - [x] 3. **Migration'lar ve domain:** Tüm tablolar; entity'ler, state machine ve testleri.
-- [ ] 4. **Validation ve template motoru:** SMS segment hesabı dahil, table-driven testler ve fuzz.
+- [x] 4. **Validation ve template motoru:** SMS segment hesabı dahil, table-driven testler ve fuzz.
    - **DoD:** `docker compose up` DB'yi migrate ediyor, `make test-unit` geçiyor.
 
 ### Faz 2: API
