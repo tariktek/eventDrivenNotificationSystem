@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -33,6 +34,21 @@ type Config struct {
 	HTTP     HTTPConfig     `envPrefix:"HTTP_"`
 	Database DatabaseConfig `envPrefix:"DATABASE_"`
 	Redis    RedisConfig    `envPrefix:"REDIS_"`
+	Callback CallbackConfig `envPrefix:"CALLBACK_"`
+	Auth     AuthConfig
+}
+
+// DevAPIKey is the default key for local development. It is rejected when
+// APP_ENV=production so it can never protect a real deployment.
+const DevAPIKey = "dev-api-key-change-me" //nolint:gosec // public on purpose; rejected in production
+
+// AuthConfig controls API authentication and request idempotency.
+type AuthConfig struct {
+	// APIKeys are accepted values of the X-API-Key header. Several keys allow
+	// rotation: add the new key, migrate clients, remove the old one.
+	APIKeys []string `env:"API_KEYS" envDefault:"dev-api-key-change-me" envSeparator:","`
+	// IdempotencyTTL is how long an Idempotency-Key response is replayable.
+	IdempotencyTTL time.Duration `env:"IDEMPOTENCY_TTL" envDefault:"24h"`
 }
 
 // LogConfig controls structured logging output.
@@ -49,6 +65,8 @@ type HTTPConfig struct {
 	ReadTimeout       time.Duration `env:"READ_TIMEOUT"        envDefault:"15s"`
 	WriteTimeout      time.Duration `env:"WRITE_TIMEOUT"       envDefault:"15s"`
 	IdleTimeout       time.Duration `env:"IDLE_TIMEOUT"        envDefault:"60s"`
+	// MaxBodyBytes caps request bodies; 5 MiB fits a 1000-item batch.
+	MaxBodyBytes int64 `env:"MAX_BODY_BYTES" envDefault:"5242880"`
 }
 
 // DatabaseConfig controls the PostgreSQL connection pool.
@@ -61,6 +79,14 @@ type DatabaseConfig struct {
 // RedisConfig controls the Redis client.
 type RedisConfig struct {
 	URL string `env:"URL" envDefault:"redis://localhost:6379/0"`
+}
+
+// CallbackConfig relaxes callback URL rules for local development. Both
+// must stay false in production: they would let clients make the service
+// call internal endpoints (SSRF).
+type CallbackConfig struct {
+	AllowInsecure bool `env:"ALLOW_INSECURE" envDefault:"false"` // permit http://
+	AllowPrivate  bool `env:"ALLOW_PRIVATE"  envDefault:"false"` // permit localhost/private IPs
 }
 
 // Load reads configuration from the process environment and validates it.
@@ -78,6 +104,11 @@ func load(opts env.Options) (Config, error) {
 	cfg, err := env.ParseAsWithOptions[Config](opts)
 	if err != nil {
 		return Config{}, fmt.Errorf("parse environment: %w", err)
+	}
+	// "key-a, key-b" is a natural way to write a list; HTTP header values
+	// are trimmed too, so untrimmed keys could never match.
+	for i, k := range cfg.Auth.APIKeys {
+		cfg.Auth.APIKeys[i] = strings.TrimSpace(k)
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid configuration: %w", err)
@@ -119,6 +150,29 @@ func (c Config) Validate() error {
 		if t.d <= 0 {
 			errs = append(errs, fmt.Errorf("%s: must be positive", t.name))
 		}
+	}
+
+	if c.HTTP.MaxBodyBytes <= 0 {
+		errs = append(errs, errors.New("HTTP_MAX_BODY_BYTES: must be positive"))
+	}
+
+	if len(c.Auth.APIKeys) == 0 {
+		errs = append(errs, errors.New("API_KEYS: at least one key is required"))
+	}
+	for _, k := range c.Auth.APIKeys {
+		switch {
+		case k == "":
+			errs = append(errs, errors.New("API_KEYS: keys must not be empty"))
+		case c.Env == EnvProduction && (k == DevAPIKey || len(k) < 32):
+			errs = append(errs, errors.New("API_KEYS: production keys must be at least 32 characters and not the development default"))
+		}
+	}
+	if c.Auth.IdempotencyTTL <= 0 {
+		errs = append(errs, errors.New("IDEMPOTENCY_TTL: must be positive"))
+	}
+
+	if c.Env == EnvProduction && (c.Callback.AllowInsecure || c.Callback.AllowPrivate) {
+		errs = append(errs, errors.New("CALLBACK_ALLOW_INSECURE/CALLBACK_ALLOW_PRIVATE: must be false in production"))
 	}
 
 	if err := validateURL(c.Database.URL, "postgres", "postgresql"); err != nil {

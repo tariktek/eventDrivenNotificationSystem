@@ -205,6 +205,24 @@ func isPrintableASCII(s string) bool {
 	return true
 }
 
+// Metadata validates a free-form metadata object (e.g. batch metadata).
+func Metadata(m map[string]any, field string) error {
+	if m == nil {
+		return nil
+	}
+	c := newCollector("")
+	checkJSONObject(c, field, m, metadataMaxBytes)
+	return c.err()
+}
+
+// TemplateVars validates template variables supplied outside a
+// notification request (e.g. a preview).
+func TemplateVars(m map[string]any, field string) error {
+	c := newCollector("")
+	checkJSONObject(c, field, m, templateVarsMaxBytes)
+	return c.err()
+}
+
 // checkJSONObject validates a free-form object destined for a jsonb column.
 func checkJSONObject(c collector, field string, v map[string]any, maxBytes int) {
 	b, err := json.Marshal(v)

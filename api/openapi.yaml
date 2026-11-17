@@ -12,14 +12,18 @@ info:
     the WebSocket stream (`GET /ws`) or a per-notification `callback_url`.
 
     ## Authentication
-    Every `/api/v1` endpoint requires an `X-API-Key` header.
+    Every `/api/v1` endpoint requires an `X-API-Key` header. With the local
+    docker compose setup the key is `dev-api-key-change-me` (in Swagger UI:
+    **Authorize**).
 
     ## Idempotency
-    * **Request level** — send an `Idempotency-Key` header on `POST`
-      requests. Retrying with the same key and body replays the original
+    * **Request level** — send an `Idempotency-Key` header when creating
+      notifications (single or batch). Retrying with the same key and body replays the original
       response (marked `Idempotent-Replayed: true`) instead of creating
       duplicates. The same key with a different body returns `422`; a retry
-      while the first request is still running returns `409`.
+      while the first request is still running returns `409`. If the first
+      request fails with a server error, the key is released and the retry
+      runs normally. Keys are scoped to the API key that sent them.
     * **Notification level** — `idempotency_key` in the body. At most one
       notification ever exists per key; creating another returns the
       existing one.
@@ -98,6 +102,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Notification" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/ValidationFailed" }
@@ -184,6 +189,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/NotificationDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
@@ -202,6 +208,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Notification" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
@@ -223,6 +230,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Notification" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
@@ -241,6 +249,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Batch" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
@@ -263,6 +272,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/NotificationPage" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
@@ -281,6 +291,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/BatchCancelled" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
@@ -307,6 +318,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Template" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/ValidationFailed" }
@@ -326,6 +338,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/TemplatePage" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -342,6 +355,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Template" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
@@ -362,6 +376,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Template" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
@@ -375,6 +390,7 @@ paths:
       responses:
         "204":
           description: Deleted.
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
@@ -400,6 +416,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/TemplatePreview" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "422": { $ref: "#/components/responses/ValidationFailed" }
@@ -676,41 +693,51 @@ components:
         notifications:
           type: array
           description: One entry per item, in request order.
-          items:
-            type: object
-            required: [id, status, duplicate]
-            properties:
-              id: { type: string, format: uuid }
-              status: { $ref: "#/components/schemas/Status" }
-              duplicate:
-                type: boolean
-                description: True when the item's idempotency_key already existed and no new notification was created.
+          items: { $ref: "#/components/schemas/BatchCreatedItem" }
+
+    BatchCreatedItem:
+      type: object
+      required: [id, status, duplicate]
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/Status" }
+        duplicate:
+          type: boolean
+          description: True when the item's idempotency_key already existed and no new notification was created.
 
     Batch:
       type: object
       required: [id, total, counts, progress, metadata, created_at]
       properties:
         id: { type: string, format: uuid }
-        total: { type: integer }
-        counts:
-          type: object
-          required: [pending, scheduled, processing, sent, failed, cancelled]
-          properties:
-            pending: { type: integer }
-            scheduled: { type: integer }
-            processing: { type: integer }
-            sent: { type: integer }
-            failed: { type: integer }
-            cancelled: { type: integer }
+        total:
+          type: integer
+          description: |
+            Items in the request. Items whose `idempotency_key` already existed
+            were not created again and belong to their original batch, so
+            `counts` can add up to less than `total`.
+        counts: { $ref: "#/components/schemas/BatchCounts" }
         progress:
           type: number
           format: double
           minimum: 0
           maximum: 1
-          description: Share of notifications in a final status (sent, failed or cancelled).
+          description: "Share of this batch's notifications in a final status (sent, failed or cancelled)."
         completed_at: { type: string, format: date-time }
         metadata: { $ref: "#/components/schemas/Metadata" }
         created_at: { type: string, format: date-time }
+
+    BatchCounts:
+      type: object
+      description: Number of the batch's notifications in each status.
+      required: [pending, scheduled, processing, sent, failed, cancelled]
+      properties:
+        pending: { type: integer }
+        scheduled: { type: integer }
+        processing: { type: integer }
+        sent: { type: integer }
+        failed: { type: integer }
+        cancelled: { type: integer }
 
     BatchCancelled:
       type: object

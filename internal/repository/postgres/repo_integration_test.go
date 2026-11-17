@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/idempotency"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/testutil/pgtest"
 )
@@ -501,4 +502,52 @@ func TestTemplates(t *testing.T) {
 
 		mk("welcome", baseTime.Add(time.Hour)) // name is reusable
 	})
+}
+
+func TestIdempotencyStore_LeaseFencing(t *testing.T) {
+	reset(t)
+	idem := store.Idempotency()
+	now := baseTime
+
+	a, _, ok, err := idem.Acquire(t.Context(), "c:k", "hash", now, time.Hour, time.Minute)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	_, rec, ok, err := idem.Acquire(t.Context(), "c:k", "hash", now.Add(30*time.Second), time.Hour, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, ok, "in progress and not yet stale")
+	assert.Zero(t, rec.Status)
+
+	b, _, ok, err := idem.Acquire(t.Context(), "c:k", "hash", now.Add(2*time.Minute), time.Hour, time.Minute)
+	require.NoError(t, err)
+	require.True(t, ok, "stale lock taken over")
+	assert.NotEqual(t, a.Token, b.Token)
+
+	// The old owner finishes late: it can neither release nor complete.
+	require.NoError(t, idem.Release(t.Context(), a))
+	assert.ErrorIs(t, idem.Complete(t.Context(), a, 201, []byte("stale")), idempotency.ErrLeaseLost)
+
+	body := []byte("{\"z\":1,\"a\":2}\n")
+	require.NoError(t, idem.Complete(t.Context(), b, 201, body))
+	_, rec, ok, err = idem.Acquire(t.Context(), "c:k", "hash", now.Add(3*time.Minute), time.Hour, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, ok)
+	assert.Equal(t, 201, rec.Status)
+	assert.Equal(t, body, rec.Body, "replayed byte for byte")
+
+	_, rec, _, err = idem.Acquire(t.Context(), "c:k", "other-hash", now.Add(3*time.Minute), time.Hour, time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, "hash", rec.RequestHash, "a different request sees the original hash")
+}
+
+func TestIdempotencyStore_ExpiredKeyIsReusable(t *testing.T) {
+	reset(t)
+	idem := store.Idempotency()
+	l, _, _, err := idem.Acquire(t.Context(), "c:e", "h1", baseTime, time.Hour, time.Minute)
+	require.NoError(t, err)
+	require.NoError(t, idem.Complete(t.Context(), l, 201, []byte("{}")))
+
+	_, _, ok, err := idem.Acquire(t.Context(), "c:e", "h2", baseTime.Add(2*time.Hour), time.Hour, time.Minute)
+	require.NoError(t, err)
+	assert.True(t, ok, "after expiry the key starts over, even for a different request")
 }

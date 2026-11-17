@@ -41,6 +41,7 @@ type IdempotencyKey struct {
 	ResponseBody   []byte
 	CreatedAt      time.Time
 	ExpiresAt      time.Time
+	LockToken      uuid.UUID
 }
 
 type Notification struct {

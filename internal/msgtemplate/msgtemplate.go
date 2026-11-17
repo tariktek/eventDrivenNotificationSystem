@@ -76,6 +76,17 @@ func (e *MissingVariablesError) Error() string {
 	return "missing or null template variables: " + strings.Join(e.Names, ", ")
 }
 
+// ParseError reports which part of a template ("subject" or "body") is
+// invalid, so callers can point the client at the right field.
+type ParseError struct {
+	Part string
+	Err  error
+}
+
+func (e *ParseError) Error() string { return "parse " + e.Part + " template: " + e.Err.Error() }
+
+func (e *ParseError) Unwrap() error { return e.Err }
+
 // ErrOutputTooLarge is returned when rendering exceeds MaxOutputBytes.
 var ErrOutputTooLarge = fmt.Errorf("rendered template exceeds %d bytes", MaxOutputBytes)
 
@@ -107,15 +118,15 @@ func Parse(subject, body string) (*Template, error) {
 func compile(name, text string, vars map[string]bool) (*template.Template, error) {
 	t, err := template.New(name).Funcs(funcs).Option("missingkey=error").Parse(text)
 	if err != nil {
-		return nil, fmt.Errorf("parse %s template: %w", name, err)
+		return nil, &ParseError{Part: name, Err: err}
 	}
 	// Each {{define}} adds an associated template.
 	if len(t.Templates()) > 1 {
-		return nil, fmt.Errorf("parse %s template: {{define}} is not allowed", name)
+		return nil, &ParseError{Part: name, Err: errors.New("{{define}} is not allowed")}
 	}
 	w := walker{vars: vars}
 	if err := w.walk(t.Root, scope{}); err != nil {
-		return nil, fmt.Errorf("parse %s template: %w", name, err)
+		return nil, &ParseError{Part: name, Err: err}
 	}
 	return t, nil
 }

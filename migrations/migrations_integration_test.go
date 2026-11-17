@@ -19,7 +19,7 @@ import (
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/testutil/pgtest"
 )
 
-const latestVersion = 8
+const latestVersion = 9
 
 var dsn string
 

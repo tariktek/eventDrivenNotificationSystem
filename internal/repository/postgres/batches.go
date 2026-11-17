@@ -77,3 +77,12 @@ func (r *Repo) CancelBatch(ctx context.Context, id uuid.UUID, now time.Time) (in
 	}
 	return n, nil
 }
+
+// BatchExists reports whether a batch with the given id exists.
+func (r *Repo) BatchExists(ctx context.Context, id uuid.UUID) (bool, error) {
+	ok, err := r.q.BatchExists(ctx, id)
+	if err != nil {
+		return false, fmt.Errorf("check batch: %w", err)
+	}
+	return ok, nil
+}

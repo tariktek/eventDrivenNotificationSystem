@@ -121,7 +121,13 @@ func TestBatchSummary_Progress(t *testing.T) {
 		},
 	}
 	assert.Equal(t, 6, s.Done())
+	assert.Equal(t, 10, s.Created())
 	assert.InDelta(t, 0.6, s.Progress(), 1e-9)
 
-	assert.Zero(t, domain.BatchSummary{}.Progress(), "empty batch must not divide by zero")
+	// 3 of 5 items were duplicates of earlier notifications: progress is
+	// measured over the 2 this batch created, so it can reach 100%.
+	dup := domain.BatchSummary{Batch: domain.Batch{Total: 5}, Counts: map[domain.Status]int{domain.StatusSent: 2}}
+	assert.InDelta(t, 1.0, dup.Progress(), 1e-9)
+
+	assert.InDelta(t, 1.0, domain.BatchSummary{}.Progress(), 1e-9, "nothing created: nothing left to do")
 }

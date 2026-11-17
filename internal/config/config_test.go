@@ -22,6 +22,14 @@ func TestLoadFrom_Defaults(t *testing.T) {
 	assert.Equal(t, 5*time.Second, cfg.HTTP.ReadHeaderTimeout)
 	assert.Equal(t, int32(20), cfg.Database.MaxConns)
 	assert.Equal(t, "redis://localhost:6379/0", cfg.Redis.URL)
+	assert.Equal(t, []string{config.DevAPIKey}, cfg.Auth.APIKeys)
+	assert.Equal(t, 24*time.Hour, cfg.Auth.IdempotencyTTL)
+}
+
+func TestLoadFrom_MultipleAPIKeysForRotation(t *testing.T) {
+	cfg, err := config.LoadFrom(map[string]string{"API_KEYS": "key-one, key-two "})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"key-one", "key-two"}, cfg.Auth.APIKeys)
 }
 
 func TestLoadFrom_Overrides(t *testing.T) {
@@ -34,6 +42,7 @@ func TestLoadFrom_Overrides(t *testing.T) {
 		"DATABASE_MAX_CONNS": "50",
 		"REDIS_URL":          "rediss://cache:6380/1",
 		"SHUTDOWN_TIMEOUT":   "45s",
+		"API_KEYS":           "a-production-key-that-is-long-enough",
 	})
 	require.NoError(t, err)
 
@@ -62,6 +71,12 @@ func TestLoadFrom_Invalid(t *testing.T) {
 		{"db without host", map[string]string{"DATABASE_URL": "postgres:///db"}, "DATABASE_URL"},
 		{"min conns above max", map[string]string{"DATABASE_MIN_CONNS": "10", "DATABASE_MAX_CONNS": "5"}, "DATABASE_MIN_CONNS"},
 		{"wrong redis scheme", map[string]string{"REDIS_URL": "http://localhost:6379"}, "REDIS_URL"},
+		{"empty api key", map[string]string{"API_KEYS": "a,,b"}, "API_KEYS"},
+		{"dev key in production", map[string]string{"APP_ENV": "production"}, "API_KEYS"},
+		{"short key in production", map[string]string{"APP_ENV": "production", "API_KEYS": "short"}, "API_KEYS"},
+		{"zero idempotency ttl", map[string]string{"IDEMPOTENCY_TTL": "0s"}, "IDEMPOTENCY_TTL"},
+		{"zero body limit", map[string]string{"HTTP_MAX_BODY_BYTES": "0"}, "HTTP_MAX_BODY_BYTES"},
+		{"insecure callbacks in production", map[string]string{"APP_ENV": "production", "CALLBACK_ALLOW_PRIVATE": "true"}, "CALLBACK_ALLOW"},
 		// Parse errors come from the env library and name the struct field and
 		// the offending value rather than the variable.
 		{"unparseable duration", map[string]string{"SHUTDOWN_TIMEOUT": "soon"}, `ShutdownTimeout" of type "time.Duration": unable to parse duration: time: invalid duration "soon"`},

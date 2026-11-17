@@ -572,8 +572,8 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
 ### Faz 2: API
 - [x] 5. **OpenAPI spec (ilk tam hali)** ve `oapi-codegen` kurulumu.
 - [x] 6. **Repository katmanı:** sqlc sorguları, dinamik liste builder'ı, tx yöneticisi, `unnest` ile tek sorguda batch insert (`COPY` yerine: `ON CONFLICT` desteği için), integration testleri.
-- [ ] 7. **Servis ve handler'lar:** create, batch, get, list, cancel, retry, template CRUD ve preview.
-- [ ] 8. **Middleware'ler:** auth, correlation ID, request log, recovery, body limit; idempotency (eşzamanlılık testiyle birlikte).
+- [x] 7. **Servis ve handler'lar:** create, batch, get, list, cancel, retry, template CRUD ve preview.
+- [x] 8. **Middleware'ler:** auth, correlation ID, request log, recovery, body limit; idempotency (eşzamanlılık testiyle birlikte).
    - **DoD:** Tüm endpoint'ler curl ile çalışıyor, contract testleri geçiyor.
 
 ### Faz 3: İşleme motoru

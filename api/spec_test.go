@@ -51,13 +51,16 @@ func TestSpec_Conventions(t *testing.T) {
 				for _, code := range []string{"401", "500"} {
 					assert.NotNil(t, op.Responses.Value(code), "must document %s", code)
 				}
-				if method == http.MethodPost || method == http.MethodPut {
-					if op.RequestBody != nil {
-						assert.NotNil(t, op.Responses.Value("400"), "operations with a body must document 400")
-					}
+				if op.RequestBody != nil {
+					assert.NotNil(t, op.Responses.Value("400"), "malformed or unknown-field bodies return 400")
+					assert.NotNil(t, op.Responses.Value("413"), "the body size limit applies to every body")
 				}
 				if strings.Contains(path, "{id}") {
+					assert.NotNil(t, op.Responses.Value("400"), "a non-UUID id returns 400")
 					assert.NotNil(t, op.Responses.Value("404"), "operations on a resource must document 404")
+				}
+				if method == http.MethodGet && op.Parameters.GetByInAndName("query", "cursor") != nil {
+					assert.NotNil(t, op.Responses.Value("422"), "an invalid cursor or filter returns 422")
 				}
 			})
 		}

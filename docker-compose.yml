@@ -18,6 +18,12 @@ x-app: &app
     SHUTDOWN_TIMEOUT: 20s
     DATABASE_URL: postgres://notification:notification@postgres:5432/notification?sslmode=disable
     REDIS_URL: redis://redis:6379/0
+    # Local development key; send it as X-API-Key (Swagger UI: "Authorize").
+    API_KEYS: ${API_KEYS:-dev-api-key-change-me}
+    # Local development: allow http:// and private-network callback URLs so
+    # callbacks can target containers. Refused when APP_ENV=production.
+    CALLBACK_ALLOW_INSECURE: "true"
+    CALLBACK_ALLOW_PRIVATE: "true"
   depends_on:
     postgres:
       condition: service_healthy

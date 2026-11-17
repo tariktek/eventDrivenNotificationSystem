@@ -10,7 +10,8 @@ import (
 
 // NewLogger builds the process-wide structured logger. Every record carries
 // the service name and version so logs from different binaries and releases
-// can be told apart once aggregated.
+// can be told apart once aggregated, plus the correlation ID when logged
+// with a request context.
 //
 // The config is assumed to be validated already (config.Load does this).
 func NewLogger(w io.Writer, cfg config.LogConfig, service, version string) *slog.Logger {
@@ -28,7 +29,7 @@ func NewLogger(w io.Writer, cfg config.LogConfig, service, version string) *slog
 		handler = slog.NewJSONHandler(w, opts)
 	}
 
-	return slog.New(handler).With(
+	return slog.New(newContextHandler(handler)).With(
 		slog.String("service", service),
 		slog.String("version", version),
 	)

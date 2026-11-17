@@ -180,3 +180,14 @@ func FuzzParseAndRender(f *testing.F) {
 		}
 	})
 }
+
+func TestParse_ErrorNamesThePart(t *testing.T) {
+	_, err := msgtemplate.Parse("Hi {{.name", "fine")
+	var pe *msgtemplate.ParseError
+	require.True(t, errors.As(err, &pe))
+	assert.Equal(t, "subject", pe.Part)
+
+	_, err = msgtemplate.Parse("fine", "{{printf \"x\"}}")
+	require.True(t, errors.As(err, &pe))
+	assert.Equal(t, "body", pe.Part)
+}

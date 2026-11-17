@@ -5,6 +5,7 @@
 package validation
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -81,4 +82,35 @@ func (c collector) err() error {
 		errs = append(errs, FieldError{Field: "", Reason: fmt.Sprintf("too many errors; only the first %d are reported", maxReportedErrors)})
 	}
 	return errs
+}
+
+// Field builds a single-field validation error, for rules checked outside
+// this package (e.g. "template_id: template not found").
+func Field(field, format string, args ...any) error {
+	return Errors{{Field: field, Reason: fmt.Sprintf(format, args...)}}
+}
+
+// Path joins a field-path prefix and a field: Path("items[2]", "content")
+// is "items[2].content"; an empty prefix returns field unchanged.
+func Path(prefix, field string) string {
+	return collector{prefix: prefix}.path(field)
+}
+
+// Merge concatenates validation errors from several checks into one,
+// respecting the reporting cap. Non-validation errors are returned as-is.
+func Merge(errs ...error) error {
+	c := newCollector("")
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		var verrs Errors
+		if !errors.As(err, &verrs) {
+			return err
+		}
+		for _, fe := range verrs {
+			c.add(fe.Field, "%s", fe.Reason)
+		}
+	}
+	return c.err()
 }

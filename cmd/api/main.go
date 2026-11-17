@@ -10,13 +10,17 @@ import (
 	"time"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/handler"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/router"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/buildinfo"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/health"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/httpserver"
-	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/postgres"
+	pgplatform "github.com/tariktek/eventDrivenNotificationSystem/internal/platform/postgres"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/redisx"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/service"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/validation"
 )
 
 const (
@@ -44,7 +48,7 @@ func run() error {
 
 	log.Info("starting", "env", cfg.Env, "commit", buildinfo.Commit)
 
-	pool, err := postgres.NewPool(ctx, cfg.Database)
+	pool, err := pgplatform.NewPool(ctx, cfg.Database)
 	if err != nil {
 		return err
 	}
@@ -65,7 +69,25 @@ func run() error {
 	// Report not-ready as soon as shutdown starts so traffic drains away.
 	defer context.AfterFunc(ctx, checks.SetDraining)()
 
-	srv := httpserver.New(cfg.HTTP, router.New(router.Deps{Health: checks}))
+	store := postgres.NewStore(pool)
+	svc := service.New(store, time.Now, validation.Options{
+		AllowInsecureCallbacks: cfg.Callback.AllowInsecure,
+		AllowPrivateCallbacks:  cfg.Callback.AllowPrivate,
+	})
+	meta := func(ctx context.Context) service.RequestMeta {
+		return service.RequestMeta{CorrelationID: observability.CorrelationID(ctx)}
+	}
+	routes := router.New(router.Deps{
+		Health:         checks,
+		API:            handler.New(svc, meta),
+		Log:            log,
+		MaxBodyBytes:   cfg.HTTP.MaxBodyBytes,
+		APIKeys:        cfg.Auth.APIKeys,
+		Idempotency:    store.Idempotency(),
+		IdempotencyTTL: cfg.Auth.IdempotencyTTL,
+		Now:            time.Now,
+	})
+	srv := httpserver.New(cfg.HTTP, routes)
 
 	log.Info("http server listening", "addr", cfg.HTTP.Addr)
 	if err := httpserver.ListenAndServe(ctx, srv, cfg.ShutdownTimeout); err != nil {
