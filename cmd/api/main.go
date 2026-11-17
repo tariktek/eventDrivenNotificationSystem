@@ -7,13 +7,22 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/router"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/buildinfo"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/health"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/httpserver"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/postgres"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/redisx"
 )
 
-const serviceName = "api"
+const (
+	serviceName        = "api"
+	healthCheckTimeout = time.Second
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -33,10 +42,36 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Info("starting", "env", cfg.Env, "commit", buildinfo.Commit, "http_addr", cfg.HTTP.Addr)
+	log.Info("starting", "env", cfg.Env, "commit", buildinfo.Commit)
 
-	<-ctx.Done()
+	pool, err := postgres.NewPool(ctx, cfg.Database)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
 
-	log.Info("shutdown signal received")
+	rdb, err := redisx.NewClient(cfg.Redis)
+	if err != nil {
+		return err
+	}
+	defer rdb.Close()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Warn("redis unreachable at startup, continuing in degraded mode", "error", err)
+	}
+
+	checks := health.NewRegistry(healthCheckTimeout)
+	checks.Register("postgres", true, pool.Ping)
+	checks.Register("redis", false, func(ctx context.Context) error { return rdb.Ping(ctx).Err() })
+	// Report not-ready as soon as shutdown starts so traffic drains away.
+	defer context.AfterFunc(ctx, checks.SetDraining)()
+
+	srv := httpserver.New(cfg.HTTP, router.New(router.Deps{Health: checks}))
+
+	log.Info("http server listening", "addr", cfg.HTTP.Addr)
+	if err := httpserver.ListenAndServe(ctx, srv, cfg.ShutdownTimeout); err != nil {
+		return err
+	}
+
+	log.Info("stopped gracefully")
 	return nil
 }

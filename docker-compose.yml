@@ -1,0 +1,85 @@
+name: notification-system
+
+# Settings shared by every application container.
+x-app: &app
+  build:
+    context: .
+    args:
+      VERSION: ${VERSION:-dev}
+      COMMIT: ${COMMIT:-none}
+  image: notification-system:local
+  restart: unless-stopped
+  # Must exceed SHUTDOWN_TIMEOUT so Docker never SIGKILLs a draining process.
+  stop_grace_period: 30s
+  environment: &app-env
+    APP_ENV: development
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    LOG_FORMAT: json
+    SHUTDOWN_TIMEOUT: 20s
+    DATABASE_URL: postgres://notification:notification@postgres:5432/notification?sslmode=disable
+    REDIS_URL: redis://redis:6379/0
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notification
+      POSTGRES_PASSWORD: notification
+      POSTGRES_DB: notification
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notification -d notification"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    # Append-only file so Redis Streams survive a container restart.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Applies versioned schema migrations once, then exits.
+  migrate:
+    image: migrate/migrate:v4.18.3
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://notification:notification@postgres:5432/notification?sslmode=disable
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app
+    ports:
+      - "8080:8080"
+
+  worker:
+    <<: *app
+    entrypoint: ["/app/worker"]
+
+volumes:
+  pgdata:
+  redisdata:

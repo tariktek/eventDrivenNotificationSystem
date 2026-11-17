@@ -4,7 +4,7 @@ COMMIT   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 LDFLAGS  := -s -w \
 	-X $(MODULE)/internal/platform/buildinfo.Version=$(VERSION) \
 	-X $(MODULE)/internal/platform/buildinfo.Commit=$(COMMIT)
-BINARIES := api worker
+BINARIES := api worker healthcheck
 
 .DEFAULT_GOAL := help
 
@@ -38,8 +38,30 @@ run-api: ## Run the API locally
 	go run ./cmd/api
 
 .PHONY: run-worker
-run-worker: ## Run the worker locally
-	go run ./cmd/worker
+run-worker: ## Run the worker locally (ops server on :8081 to avoid clashing with the API)
+	HTTP_ADDR=:8081 go run ./cmd/worker
+
+## ---------- Docker Compose ----------
+
+.PHONY: up
+up: ## Build and start the full stack in the background
+	VERSION=$(VERSION) COMMIT=$(COMMIT) docker compose up -d --build
+
+.PHONY: down
+down: ## Stop the stack (data volumes are kept)
+	docker compose down
+
+.PHONY: clean
+clean: ## Stop the stack and delete its data volumes
+	docker compose down -v
+
+.PHONY: logs
+logs: ## Follow application logs
+	docker compose logs -f api worker
+
+.PHONY: ps
+ps: ## Show container status
+	docker compose ps
 
 ## ---------- Tests ----------
 
