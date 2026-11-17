@@ -580,7 +580,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
 - [x] 9. **Kuyruk:** Claim, lease, heartbeat, reaper, `LISTEN/NOTIFY` + poll.
 - [x] 10. **Rate limiter:** Redis GCRA Lua, yerel fallback, doğruluk testi.
 - [x] 11. **Provider client ve mock provider:** Hata sınıflandırması, fault injection.
-- [ ] 12. **Worker:** Kanal havuzları, öncelik ve aging, claim miktarının limite bağlanması, graceful shutdown.
+- [x] 12. **Worker:** Kanal havuzları, öncelik ve aging, claim miktarının limite bağlanması, graceful shutdown.
 - [ ] 13. **Retry ve failure handling:** Backoff, `Retry-After`, circuit breaker, DLQ, attempts kaydı.
     - **DoD:** E2E testleri (retry, kalıcı hata, devre açılması, chaos) geçiyor; uçtan uca bir bildirim webhook.site'a ulaşıyor.
 

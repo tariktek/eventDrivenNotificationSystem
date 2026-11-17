@@ -37,6 +37,34 @@ type Config struct {
 	Callback CallbackConfig `envPrefix:"CALLBACK_"`
 	Auth     AuthConfig
 	Provider ProviderConfig `envPrefix:"PROVIDER_"`
+	Worker   WorkerConfig   `envPrefix:"WORKER_"`
+	Retry    RetryConfig    `envPrefix:"RETRY_"`
+}
+
+// WorkerConfig tunes the delivery pipeline.
+type WorkerConfig struct {
+	// ID identifies this worker in leases and logs; generated if empty.
+	ID string `env:"ID"`
+	// Concurrency is the max in-flight deliveries per channel.
+	Concurrency  int           `env:"CONCURRENCY"   envDefault:"100"`
+	BatchSize    int           `env:"BATCH_SIZE"    envDefault:"50"`
+	PollInterval time.Duration `env:"POLL_INTERVAL" envDefault:"1s"`
+	Lease        time.Duration `env:"LEASE"         envDefault:"30s"`
+	ReapInterval time.Duration `env:"REAP_INTERVAL" envDefault:"10s"`
+	// PriorityAging promotes waiting work one priority level per interval.
+	PriorityAging time.Duration `env:"PRIORITY_AGING" envDefault:"5m"`
+	// RateLimit is messages per second per channel, across all workers.
+	RateLimit   int           `env:"RATE_LIMIT"   envDefault:"100"`
+	RateHorizon time.Duration `env:"RATE_HORIZON" envDefault:"1s"`
+	// ExpectedInstances sizes the local fallback limiter: if Redis is down,
+	// each worker sends at RateLimit / ExpectedInstances.
+	ExpectedInstances int `env:"EXPECTED_INSTANCES" envDefault:"1"`
+}
+
+// RetryConfig shapes the backoff between delivery attempts.
+type RetryConfig struct {
+	BaseDelay time.Duration `env:"BASE_DELAY" envDefault:"2s"`
+	MaxDelay  time.Duration `env:"MAX_DELAY"  envDefault:"5m"`
 }
 
 // ProviderConfig locates the external notification provider. URL serves
@@ -192,6 +220,11 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("IDEMPOTENCY_TTL: must be positive"))
 	}
 
+	errs = append(errs, c.Worker.validate()...)
+	if c.Retry.BaseDelay <= 0 || c.Retry.MaxDelay < c.Retry.BaseDelay {
+		errs = append(errs, errors.New("RETRY_BASE_DELAY/RETRY_MAX_DELAY: need 0 < base <= max"))
+	}
+
 	if c.Env == EnvProduction && (c.Callback.AllowInsecure || c.Callback.AllowPrivate) {
 		errs = append(errs, errors.New("CALLBACK_ALLOW_INSECURE/CALLBACK_ALLOW_PRIVATE: must be false in production"))
 	}
@@ -224,6 +257,44 @@ func (c Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func (w WorkerConfig) validate() []error {
+	var errs []error
+	for _, v := range []struct {
+		name string
+		val  int
+	}{
+		{"WORKER_CONCURRENCY", w.Concurrency},
+		{"WORKER_BATCH_SIZE", w.BatchSize},
+		{"WORKER_RATE_LIMIT", w.RateLimit},
+		{"WORKER_EXPECTED_INSTANCES", w.ExpectedInstances},
+	} {
+		if v.val < 1 {
+			errs = append(errs, fmt.Errorf("%s: must be at least 1", v.name))
+		}
+	}
+	for _, d := range []struct {
+		name string
+		val  time.Duration
+	}{
+		{"WORKER_POLL_INTERVAL", w.PollInterval},
+		{"WORKER_LEASE", w.Lease},
+		{"WORKER_REAP_INTERVAL", w.ReapInterval},
+		{"WORKER_PRIORITY_AGING", w.PriorityAging},
+		{"WORKER_RATE_HORIZON", w.RateHorizon},
+	} {
+		if d.val <= 0 {
+			errs = append(errs, fmt.Errorf("%s: must be positive", d.name))
+		}
+	}
+	if w.BatchSize > w.Concurrency {
+		errs = append(errs, errors.New("WORKER_BATCH_SIZE: must not exceed WORKER_CONCURRENCY"))
+	}
+	if w.RateLimit > 0 && w.RateHorizon < time.Second/time.Duration(w.RateLimit) {
+		errs = append(errs, errors.New("WORKER_RATE_HORIZON: must fit at least one send slot (1s / WORKER_RATE_LIMIT)"))
+	}
+	return errs
 }
 
 func validateURL(raw string, schemes ...string) error {

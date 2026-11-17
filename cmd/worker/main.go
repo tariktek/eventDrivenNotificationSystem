@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,13 +12,22 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/buildinfo"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/health"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/httpserver"
-	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/postgres"
+	pgplatform "github.com/tariktek/eventDrivenNotificationSystem/internal/platform/postgres"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/redisx"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/provider"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/ratelimit"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/retry"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/worker"
 )
 
 const (
@@ -45,7 +55,7 @@ func run() error {
 
 	log.Info("starting", "env", cfg.Env, "commit", buildinfo.Commit)
 
-	pool, err := postgres.NewPool(ctx, cfg.Database)
+	pool, err := pgplatform.NewPool(ctx, cfg.Database)
 	if err != nil {
 		return err
 	}
@@ -65,6 +75,45 @@ func run() error {
 	checks.Register("redis", false, func(ctx context.Context) error { return rdb.Ping(ctx).Err() })
 	defer context.AfterFunc(ctx, checks.SetDraining)()
 
+	store := postgres.NewStore(pool)
+	rate := ratelimit.Config{Rate: cfg.Worker.RateLimit, Horizon: cfg.Worker.RateHorizon}
+	limiter := ratelimit.NewFallback(ratelimit.FallbackConfig{
+		Primary:    ratelimit.NewRedis(rdb, rate, "ratelimit:"),
+		Rate:       rate,
+		Instances:  cfg.Worker.ExpectedInstances,
+		Log:        log,
+		RetryEvery: 5 * time.Second,
+	})
+	checks.Register("rate_limiter", false, func(context.Context) error {
+		if limiter.Degraded() {
+			return errors.New("shared limiter unavailable; using local fallback")
+		}
+		return nil
+	})
+
+	urls := map[domain.Channel]string{}
+	for _, ch := range domain.Channels {
+		urls[ch] = cfg.Provider.URLFor(string(ch))
+	}
+	w := worker.New(worker.Config{
+		ID:            workerID(cfg.Worker.ID),
+		Channels:      domain.Channels,
+		Concurrency:   cfg.Worker.Concurrency,
+		BatchSize:     cfg.Worker.BatchSize,
+		PollInterval:  cfg.Worker.PollInterval,
+		Lease:         cfg.Worker.Lease,
+		ReapInterval:  cfg.Worker.ReapInterval,
+		Aging:         cfg.Worker.PriorityAging,
+		ShutdownGrace: cfg.ShutdownTimeout,
+	}, worker.Deps{
+		Queue:    store.Queue(),
+		Limiter:  limiter,
+		Sender:   provider.NewHTTPClient(provider.HTTPConfig{URLs: urls, Timeout: cfg.Provider.Timeout}),
+		Policy:   retry.Policy{Base: cfg.Retry.BaseDelay, Max: cfg.Retry.MaxDelay},
+		Notifier: store.Queue(),
+		Log:      log,
+	})
+
 	// The worker has no public API; this small "ops" server exposes probes
 	// (and, later, Prometheus metrics) for the orchestrator.
 	mux := http.NewServeMux()
@@ -72,11 +121,31 @@ func run() error {
 	mux.Handle("GET /ready", checks.ReadinessHandler())
 	srv := httpserver.New(cfg.HTTP, mux)
 
-	log.Info("ops server listening", "addr", cfg.HTTP.Addr)
-	if err := httpserver.ListenAndServe(ctx, srv, cfg.ShutdownTimeout); err != nil {
+	// If either part fails (e.g. the ops port is taken), stop the other too
+	// rather than run half alive.
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return w.Run(gctx) })
+	g.Go(func() error {
+		log.Info("ops server listening", "addr", cfg.HTTP.Addr)
+		return httpserver.ListenAndServe(gctx, srv, cfg.ShutdownTimeout)
+	})
+	if err := g.Wait(); err != nil {
 		return err
 	}
 
 	log.Info("stopped gracefully")
 	return nil
+}
+
+// workerID returns the configured ID, or hostname-plus-random so replicas
+// of the same container image never share one.
+func workerID(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		host = "worker"
+	}
+	return host + "-" + uuid.NewString()[:8]
 }

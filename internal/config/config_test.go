@@ -89,6 +89,10 @@ func TestLoadFrom_Invalid(t *testing.T) {
 		{"provider url not http", map[string]string{"PROVIDER_URL": "ftp://x/send"}, "PROVIDER_URL"},
 		{"bad channel provider url", map[string]string{"PROVIDER_URL_EMAIL": "not a url"}, "PROVIDER_URL_EMAIL"},
 		{"zero provider timeout", map[string]string{"PROVIDER_TIMEOUT": "0s"}, "PROVIDER_TIMEOUT"},
+		{"batch above concurrency", map[string]string{"WORKER_BATCH_SIZE": "200", "WORKER_CONCURRENCY": "100"}, "WORKER_BATCH_SIZE"},
+		{"zero rate limit", map[string]string{"WORKER_RATE_LIMIT": "0"}, "WORKER_RATE_LIMIT"},
+		{"horizon below one slot", map[string]string{"WORKER_RATE_LIMIT": "10", "WORKER_RATE_HORIZON": "50ms"}, "WORKER_RATE_HORIZON"},
+		{"retry max below base", map[string]string{"RETRY_BASE_DELAY": "10s", "RETRY_MAX_DELAY": "1s"}, "RETRY_BASE_DELAY"},
 		{"zero body limit", map[string]string{"HTTP_MAX_BODY_BYTES": "0"}, "HTTP_MAX_BODY_BYTES"},
 		{"insecure callbacks in production", map[string]string{"APP_ENV": "production", "CALLBACK_ALLOW_PRIVATE": "true"}, "CALLBACK_ALLOW"},
 		// Parse errors come from the env library and name the struct field and

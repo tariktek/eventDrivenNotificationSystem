@@ -1,9 +1,11 @@
 package postgres
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -98,7 +100,103 @@ func (q QueueStore) Claim(ctx context.Context, req queue.ClaimRequest) ([]*domai
 	if err != nil {
 		return nil, fmt.Errorf("claim notifications: %w", err)
 	}
-	return toNotifications(claimed)
+	ns, err := toNotifications(claimed)
+	if err != nil {
+		return nil, err
+	}
+	// UPDATE ... RETURNING does not preserve the picking order. Restore it,
+	// since the worker hands out send slots in this order.
+	sortByClaimOrder(ns, req.Now, req.Aging)
+	return ns, nil
+}
+
+// sortByClaimOrder mirrors the claim query's ORDER BY.
+func sortByClaimOrder(ns []*domain.Notification, now time.Time, aging time.Duration) {
+	effective := func(n *domain.Notification) int64 {
+		steps := int64(now.Sub(n.NextAttemptAt) / aging)
+		return max(int64(n.Priority.Rank())-steps, 0)
+	}
+	slices.SortStableFunc(ns, func(a, b *domain.Notification) int {
+		if c := cmp.Compare(effective(a), effective(b)); c != 0 {
+			return c
+		}
+		return a.NextAttemptAt.Compare(b.NextAttemptAt)
+	})
+}
+
+// Complete implements queue.Queue.
+func (q QueueStore) Complete(ctx context.Context, c *queue.Completion) (bool, error) {
+	a := &c.Attempt
+	durationMS, err := narrow[int32](int(a.Duration.Milliseconds()), "duration_ms")
+	if err != nil {
+		return false, err
+	}
+	attemptNo, err := narrow[int32](a.AttemptNo, "attempt_no")
+	if err != nil {
+		return false, err
+	}
+	var statusCode *int32
+	if a.StatusCode != 0 {
+		sc, err := narrow[int32](a.StatusCode, "status_code")
+		if err != nil {
+			return false, err
+		}
+		statusCode = &sc
+	}
+
+	var rows int64
+	err = pgx.BeginFunc(ctx, q.pool, func(tx pgx.Tx) error {
+		qq := sqlcgen.New(tx)
+		var err error
+		switch c.Status {
+		case domain.StatusSent:
+			rows, err = qq.CompleteSent(ctx, sqlcgen.CompleteSentParams{
+				ID: c.NotificationID, WorkerID: &c.WorkerID, Now: &c.Now, ProviderMessageID: nilIfZero(a.ProviderMessageID),
+			})
+		case domain.StatusPending:
+			rows, err = qq.CompleteRetry(ctx, sqlcgen.CompleteRetryParams{
+				ID: c.NotificationID, WorkerID: &c.WorkerID, NextAttemptAt: c.NextAttemptAt,
+				LastError: nilIfZero(a.Error), LastErrorCode: nilIfZero(a.ErrorCode),
+			})
+		case domain.StatusFailed:
+			rows, err = qq.CompleteFailed(ctx, sqlcgen.CompleteFailedParams{
+				ID: c.NotificationID, WorkerID: &c.WorkerID, Now: &c.Now,
+				LastError: nilIfZero(a.Error), LastErrorCode: nilIfZero(a.ErrorCode),
+			})
+		default:
+			return fmt.Errorf("complete: unexpected status %q", c.Status)
+		}
+		if err != nil {
+			return fmt.Errorf("update notification: %w", err)
+		}
+		return qq.InsertAttempt(ctx, sqlcgen.InsertAttemptParams{
+			NotificationID:    c.NotificationID,
+			AttemptNo:         attemptNo,
+			Outcome:           string(a.Outcome),
+			StatusCode:        statusCode,
+			ErrorCode:         nilIfZero(a.ErrorCode),
+			Error:             nilIfZero(a.Error),
+			ProviderMessageID: nilIfZero(a.ProviderMessageID),
+			DurationMs:        durationMS,
+			CreatedAt:         c.Now,
+		})
+	})
+	if err != nil {
+		return false, fmt.Errorf("complete delivery: %w", err)
+	}
+	return rows == 1, nil
+}
+
+// Release implements queue.Queue.
+func (q QueueStore) Release(ctx context.Context, workerID string, ids []uuid.UUID) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	n, err := q.repo.q.ReleaseClaims(ctx, sqlcgen.ReleaseClaimsParams{Ids: ids, WorkerID: &workerID})
+	if err != nil {
+		return 0, fmt.Errorf("release claims: %w", err)
+	}
+	return n, nil
 }
 
 // ExtendLeases implements queue.Queue.

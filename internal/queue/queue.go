@@ -37,6 +37,20 @@ type ReapResult struct {
 	Failed int64
 }
 
+// Completion records the outcome of one delivery attempt.
+type Completion struct {
+	NotificationID uuid.UUID
+	WorkerID       string
+	Now            time.Time
+	// Status is the notification's next state: sent, pending (retry at
+	// NextAttemptAt) or failed.
+	Status        domain.Status
+	NextAttemptAt time.Time
+	// Attempt is the history row; its fields also fill the notification's
+	// provider_message_id and last_error columns.
+	Attempt domain.Attempt
+}
+
 // Queue is the worker's view of pending work.
 type Queue interface {
 	// Claim atomically moves due notifications to processing under a
@@ -49,4 +63,11 @@ type Queue interface {
 	// ReapExpiredLeases recovers work from workers that stopped
 	// heartbeating (crashed, killed, network-partitioned).
 	ReapExpiredLeases(ctx context.Context, now time.Time) (ReapResult, error)
+	// Complete atomically stores the attempt and the notification's new
+	// state. applied is false if the worker no longer held the lease, in
+	// which case only the attempt history is written.
+	Complete(ctx context.Context, c *Completion) (applied bool, err error)
+	// Release returns claimed but unsent notifications to the queue without
+	// counting an attempt (used on graceful shutdown).
+	Release(ctx context.Context, workerID string, ids []uuid.UUID) (int64, error)
 }

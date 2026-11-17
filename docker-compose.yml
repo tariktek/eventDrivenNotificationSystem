@@ -38,6 +38,7 @@ x-app: &app
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: notification
       POSTGRES_PASSWORD: notification
@@ -54,6 +55,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     # Append-only file so Redis Streams survive a container restart.
     command: ["redis-server", "--appendonly", "yes"]
     ports:
@@ -88,6 +90,12 @@ services:
   worker:
     <<: *app
     entrypoint: ["/app/worker"]
+    # Two instances share the per-channel rate limit through Redis.
+    deploy:
+      replicas: 2
+    environment:
+      <<: *app-env
+      WORKER_EXPECTED_INSTANCES: "2"
 
   # Stand-in for the external provider, with fault injection and stats:
   #   GET  http://localhost:9000/admin/stats
