@@ -40,6 +40,24 @@ type Config struct {
 	Worker   WorkerConfig   `envPrefix:"WORKER_"`
 	Retry    RetryConfig    `envPrefix:"RETRY_"`
 	Breaker  BreakerConfig  `envPrefix:"BREAKER_"`
+	Events   EventsConfig   `envPrefix:"EVENTS_"`
+	Outbox   OutboxConfig   `envPrefix:"OUTBOX_"`
+}
+
+// EventsConfig locates the domain event stream.
+type EventsConfig struct {
+	Stream string `env:"STREAM" envDefault:"stream:notification-events"`
+	// StreamMaxLen trims the stream to about this many entries (~0.5 KB
+	// each). A consumer further behind than that misses events.
+	StreamMaxLen int64 `env:"STREAM_MAX_LEN" envDefault:"100000"`
+}
+
+// OutboxConfig tunes the relay from the outbox table to the stream.
+type OutboxConfig struct {
+	BatchSize     int           `env:"BATCH_SIZE"     envDefault:"500"`
+	PollInterval  time.Duration `env:"POLL_INTERVAL"  envDefault:"100ms"`
+	Retention     time.Duration `env:"RETENTION"      envDefault:"24h"`
+	PruneInterval time.Duration `env:"PRUNE_INTERVAL" envDefault:"10m"`
 }
 
 // WorkerConfig tunes the delivery pipeline.
@@ -245,6 +263,16 @@ func (c Config) Validate() error {
 	}
 	if c.Breaker.FailureRatio <= 0 || c.Breaker.FailureRatio > 1 {
 		errs = append(errs, errors.New("BREAKER_FAILURE_RATIO: must be in (0, 1]"))
+	}
+
+	if c.Events.Stream == "" || c.Events.StreamMaxLen < 1000 {
+		errs = append(errs, errors.New("EVENTS_STREAM/EVENTS_STREAM_MAX_LEN: need a stream name and a max length of at least 1000"))
+	}
+	if c.Outbox.BatchSize < 1 || c.Outbox.BatchSize > 10000 {
+		errs = append(errs, errors.New("OUTBOX_BATCH_SIZE: must be between 1 and 10000"))
+	}
+	if c.Outbox.PollInterval <= 0 || c.Outbox.Retention <= 0 || c.Outbox.PruneInterval <= 0 {
+		errs = append(errs, errors.New("OUTBOX_POLL_INTERVAL/OUTBOX_RETENTION/OUTBOX_PRUNE_INTERVAL: must be positive"))
 	}
 
 	if c.Env == EnvProduction && (c.Callback.AllowInsecure || c.Callback.AllowPrivate) {

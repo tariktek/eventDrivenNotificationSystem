@@ -56,7 +56,7 @@ func (q *Queries) CountBatchStatuses(ctx context.Context, batchID *uuid.UUID) ([
 }
 
 const getBatch = `-- name: GetBatch :one
-SELECT id, total, metadata, correlation_id, completed_at, created_at FROM batches WHERE id = $1
+SELECT id, total, metadata, correlation_id, completed_at, created_at, created_count, finished_count FROM batches WHERE id = $1
 `
 
 func (q *Queries) GetBatch(ctx context.Context, id uuid.UUID) (Batch, error) {
@@ -69,6 +69,8 @@ func (q *Queries) GetBatch(ctx context.Context, id uuid.UUID) (Batch, error) {
 		&i.CorrelationID,
 		&i.CompletedAt,
 		&i.CreatedAt,
+		&i.CreatedCount,
+		&i.FinishedCount,
 	)
 	return i, err
 }

@@ -17,6 +17,8 @@ type Batch struct {
 	CorrelationID *string
 	CompletedAt   *time.Time
 	CreatedAt     time.Time
+	CreatedCount  int32
+	FinishedCount int32
 }
 
 type CallbackDelivery struct {

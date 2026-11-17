@@ -19,7 +19,9 @@ import (
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/breaker"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/outbox"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/buildinfo"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/health"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/httpserver"
@@ -138,6 +140,17 @@ func run() error {
 		return nil
 	})
 
+	// Every worker runs a relay; an advisory lock lets one publish at a time.
+	relay := outbox.New(store,
+		events.NewPublisher(rdb, cfg.Events.Stream, cfg.Events.StreamMaxLen),
+		outbox.Config{
+			BatchSize:     cfg.Outbox.BatchSize,
+			PollInterval:  cfg.Outbox.PollInterval,
+			RetryEvery:    time.Second,
+			Retention:     cfg.Outbox.Retention,
+			PruneInterval: cfg.Outbox.PruneInterval,
+		}, log)
+
 	// The worker has no public API; this small "ops" server exposes probes
 	// (and, later, Prometheus metrics) for the orchestrator.
 	mux := http.NewServeMux()
@@ -149,6 +162,7 @@ func run() error {
 	// rather than run half alive.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return w.Run(gctx) })
+	g.Go(func() error { relay.Run(gctx); return nil })
 	g.Go(func() error {
 		log.Info("ops server listening", "addr", cfg.HTTP.Addr)
 		return httpserver.ListenAndServe(gctx, srv, cfg.ShutdownTimeout)

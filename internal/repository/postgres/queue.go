@@ -147,7 +147,24 @@ func (q QueueStore) Complete(ctx context.Context, c *queue.Completion) (bool, er
 	var rows int64
 	err = pgx.BeginFunc(ctx, q.pool, func(tx pgx.Tx) error {
 		qq := sqlcgen.New(tx)
-		var err error
+		// The attempt goes first. The status update fires the outbox
+		// trigger, which locks the notification's batch row until commit;
+		// updating last keeps that lock to one round trip, so completions
+		// of the same batch barely wait for each other.
+		err := qq.InsertAttempt(ctx, sqlcgen.InsertAttemptParams{
+			NotificationID:    c.NotificationID,
+			AttemptNo:         attemptNo,
+			Outcome:           string(a.Outcome),
+			StatusCode:        statusCode,
+			ErrorCode:         nilIfZero(a.ErrorCode),
+			Error:             nilIfZero(a.Error),
+			ProviderMessageID: nilIfZero(a.ProviderMessageID),
+			DurationMs:        durationMS,
+			CreatedAt:         c.Now,
+		})
+		if err != nil {
+			return fmt.Errorf("insert attempt: %w", err)
+		}
 		switch c.Status {
 		case domain.StatusSent:
 			rows, err = qq.CompleteSent(ctx, sqlcgen.CompleteSentParams{
@@ -169,17 +186,7 @@ func (q QueueStore) Complete(ctx context.Context, c *queue.Completion) (bool, er
 		if err != nil {
 			return fmt.Errorf("update notification: %w", err)
 		}
-		return qq.InsertAttempt(ctx, sqlcgen.InsertAttemptParams{
-			NotificationID:    c.NotificationID,
-			AttemptNo:         attemptNo,
-			Outcome:           string(a.Outcome),
-			StatusCode:        statusCode,
-			ErrorCode:         nilIfZero(a.ErrorCode),
-			Error:             nilIfZero(a.Error),
-			ProviderMessageID: nilIfZero(a.ProviderMessageID),
-			DurationMs:        durationMS,
-			CreatedAt:         c.Now,
-		})
+		return nil
 	})
 	if err != nil {
 		return false, fmt.Errorf("complete delivery: %w", err)

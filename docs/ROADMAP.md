@@ -585,7 +585,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
     - **DoD:** E2E testleri (retry, kalıcı hata, devre açılması, chaos) geçiyor; uçtan uca bir bildirim webhook.site'a ulaşıyor.
 
 ### Faz 4: Event'ler ve gerçek zamanlılık
-- [ ] 14. **Outbox ve relay:** Redis Streams publisher, consumer group yönetimi.
+- [x] 14. **Outbox ve relay:** Redis Streams publisher, consumer group yönetimi.
 - [ ] 15. **WebSocket hub:** Abonelik, filtreleme, ping/pong, backpressure.
 - [ ] 16. **Status callback'leri:** HMAC imzası, retry, SSRF koruması.
 - [ ] 17. **Scheduled bildirimler:** Uçtan uca test (scheduled → pending → sent ve iptal).
