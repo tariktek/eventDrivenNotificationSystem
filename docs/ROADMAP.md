@@ -577,7 +577,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
    - **DoD:** Tüm endpoint'ler curl ile çalışıyor, contract testleri geçiyor.
 
 ### Faz 3: İşleme motoru
-- [ ] 9. **Kuyruk:** Claim, lease, heartbeat, reaper, `LISTEN/NOTIFY` + poll.
+- [x] 9. **Kuyruk:** Claim, lease, heartbeat, reaper, `LISTEN/NOTIFY` + poll.
 - [ ] 10. **Rate limiter:** Redis GCRA Lua, yerel fallback, doğruluk testi.
 - [ ] 11. **Provider client ve mock provider:** Hata sınıflandırması, fault injection.
 - [ ] 12. **Worker:** Kanal havuzları, öncelik ve aging, claim miktarının limite bağlanması, graceful shutdown.
