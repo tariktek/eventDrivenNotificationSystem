@@ -42,6 +42,17 @@ jobs:
           name: coverage
           path: coverage.out
 
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Test (testcontainers, Docker is preinstalled on the runner)
+        run: go test -race -count=1 -tags=integration ./...
+
   build:
     name: Build
     runs-on: ubuntu-latest

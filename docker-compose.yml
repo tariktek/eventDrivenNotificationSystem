@@ -59,7 +59,7 @@ services:
 
   # Applies versioned schema migrations once, then exits.
   migrate:
-    image: migrate/migrate:v4.18.3
+    image: migrate/migrate:v4.20.1
     volumes:
       - ./migrations:/migrations:ro
     command:

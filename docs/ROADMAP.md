@@ -554,60 +554,62 @@ Komutlar:
 
 Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test:`, `docs:`, `chore:`). Her commit derlenir ve testleri geçer. Her fazın sonunda "bitti" kriteri (DoD) kontrol edilir.
 
+**İlerleme:** `[x]` tamamlandı, `[ ]` bekliyor. Her adım bitince işaretlenir ve o adımın commit'ine dahil edilir.
+
 ### Faz 0: Hazırlık
-0. Go 1.23+, Docker Desktop, `make` (Windows için Git Bash veya `choco install make`) kurulumu.
+- [ ] 0. Go 1.27, Docker Desktop kurulumu ✅ · GitHub repo ✅ · webhook.site URL'i ⏳ (Adım 11'den önce gerekli).
    - webhook.site'ta URL açılır: "Edit" → status 202, content-type `application/json`, body `{"messageId":"$request.uuid$","status":"accepted","timestamp":"$time$"}` (webhook.site'ın değişken desteğiyle).
    - GitHub'da boş bir repo açılır.
    - **DoD:** `go version`, `docker compose version` çalışıyor; webhook.site'a atılan curl isteği 202 dönüyor.
 
 ### Faz 1: Temel
-1. **İskelet:** `go mod init`, klasör yapısı, config (fail-fast), logger, Makefile, `.golangci.yml`, `.gitignore`, `.env.example`, `git init`. İlk CI iskeleti (lint + build).
-2. **Altyapı:** Dockerfile ve docker-compose'un ilk hali (postgres, redis, migrate), graceful shutdown iskeleti, `/health` ve `/ready`.
-3. **Migration'lar ve domain:** Tüm tablolar; entity'ler, state machine ve testleri.
-4. **Validation ve template motoru:** SMS segment hesabı dahil, table-driven testler ve fuzz.
+- [x] 1. **İskelet:** `go mod init`, klasör yapısı, config (fail-fast), logger, Makefile, `.golangci.yml`, `.gitignore`, `.env.example`, `git init`. İlk CI iskeleti (lint + build).
+- [x] 2. **Altyapı:** Dockerfile ve docker-compose'un ilk hali (postgres, redis, migrate), graceful shutdown iskeleti, `/health` ve `/ready`.
+- [x] 3. **Migration'lar ve domain:** Tüm tablolar; entity'ler, state machine ve testleri.
+- [ ] 4. **Validation ve template motoru:** SMS segment hesabı dahil, table-driven testler ve fuzz.
    - **DoD:** `docker compose up` DB'yi migrate ediyor, `make test-unit` geçiyor.
 
 ### Faz 2: API
-5. **OpenAPI spec (ilk tam hali)** ve `oapi-codegen` kurulumu.
-6. **Repository katmanı:** sqlc sorguları, dinamik liste builder'ı, tx yöneticisi, `COPY` ile batch insert, integration testleri.
-7. **Servis ve handler'lar:** create, batch, get, list, cancel, retry, template CRUD ve preview.
-8. **Middleware'ler:** auth, correlation ID, request log, recovery, body limit; idempotency (eşzamanlılık testiyle birlikte).
+- [ ] 5. **OpenAPI spec (ilk tam hali)** ve `oapi-codegen` kurulumu.
+- [ ] 6. **Repository katmanı:** sqlc sorguları, dinamik liste builder'ı, tx yöneticisi, `COPY` ile batch insert, integration testleri.
+- [ ] 7. **Servis ve handler'lar:** create, batch, get, list, cancel, retry, template CRUD ve preview.
+- [ ] 8. **Middleware'ler:** auth, correlation ID, request log, recovery, body limit; idempotency (eşzamanlılık testiyle birlikte).
    - **DoD:** Tüm endpoint'ler curl ile çalışıyor, contract testleri geçiyor.
 
 ### Faz 3: İşleme motoru
-9. **Kuyruk:** Claim, lease, heartbeat, reaper, `LISTEN/NOTIFY` + poll.
-10. **Rate limiter:** Redis GCRA Lua, yerel fallback, doğruluk testi.
-11. **Provider client ve mock provider:** Hata sınıflandırması, fault injection.
-12. **Worker:** Kanal havuzları, öncelik ve aging, claim miktarının limite bağlanması, graceful shutdown.
-13. **Retry ve failure handling:** Backoff, `Retry-After`, circuit breaker, DLQ, attempts kaydı.
+- [ ] 9. **Kuyruk:** Claim, lease, heartbeat, reaper, `LISTEN/NOTIFY` + poll.
+- [ ] 10. **Rate limiter:** Redis GCRA Lua, yerel fallback, doğruluk testi.
+- [ ] 11. **Provider client ve mock provider:** Hata sınıflandırması, fault injection.
+- [ ] 12. **Worker:** Kanal havuzları, öncelik ve aging, claim miktarının limite bağlanması, graceful shutdown.
+- [ ] 13. **Retry ve failure handling:** Backoff, `Retry-After`, circuit breaker, DLQ, attempts kaydı.
     - **DoD:** E2E testleri (retry, kalıcı hata, devre açılması, chaos) geçiyor; uçtan uca bir bildirim webhook.site'a ulaşıyor.
 
 ### Faz 4: Event'ler ve gerçek zamanlılık
-14. **Outbox ve relay:** Redis Streams publisher, consumer group yönetimi.
-15. **WebSocket hub:** Abonelik, filtreleme, ping/pong, backpressure.
-16. **Status callback'leri:** HMAC imzası, retry, SSRF koruması.
-17. **Scheduled bildirimler:** Uçtan uca test (scheduled → pending → sent ve iptal).
+- [ ] 14. **Outbox ve relay:** Redis Streams publisher, consumer group yönetimi.
+- [ ] 15. **WebSocket hub:** Abonelik, filtreleme, ping/pong, backpressure.
+- [ ] 16. **Status callback'leri:** HMAC imzası, retry, SSRF koruması.
+- [ ] 17. **Scheduled bildirimler:** Uçtan uca test (scheduled → pending → sent ve iptal).
     - **DoD:** Bir batch gönderildiğinde WebSocket client'ı tüm durum değişikliklerini sırayla görüyor; callback alıcısı imzayı doğrulayabiliyor.
 
 ### Faz 5: Gözlemlenebilirlik
-18. **Prometheus metrikleri** ve `/api/v1/metrics` JSON özeti, queue depth sampler.
-19. **OpenTelemetry + Jaeger:** Span link'leri, log'larda `trace_id`.
-20. **Grafana dashboard'u ve alert kuralları:** Provisioning dahil.
-21. **Log'larda PII maskeleme.**
+- [ ] 18. **Prometheus metrikleri** ve `/api/v1/metrics` JSON özeti, queue depth sampler.
+- [ ] 19. **OpenTelemetry + Jaeger:** Span link'leri, log'larda `trace_id`.
+- [ ] 20. **Grafana dashboard'u ve alert kuralları:** Provisioning dahil.
+- [ ] 21. **Log'larda PII maskeleme.**
     - **DoD:** Tek bir bildirim, correlation ID ile loglardan ve trace ID ile Jaeger'dan uçtan uca takip edilebiliyor; dashboard canlı veri gösteriyor.
 
 ### Faz 6: Kalite ve kanıt
-22. **E2E test setinin tamamlanması**; `make test` tek komutla her şeyi çalıştırıyor.
-23. **k6 yük testleri:** Sonuçların ölçülmesi; gerekirse indeks ve batch boyutu ayarı (bulgular ADR'ye yazılır).
-24. **CI'ın tamamlanması:** Generate-check, integration, govulncheck, Trivy, coverage, Dependabot, GHCR push.
-25. **Güvenlik gözden geçirmesi:** gosec bulguları, container sertleştirme, secret taraması.
+- [ ] 22. **E2E test setinin tamamlanması**; `make test` tek komutla her şeyi çalıştırıyor.
+- [ ] 23. **k6 yük testleri:** Sonuçların ölçülmesi; gerekirse indeks ve batch boyutu ayarı (bulgular ADR'ye yazılır).
+- [ ] 24. **CI'ın tamamlanması:** Generate-check, integration, govulncheck, Trivy, coverage, Dependabot, GHCR push.
+- [ ] 25. **Güvenlik gözden geçirmesi:** gosec bulguları, container sertleştirme, secret taraması.
     - **DoD:** CI yeşil; yük testi kanal başına 100/s limitinin aşılmadığını ve burst'ün kayıpsız eridiğini gösteriyor.
 
 ### Faz 7: Teslim
-26. **OpenAPI'nin son hali:** Örnekler ve hata yanıtları.
-27. **Dokümantasyon:** README, architecture.md, ADR'ler, runbook, `requests.http`.
-28. **Temiz kurulum provası:** Repo sıfırdan klonlanır, sadece `docker-compose up` ve README'deki adımlarla her şeyin çalıştığı doğrulanır. Commit geçmişi gözden geçirilir.
-29. **Teslim:** Repo linki paylaşılır.
+- [ ] 26. **OpenAPI'nin son hali:** Örnekler ve hata yanıtları.
+- [ ] 27. **Dokümantasyon:** README, architecture.md, ADR'ler, runbook, `requests.http`.
+- [ ] 28. **Temiz kurulum provası:** Repo sıfırdan klonlanır, sadece `docker-compose up` ve README'deki adımlarla her şeyin çalıştığı doğrulanır. Commit geçmişi gözden geçirilir.
+- [ ] 29. **Teslim:** Repo linki paylaşılır.
 
 ---
 
