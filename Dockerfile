@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     set -e; \
     pkg=github.com/tariktek/eventDrivenNotificationSystem/internal/platform/buildinfo; \
-    for bin in api worker healthcheck; do \
+    for bin in api worker mockprovider healthcheck; do \
       go build -trimpath \
         -ldflags "-s -w -X ${pkg}.Version=${VERSION} -X ${pkg}.Commit=${COMMIT}" \
         -o /out/${bin} ./cmd/${bin}; \

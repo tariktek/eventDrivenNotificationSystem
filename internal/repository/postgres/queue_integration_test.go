@@ -92,6 +92,38 @@ func TestClaim_AgingPreventsStarvation(t *testing.T) {
 	assert.Equal(t, oldLow.ID, got[0].ID)
 }
 
+// TestClaim_FullyAgedLowBeatsFreshHigh is the overload case: high-priority
+// traffic alone fills the channel's capacity. A low notification that has
+// waited two aging steps must still get through ahead of newly arriving
+// high ones, or it would wait for as long as the overload lasts.
+func TestClaim_FullyAgedLowBeatsFreshHigh(t *testing.T) {
+	reset(t)
+	now := baseTime.Add(10 * time.Minute)
+	oldLow := due(t, domain.ChannelSMS, domain.PriorityLow, baseTime)
+	for range 5 {
+		due(t, domain.ChannelSMS, domain.PriorityHigh, now.Add(-time.Second))
+	}
+
+	got, err := store.Queue().Claim(t.Context(), claimReq(domain.ChannelSMS, "w", 1, now))
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, oldLow.ID, got[0].ID)
+}
+
+// TestClaim_HighStillPreemptsWhenNoOneIsStarving: aging only reorders work
+// that has waited; normally high goes first even if low arrived earlier.
+func TestClaim_HighStillPreemptsWhenNoOneIsStarving(t *testing.T) {
+	reset(t)
+	now := baseTime.Add(4 * time.Minute) // under one aging step
+	due(t, domain.ChannelSMS, domain.PriorityLow, baseTime)
+	high := due(t, domain.ChannelSMS, domain.PriorityHigh, now)
+
+	got, err := store.Queue().Claim(t.Context(), claimReq(domain.ChannelSMS, "w", 1, now))
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, high.ID, got[0].ID)
+}
+
 func TestClaim_ScheduledWaitsForItsTime(t *testing.T) {
 	reset(t)
 	at := baseTime.Add(time.Hour)

@@ -557,7 +557,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
 **İlerleme:** `[x]` tamamlandı, `[ ]` bekliyor. Her adım bitince işaretlenir ve o adımın commit'ine dahil edilir.
 
 ### Faz 0: Hazırlık
-- [ ] 0. Go 1.27, Docker Desktop kurulumu ✅ · GitHub repo ✅ · webhook.site URL'i ⏳ (Adım 11'den önce gerekli).
+- [x] 0. Go 1.27, Docker Desktop kurulumu ✅ · GitHub repo ✅ · webhook.site URL'i ✅
    - webhook.site'ta URL açılır: "Edit" → status 202, content-type `application/json`, body `{"messageId":"$request.uuid$","status":"accepted","timestamp":"$time$"}` (webhook.site'ın değişken desteğiyle).
    - GitHub'da boş bir repo açılır.
    - **DoD:** `go version`, `docker compose version` çalışıyor; webhook.site'a atılan curl isteği 202 dönüyor.
@@ -579,7 +579,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
 ### Faz 3: İşleme motoru
 - [x] 9. **Kuyruk:** Claim, lease, heartbeat, reaper, `LISTEN/NOTIFY` + poll.
 - [x] 10. **Rate limiter:** Redis GCRA Lua, yerel fallback, doğruluk testi.
-- [ ] 11. **Provider client ve mock provider:** Hata sınıflandırması, fault injection.
+- [x] 11. **Provider client ve mock provider:** Hata sınıflandırması, fault injection.
 - [ ] 12. **Worker:** Kanal havuzları, öncelik ve aging, claim miktarının limite bağlanması, graceful shutdown.
 - [ ] 13. **Retry ve failure handling:** Backoff, `Retry-After`, circuit breaker, DLQ, attempts kaydı.
     - **DoD:** E2E testleri (retry, kalıcı hata, devre açılması, chaos) geçiyor; uçtan uca bir bildirim webhook.site'a ulaşıyor.

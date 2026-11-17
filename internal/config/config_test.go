@@ -26,6 +26,17 @@ func TestLoadFrom_Defaults(t *testing.T) {
 	assert.Equal(t, 24*time.Hour, cfg.Auth.IdempotencyTTL)
 }
 
+func TestProviderConfig_URLFor(t *testing.T) {
+	cfg, err := config.LoadFrom(map[string]string{
+		"PROVIDER_URL":       "https://provider.example/send",
+		"PROVIDER_URL_EMAIL": "https://mail.example/send",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "https://provider.example/send", cfg.Provider.URLFor("sms"))
+	assert.Equal(t, "https://mail.example/send", cfg.Provider.URLFor("email"))
+	assert.Equal(t, "https://provider.example/send", cfg.Provider.URLFor("push"))
+}
+
 func TestLoadFrom_MultipleAPIKeysForRotation(t *testing.T) {
 	cfg, err := config.LoadFrom(map[string]string{"API_KEYS": "key-one, key-two "})
 	require.NoError(t, err)
@@ -75,6 +86,9 @@ func TestLoadFrom_Invalid(t *testing.T) {
 		{"dev key in production", map[string]string{"APP_ENV": "production"}, "API_KEYS"},
 		{"short key in production", map[string]string{"APP_ENV": "production", "API_KEYS": "short"}, "API_KEYS"},
 		{"zero idempotency ttl", map[string]string{"IDEMPOTENCY_TTL": "0s"}, "IDEMPOTENCY_TTL"},
+		{"provider url not http", map[string]string{"PROVIDER_URL": "ftp://x/send"}, "PROVIDER_URL"},
+		{"bad channel provider url", map[string]string{"PROVIDER_URL_EMAIL": "not a url"}, "PROVIDER_URL_EMAIL"},
+		{"zero provider timeout", map[string]string{"PROVIDER_TIMEOUT": "0s"}, "PROVIDER_TIMEOUT"},
 		{"zero body limit", map[string]string{"HTTP_MAX_BODY_BYTES": "0"}, "HTTP_MAX_BODY_BYTES"},
 		{"insecure callbacks in production", map[string]string{"APP_ENV": "production", "CALLBACK_ALLOW_PRIVATE": "true"}, "CALLBACK_ALLOW"},
 		// Parse errors come from the env library and name the struct field and

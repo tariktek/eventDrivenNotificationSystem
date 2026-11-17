@@ -18,6 +18,9 @@ x-app: &app
     SHUTDOWN_TIMEOUT: 20s
     DATABASE_URL: postgres://notification:notification@postgres:5432/notification?sslmode=disable
     REDIS_URL: redis://redis:6379/0
+    # Bundled mock provider by default; set PROVIDER_URL (e.g. in .env) to a
+    # webhook.site URL to deliver there instead.
+    PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:9000/send}
     # Local development key; send it as X-API-Key (Swagger UI: "Authorize").
     API_KEYS: ${API_KEYS:-dev-api-key-change-me}
     # Local development: allow http:// and private-network callback URLs so
@@ -85,6 +88,25 @@ services:
   worker:
     <<: *app
     entrypoint: ["/app/worker"]
+
+  # Stand-in for the external provider, with fault injection and stats:
+  #   GET  http://localhost:9000/admin/stats
+  #   PUT  http://localhost:9000/admin/config  {"failure_rate": 0.5, "latency": "50ms"}
+  mockprovider:
+    image: notification-system:local
+    entrypoint: ["/app/mockprovider"]
+    environment:
+      MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0}
+      MOCK_RATE_LIMIT_RATE: ${MOCK_RATE_LIMIT_RATE:-0}
+      MOCK_PERMANENT_FAILURE_RATE: ${MOCK_PERMANENT_FAILURE_RATE:-0}
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
 
 volumes:
   pgdata:

@@ -4,7 +4,7 @@ COMMIT   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 LDFLAGS  := -s -w \
 	-X $(MODULE)/internal/platform/buildinfo.Version=$(VERSION) \
 	-X $(MODULE)/internal/platform/buildinfo.Commit=$(COMMIT)
-BINARIES := api worker healthcheck
+BINARIES := api worker mockprovider healthcheck
 
 .DEFAULT_GOAL := help
 

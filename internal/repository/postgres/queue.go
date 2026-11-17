@@ -33,9 +33,14 @@ func (s *Store) Queue() QueueStore { return QueueStore{repo: s.Repo, pool: s.poo
 //     next_attempt_at), so the cost does not grow with the backlog.
 //  2. picked: re-checks those rows under FOR UPDATE SKIP LOCKED (the
 //     candidate read is unlocked and may be stale) and orders them by
-//     effective priority: priority minus one level per $aging of waiting.
-//     The oldest rows of each priority are also the most aged, so taking
-//     the top of each branch cannot miss a row that would sort first.
+//     effective priority (priority minus one level per $aging of waiting),
+//     then by how long they have been due. Ties go to the longer wait, not
+//     the original priority: otherwise a fully aged low notification would
+//     still lose to every fresh high one, and sustained high traffic would
+//     starve low traffic forever, the very thing aging exists to prevent.
+//     The bound is: nothing waits longer than 2 × $aging behind newer work.
+//     Within each priority the oldest rows rank first under this order, so
+//     taking the top of each branch cannot miss a row that would sort first.
 //  3. The UPDATE moves the picked rows to processing under our lease.
 //
 // SKIP LOCKED is what lets many workers claim concurrently: rows another
@@ -61,7 +66,7 @@ picked AS (
     WHERE n.id IN (SELECT id FROM candidates)
       AND n.status IN ('pending', 'scheduled') AND n.next_attempt_at <= $2
     ORDER BY GREATEST(n.priority - floor(extract(epoch FROM ($2 - n.next_attempt_at)) / $6)::int, 0),
-             n.priority, n.next_attempt_at
+             n.next_attempt_at
     LIMIT $4
     FOR UPDATE SKIP LOCKED
 )

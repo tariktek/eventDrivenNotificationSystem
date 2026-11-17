@@ -36,6 +36,27 @@ type Config struct {
 	Redis    RedisConfig    `envPrefix:"REDIS_"`
 	Callback CallbackConfig `envPrefix:"CALLBACK_"`
 	Auth     AuthConfig
+	Provider ProviderConfig `envPrefix:"PROVIDER_"`
+}
+
+// ProviderConfig locates the external notification provider. URL serves
+// every channel unless a channel-specific URL overrides it (real systems
+// often use a different vendor per channel).
+type ProviderConfig struct {
+	URL      string        `env:"URL"       envDefault:"http://localhost:9000/send"`
+	URLSMS   string        `env:"URL_SMS"`
+	URLEmail string        `env:"URL_EMAIL"`
+	URLPush  string        `env:"URL_PUSH"`
+	Timeout  time.Duration `env:"TIMEOUT"   envDefault:"10s"`
+}
+
+// URLFor returns the endpoint for a channel ("sms", "email" or "push").
+func (p ProviderConfig) URLFor(channel string) string {
+	override := map[string]string{"sms": p.URLSMS, "email": p.URLEmail, "push": p.URLPush}[channel]
+	if override != "" {
+		return override
+	}
+	return p.URL
 }
 
 // DevAPIKey is the default key for local development. It is rejected when
@@ -173,6 +194,21 @@ func (c Config) Validate() error {
 
 	if c.Env == EnvProduction && (c.Callback.AllowInsecure || c.Callback.AllowPrivate) {
 		errs = append(errs, errors.New("CALLBACK_ALLOW_INSECURE/CALLBACK_ALLOW_PRIVATE: must be false in production"))
+	}
+
+	for name, u := range map[string]string{
+		"PROVIDER_URL": c.Provider.URL, "PROVIDER_URL_SMS": c.Provider.URLSMS,
+		"PROVIDER_URL_EMAIL": c.Provider.URLEmail, "PROVIDER_URL_PUSH": c.Provider.URLPush,
+	} {
+		if u == "" && name != "PROVIDER_URL" {
+			continue // optional override
+		}
+		if err := validateURL(u, "http", "https"); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+		}
+	}
+	if c.Provider.Timeout <= 0 {
+		errs = append(errs, errors.New("PROVIDER_TIMEOUT: must be positive"))
 	}
 
 	if err := validateURL(c.Database.URL, "postgres", "postgresql"); err != nil {
