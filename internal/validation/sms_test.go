@@ -37,8 +37,8 @@ func TestAnalyzeSMS(t *testing.T) {
 		{"gsm accented letters stay gsm", "Çéüöä", validation.EncodingGSM7, 5, 1},
 		// GSM 03.38 has capital Ç but no lowercase ç: most Turkish text,
 		// even without ş/ğ/ı, falls back to UCS-2 and 70 characters.
-		{"lowercase c-cedilla forces ucs2", "çok", validation.EncodingUCS2, 3, 1},
-		{"turkish letters force ucs2", "Şifreniz: 1234", validation.EncodingUCS2, 14, 1},
+		{"lowercase c-cedilla forces ucs2", "çab", validation.EncodingUCS2, 3, 1},
+		{"turkish letters force ucs2", "Ş-code: 1234", validation.EncodingUCS2, 12, 1},
 		{"ucs2 single limit", "ş" + a(69), validation.EncodingUCS2, 70, 1},
 		{"ucs2 one over", "ş" + a(70), validation.EncodingUCS2, 71, 2},
 		{"emoji is a surrogate pair", "😀", validation.EncodingUCS2, 2, 1},
@@ -57,7 +57,7 @@ func TestAnalyzeSMS(t *testing.T) {
 }
 
 func FuzzAnalyzeSMS(f *testing.F) {
-	for _, seed := range []string{"", "hello", "€€€", "Şifre", "😀😀", strings.Repeat("a", 200), "\xff\xfe"} {
+	for _, seed := range []string{"", "hello", "€€€", "Ş-code", "😀😀", strings.Repeat("a", 200), "\xff\xfe"} {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, s string) {

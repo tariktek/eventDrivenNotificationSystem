@@ -39,7 +39,7 @@ func strictJSON(f api.StrictHandlerFunc, operationID string) api.StrictHandlerFu
 	return func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error) {
 		raw, _ := middleware.Body(ctx)
 		// encoding/json silently replaces invalid UTF-8 with U+FFFD, which
-		// would turn a cp1254 "Şifre" into "�ifre" in the sent message.
+		// would turn a cp1254 "Ş-code" into "�-code" in the sent message.
 		if !utf8.Valid(raw) {
 			return nil, apierror.BadRequest("request body must be UTF-8 encoded")
 		}

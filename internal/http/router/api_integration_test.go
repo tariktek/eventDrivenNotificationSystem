@@ -260,9 +260,9 @@ func TestCreateNotification_BadRequests(t *testing.T) {
 		"wrong type":     `{"channel":"sms","recipient":12345,"content":"hi"}`,
 		"trailing data":  `{"channel":"sms","recipient":"+905551234567","content":"hi"} {}`,
 		"empty body":     ``,
-		// "Şifre" encoded as Windows-1254, not UTF-8: must be refused, not
-		// silently stored as "�ifre".
-		"invalid utf8": "{\"channel\":\"sms\",\"recipient\":\"+905551234567\",\"content\":\"\xdeifre\"}",
+		// "Ş-code" encoded as Windows-1254, not UTF-8: must be refused, not
+		// silently stored as "�-code".
+		"invalid utf8": "{\"channel\":\"sms\",\"recipient\":\"+905551234567\",\"content\":\"\xde-code\"}",
 	}
 	for name, body := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -275,11 +275,11 @@ func TestCreateNotification_BadRequests(t *testing.T) {
 
 func TestCreateNotification_UnicodeRoundTrip(t *testing.T) {
 	reset(t)
-	res := call(t, http.MethodPost, "/api/v1/notifications", sms(map[string]any{"content": "Şifreniz: 4821 çğıöü 😀"}))
+	res := call(t, http.MethodPost, "/api/v1/notifications", sms(map[string]any{"content": "Ş-code: 4821 çğıöü 😀"}))
 	require.Equal(t, http.StatusCreated, res.Code)
 	n := res.json(t)
-	assert.Equal(t, "Şifreniz: 4821 çğıöü 😀", n["content"])
-	assert.EqualValues(t, 1, n["segments"], "UCS-2, 23 units: one segment")
+	assert.Equal(t, "Ş-code: 4821 çğıöü 😀", n["content"])
+	assert.EqualValues(t, 1, n["segments"], "UCS-2, 21 units: one segment")
 }
 
 func TestBodyTooLarge(t *testing.T) {
