@@ -1,6 +1,6 @@
 MODULE   := github.com/tariktek/eventDrivenNotificationSystem
-VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-COMMIT   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+VERSION  ?= $(shell git describe --tags --always --dirty || echo dev)
+COMMIT   ?= $(shell git rev-parse --short HEAD || echo none)
 LDFLAGS  := -s -w \
 	-X $(MODULE)/internal/platform/buildinfo.Version=$(VERSION) \
 	-X $(MODULE)/internal/platform/buildinfo.Commit=$(COMMIT)
@@ -8,9 +8,12 @@ BINARIES := api worker mockprovider healthcheck
 
 .DEFAULT_GOAL := help
 
+# Recipes are plain commands so they also run from PowerShell/cmd on
+# Windows; only "help" needs a Unix shell (grep, awk: use Git Bash or WSL).
+
 .PHONY: help
 help: ## List available targets
-	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
 ## ---------- Development ----------
 
@@ -95,10 +98,10 @@ test-e2e: ## Run the end-to-end tests: API + worker + relay + callbacks (needs D
 
 .PHONY: test-fuzz
 test-fuzz: ## Fuzz the input parsers for FUZZTIME each (default 30s)
-	go test -run '^$$' -fuzz '^FuzzNotification$$' -fuzztime $(FUZZTIME) ./internal/validation/
-	go test -run '^$$' -fuzz '^FuzzAnalyzeSMS$$' -fuzztime $(FUZZTIME) ./internal/validation/
-	go test -run '^$$' -fuzz '^FuzzParseAndRender$$' -fuzztime $(FUZZTIME) ./internal/msgtemplate/
-	go test -run '^$$' -fuzz '^FuzzDecodeCursor$$' -fuzztime $(FUZZTIME) ./internal/repository/postgres/
+	go test -run "^$$" -fuzz "^FuzzNotification$$" -fuzztime $(FUZZTIME) ./internal/validation/
+	go test -run "^$$" -fuzz "^FuzzAnalyzeSMS$$" -fuzztime $(FUZZTIME) ./internal/validation/
+	go test -run "^$$" -fuzz "^FuzzParseAndRender$$" -fuzztime $(FUZZTIME) ./internal/msgtemplate/
+	go test -run "^$$" -fuzz "^FuzzDecodeCursor$$" -fuzztime $(FUZZTIME) ./internal/repository/postgres/
 
 .PHONY: cover
 cover: ## Run all tests and write an HTML coverage report (needs Docker)
