@@ -16,8 +16,11 @@ package outbox
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
@@ -104,6 +107,20 @@ func (r *Relay) RelayOnce(ctx context.Context) (int, error) {
 		if err := repo.MarkEventsPublished(ctx, ids, r.now()); err != nil {
 			return err
 		}
+		// Wake the workers for channels that just got due work. Done here,
+		// once per round, rather than in a trigger on every insert: NOTIFY
+		// serializes the commits of all transactions that use it.
+		if chans := dueChannels(evs, r.now()); len(chans) > 0 {
+			if err := repo.NotifyDue(ctx, chans); err != nil {
+				return err
+			}
+		}
+		// Batch progress, in this transaction: a change is counted exactly
+		// when its event is marked published, even if the relay crashes and
+		// publishes the event again.
+		if err := r.trackBatches(ctx, repo, evs); err != nil {
+			return err
+		}
 		published = evs
 		return nil
 	})
@@ -111,6 +128,106 @@ func (r *Relay) RelayOnce(ctx context.Context) (int, error) {
 		r.cfg.OnPublished(published)
 	}
 	return len(published), err
+}
+
+// finalStatuses are the statuses that count a batch item as finished.
+var finalStatuses = map[string]bool{"sent": true, "failed": true, "cancelled": true}
+
+// trackBatches updates the finished counts of the batches these events
+// touch and emits batch.completed for those that just finished. The relay
+// is the only writer of the counts and updates each batch once per round,
+// so deliveries never wait for one another on a batch row.
+//
+// Events of one notification arrive in order, and a batch's created events
+// (one insert, one transaction) all precede its items' later changes, so a
+// batch cannot look finished before all of its items are.
+func (r *Relay) trackBatches(ctx context.Context, repo *postgres.Repo, evs []events.Event) error {
+	deltas := map[uuid.UUID]int32{}
+	var order []uuid.UUID
+	for i := range evs {
+		if evs[i].Type != events.TypeNotificationStatusChanged {
+			continue
+		}
+		var p events.NotificationPayload
+		if json.Unmarshal(evs[i].Payload, &p) != nil || p.BatchID == nil || p.PreviousStatus == nil {
+			continue
+		}
+		d := b2i(finalStatuses[p.Status]) - b2i(finalStatuses[*p.PreviousStatus])
+		if d == 0 {
+			continue
+		}
+		if _, ok := deltas[*p.BatchID]; !ok {
+			order = append(order, *p.BatchID)
+		}
+		deltas[*p.BatchID] += d
+	}
+	if len(order) == 0 {
+		return nil
+	}
+	ds := make([]int32, len(order))
+	for i, id := range order {
+		ds[i] = deltas[id]
+	}
+	now := r.now()
+	rows, err := repo.AddBatchFinished(ctx, order, ds, now)
+	if err != nil {
+		return err
+	}
+	for _, b := range rows {
+		justFinished := b.Delta > 0 && b.FinishedCount >= b.CreatedCount && b.FinishedCount-b.Delta < b.CreatedCount
+		if !justFinished {
+			continue
+		}
+		counts, err := repo.BatchStatusCounts(ctx, b.ID)
+		if err != nil {
+			return err
+		}
+		payload, err := json.Marshal(map[string]any{
+			"batch_id": b.ID, "total": b.Total, "created": b.CreatedCount,
+			"counts": json.RawMessage(counts), "completed_at": b.CompletedAt, "occurred_at": now,
+		})
+		if err != nil {
+			return err
+		}
+		// Published by the next round.
+		if err := repo.InsertOutboxEvent(ctx, "batch", b.ID, events.TypeBatchCompleted, payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func b2i(b bool) int32 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// dueChannels returns the channels of notifications that these events made
+// pending and due now: new ones, and ones handed back by a worker. Retries
+// scheduled for later and scheduled sends are left to the workers' poll.
+func dueChannels(evs []events.Event, now time.Time) []string {
+	seen := map[string]bool{}
+	var out []string
+	for i := range evs {
+		if evs[i].AggregateType != "notification" {
+			continue
+		}
+		var p struct {
+			Status        string     `json:"status"`
+			Channel       string     `json:"channel"`
+			NextAttemptAt *time.Time `json:"next_attempt_at"`
+		}
+		if json.Unmarshal(evs[i].Payload, &p) != nil || p.Status != "pending" || seen[p.Channel] {
+			continue
+		}
+		if p.NextAttemptAt == nil || !p.NextAttemptAt.After(now) {
+			seen[p.Channel] = true
+			out = append(out, p.Channel)
+		}
+	}
+	return out
 }
 
 // prune deletes published events past retention, in chunks.

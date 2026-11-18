@@ -7,9 +7,11 @@
 //  1. waits for free delivery capacity (Concurrency per channel);
 //  2. asks the channel's circuit breaker how much it may send: everything
 //     when closed, nothing when open, a few probes when half-open;
-//  3. reserves send slots from the rate limiter (≤ Rate per second, shared
-//     by every worker instance);
-//  4. claims that many due notifications, highest effective priority first;
+//  3. claims up to that many due notifications, highest effective priority
+//     first;
+//  4. reserves send slots for them from the rate limiter (≤ Rate per
+//     second, shared by every worker instance), keeping any it got no slot
+//     for until the next reservation;
 //  5. hands each one a slot: a goroutine waits for the slot time, calls the
 //     provider, and records the outcome (sent / retry later / failed).
 //
@@ -184,8 +186,13 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 		slots      = make(chan struct{}, w.cfg.Concurrency) // in-flight deliveries
 		freed      = make(chan struct{}, 1)
 		cb         = w.breakers[ch]
+		// claimed holds notifications claimed but not yet given a send slot,
+		// in claim (priority) order. Their leases are kept alive by the
+		// heartbeat like those of in-flight deliveries.
+		claimed []*domain.Notification
 	)
 	defer deliveries.Wait()
+	defer func() { w.release(sendCtx, w.untrackAll(claimed)) }() // runs first: hand back the unsent
 
 	for ctx.Err() == nil {
 		free := w.cfg.Concurrency - len(slots)
@@ -193,17 +200,52 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 			waitAny(ctx, freed, nil, w.cfg.PollInterval)
 			continue
 		}
-		want := cb.Capacity(min(free, w.cfg.BatchSize))
-		if want == 0 {
-			// Breaker open (or all half-open probes out): claim nothing, so
-			// queued notifications keep their attempts. Re-check when a
-			// probe finishes or after a poll interval; the breaker moves to
-			// half-open on its own once its timeout passes.
-			waitAny(ctx, freed, nil, w.cfg.PollInterval)
-			continue
+
+		if len(claimed) == 0 {
+			want := cb.Capacity(min(free, w.cfg.BatchSize))
+			if want == 0 {
+				// Breaker open (or all half-open probes out): claim nothing,
+				// so queued notifications keep their attempts. Re-check when
+				// a probe finishes or after a poll interval; the breaker
+				// moves to half-open on its own once its timeout passes.
+				waitAny(ctx, freed, nil, w.cfg.PollInterval)
+				continue
+			}
+			// The claim runs on sendCtx, not ctx: if shutdown cancelled the
+			// query mid-flight, PostgreSQL could still commit it while we
+			// discard the result, leaving rows in "processing" that nobody
+			// would release (until the reaper, a lease later). Letting it
+			// finish means every claimed row is either delivered or
+			// released.
+			ns, err := w.Queue.Claim(sendCtx, queue.ClaimRequest{
+				Channel: ch, WorkerID: w.cfg.ID, Limit: want, Now: w.Now(), Lease: w.cfg.Lease, Aging: w.cfg.Aging,
+			})
+			if err != nil {
+				if ctx.Err() == nil {
+					w.Log.ErrorContext(ctx, "claim notifications", "channel", ch, "error", err)
+					sleep(ctx, w.cfg.PollInterval)
+				}
+				continue
+			}
+			if len(ns) == 0 { // nothing due
+				waitAny(ctx, w.wake[ch], nil, w.cfg.PollInterval)
+				continue
+			}
+			for _, n := range ns {
+				w.track(n.ID, true)
+			}
+			claimed = ns
 		}
 
-		res, err := w.Limiter.Reserve(ctx, string(ch), want)
+		// Reserve send slots only now, with the work in hand. Reserving
+		// before the claim looked cheaper, but under load a claim can take
+		// hundreds of milliseconds: the reserved slots would be in the past
+		// by the time the claim returned, those deliveries would all go out
+		// at once, on top of the next reservation's, and the provider would
+		// see well over the limit in that second (measured: 175/s at a
+		// 100/s limit in the flash-sale load test). Now a slot is at most a
+		// Redis round trip old when its delivery is scheduled.
+		res, err := w.Limiter.Reserve(ctx, string(ch), min(len(claimed), free))
 		if err != nil {
 			if ctx.Err() == nil {
 				w.Log.ErrorContext(ctx, "reserve send slots", "channel", ch, "error", err)
@@ -211,44 +253,20 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 			}
 			continue
 		}
-		if res.Count == 0 { // this second's slots are taken; wait for the next one
+		if res.Count == 0 { // the next second's slots are taken; wait for one
 			sleep(ctx, res.First)
 			continue
 		}
 		base := w.Now()
 
-		// The claim runs on sendCtx, not ctx: if shutdown cancelled the query
-		// mid-flight, PostgreSQL could still commit it while we discard the
-		// result, leaving rows in "processing" that nobody would release
-		// (until the reaper, a lease later). Letting it finish means every
-		// claimed row reaches a delivery goroutine, which releases it at
-		// once if shutdown has begun.
-		ns, err := w.Queue.Claim(sendCtx, queue.ClaimRequest{
-			Channel: ch, WorkerID: w.cfg.ID, Limit: res.Count, Now: base, Lease: w.cfg.Lease, Aging: w.cfg.Aging,
-		})
-		if err != nil {
-			if ctx.Err() == nil {
-				w.Log.ErrorContext(ctx, "claim notifications", "channel", ch, "error", err)
-				sleep(ctx, w.cfg.PollInterval)
-			}
-			continue
-		}
-		if len(ns) == 0 {
-			// Nothing due. The unused slots simply lapse: the limiter only
-			// matters when there is a backlog, and then claims are full.
-			waitAny(ctx, w.wake[ch], nil, w.cfg.PollInterval)
-			continue
-		}
-
 		var rejected []uuid.UUID
-		for i, n := range ns {
+		for i, n := range claimed[:res.Count] {
 			ticket := cb.Admit()
-			if ticket == nil { // the breaker opened since Capacity
+			if ticket == nil { // the breaker opened while these waited
 				rejected = append(rejected, n.ID)
 				continue
 			}
 			slots <- struct{}{}
-			w.track(n.ID, true)
 			at := base.Add(res.Delay(i))
 			deliveries.Go(func() {
 				defer func() {
@@ -262,8 +280,23 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 				w.deliver(ctx, sendCtx, n, at, ticket)
 			})
 		}
+		claimed = claimed[res.Count:]
 		w.release(sendCtx, rejected)
+		for _, id := range rejected {
+			w.track(id, false)
+		}
 	}
+}
+
+// untrackAll stops heartbeating the given notifications and returns their
+// ids.
+func (w *Worker) untrackAll(ns []*domain.Notification) []uuid.UUID {
+	ids := make([]uuid.UUID, len(ns))
+	for i, n := range ns {
+		ids[i] = n.ID
+		w.track(n.ID, false)
+	}
+	return ids
 }
 
 // release hands claimed-but-unsent notifications back to the queue with

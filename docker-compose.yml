@@ -153,13 +153,32 @@ services:
     restart: unless-stopped
 
   # Jaeger: http://localhost:16686. Receives OTLP over HTTP on 4318.
+  # In-memory storage, capped: unbounded, a load test's ~300k delivery
+  # traces filled 6 GB and starved the other containers. Only the most
+  # recent traces are kept.
   jaeger:
     image: jaegertracing/all-in-one:1.60.0
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+      MEMORY_MAX_TRACES: "20000"
     ports:
       - "16686:16686"
     restart: unless-stopped
+
+  # Load tests (not started by "up"): make test-load, or
+  #   docker compose --profile load run --rm k6 run /scripts/flash-sale.js
+  k6:
+    image: grafana/k6:0.54.0
+    profiles: ["load"]
+    volumes:
+      - ./loadtest:/scripts:ro
+    environment:
+      BASE_URL: http://api:8080
+      MOCK_URL: http://mockprovider:9000
+      API_KEY: ${API_KEYS:-dev-api-key-change-me}
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   pgdata:

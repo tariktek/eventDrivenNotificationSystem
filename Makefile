@@ -103,6 +103,12 @@ test-fuzz: ## Fuzz the input parsers for FUZZTIME each (default 30s)
 	go test -run "^$$" -fuzz "^FuzzParseAndRender$$" -fuzztime $(FUZZTIME) ./internal/msgtemplate/
 	go test -run "^$$" -fuzz "^FuzzDecodeCursor$$" -fuzztime $(FUZZTIME) ./internal/repository/postgres/
 
+.PHONY: test-load
+test-load: ## Run the k6 load tests against the running stack (make up first; ~10 min)
+	docker compose --profile load run --rm k6 run /scripts/steady.js
+	docker compose --profile load run --rm k6 run /scripts/flash-sale.js
+	docker compose --profile load run --rm k6 run /scripts/provider-faults.js
+
 .PHONY: cover
 cover: ## Run all tests and write an HTML coverage report (needs Docker)
 	go test -count=1 -p 1 -tags=integration -coverpkg=./internal/... -coverprofile=coverage.out ./...

@@ -169,6 +169,22 @@ func complete(t *testing.T, n *domain.Notification, status domain.Status) {
 	require.True(t, applied)
 }
 
+// relayAll runs relay rounds until nothing is left to publish. Batch
+// completion is counted by the relay, and the batch.completed event it
+// emits goes out in the following round.
+func relayAll(t *testing.T) {
+	t.Helper()
+	r := outbox.New(store, events.NewPublisher(rdb, events.DefaultStream, 100000), relayConfig(), quiet)
+	for range 20 {
+		n, err := r.RelayOnce(t.Context())
+		require.NoError(t, err)
+		if n == 0 {
+			return
+		}
+	}
+	t.Fatal("relay did not settle")
+}
+
 // ---- triggers --------------------------------------------------------------
 
 func TestTriggers_EveryStatusChangeIsAnEvent(t *testing.T) {
@@ -202,6 +218,7 @@ func TestTriggers_EveryStatusChangeIsAnEvent(t *testing.T) {
 	_, err = store.CancelNotification(t.Context(), third, time.Now())
 	require.NoError(t, err)
 
+	relayAll(t) // batch completion is counted by the relay
 	rows = outboxRows(t)
 	seq := statuses(rows)
 	assert.Equal(t, []string{"pending", "processing", "sent"}, seq[claimed[0].ID])
@@ -223,9 +240,10 @@ func TestTriggers_EveryStatusChangeIsAnEvent(t *testing.T) {
 }
 
 // TestTriggers_BatchCompletesOnceUnderConcurrency finishes all items of a
-// batch at the same moment from separate transactions. Without the batch
-// row lock, the last two would each see the other as unfinished and no
-// batch.completed would be emitted, or both would emit it.
+// batch at the same moment from separate transactions. Counted per
+// transaction, the last two could each see the other as unfinished (no
+// batch.completed) or both finish it (two). The relay counts them in one
+// place, in order, so the batch completes exactly once.
 func TestTriggers_BatchCompletesOnceUnderConcurrency(t *testing.T) {
 	for round := range 5 {
 		reset(t)
@@ -238,6 +256,7 @@ func TestTriggers_BatchCompletesOnceUnderConcurrency(t *testing.T) {
 			wg.Go(func() { complete(t, n, domain.StatusSent) })
 		}
 		wg.Wait()
+		relayAll(t)
 		done := ofType(outboxRows(t), events.TypeBatchCompleted)
 		require.Len(t, done, 1, "round %d", round)
 		assert.Equal(t, map[string]any{"sent": 20.0}, done[0].Payload["counts"])
@@ -250,16 +269,19 @@ func TestTriggers_RedriveReopensTheBatch(t *testing.T) {
 	claimed := claim(t, 2)
 	complete(t, claimed[0], domain.StatusSent)
 	complete(t, claimed[1], domain.StatusFailed)
+	relayAll(t)
 	require.Len(t, ofType(outboxRows(t), events.TypeBatchCompleted), 1)
 
 	_, err := store.RetryNotification(t.Context(), claimed[1].ID, time.Now())
 	require.NoError(t, err)
+	relayAll(t)
 	b, err := store.GetBatchSummary(t.Context(), batchID)
 	require.NoError(t, err)
 	assert.Nil(t, b.CompletedAt, "a redriven item reopens its batch")
 
 	again := claim(t, 1)
 	complete(t, again[0], domain.StatusSent)
+	relayAll(t)
 	done := ofType(outboxRows(t), events.TypeBatchCompleted)
 	require.Len(t, done, 2, "completed again")
 	assert.Equal(t, map[string]any{"sent": 2.0}, done[1].Payload["counts"])
@@ -293,6 +315,7 @@ func TestTriggers_DuplicatesDoNotCountTowardsTheBatch(t *testing.T) {
 	}))
 	_, err = pool.Exec(t.Context(), `UPDATE notifications SET status='cancelled', cancelled_at=now() WHERE batch_id=$1`, b.ID)
 	require.NoError(t, err)
+	relayAll(t)
 	assert.Len(t, ofType(outboxRows(t), events.TypeBatchCompleted), 1, "1 of 1 created items finished")
 }
 
@@ -514,4 +537,47 @@ func TestTail_FansOutToEveryReader(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, []int64{100, 101, 102, 103}, seen["api-1"])
 	assert.Equal(t, seen["api-1"], seen["api-2"])
+}
+
+// TestRelay_WakesWorkersForDueWork: the relay replaces the old NOTIFY
+// trigger. One round over new notifications on two channels sends one
+// wake-up per channel; scheduled ones send none.
+func TestRelay_WakesWorkersForDueWork(t *testing.T) {
+	reset(t)
+	var mu sync.Mutex
+	woke := map[domain.Channel]int{}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go store.Queue().ListenDue(ctx, func(ch domain.Channel) {
+		mu.Lock()
+		woke[ch]++
+		mu.Unlock()
+	}, func(error) {})
+	time.Sleep(300 * time.Millisecond) // let LISTEN take effect
+
+	later := time.Now().Add(time.Hour)
+	var ns []*domain.Notification
+	for i, p := range []domain.NewNotificationParams{
+		{Channel: domain.ChannelSMS, Recipient: "+905551234567", Content: "a"},
+		{Channel: domain.ChannelSMS, Recipient: "+905551234567", Content: "b"},
+		{Channel: domain.ChannelEmail, Recipient: "a@example.com", Subject: "s", Content: "c"},
+		{Channel: domain.ChannelPush, Recipient: "token", Subject: "s", Content: "d", ScheduledAt: &later},
+	} {
+		n, err := domain.NewNotification(p, time.Now())
+		require.NoError(t, err, i)
+		ns = append(ns, n)
+	}
+	_, err := store.InsertNotifications(t.Context(), ns)
+	require.NoError(t, err)
+
+	_, err = outbox.New(store, events.NewPublisher(rdb, events.DefaultStream, 1000), relayConfig(), quiet).RelayOnce(t.Context())
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return woke[domain.ChannelSMS] == 1 && woke[domain.ChannelEmail] == 1
+	}, 3*time.Second, 20*time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Zero(t, woke[domain.ChannelPush], "scheduled for later: nothing to wake for")
 }

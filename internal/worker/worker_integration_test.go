@@ -111,6 +111,18 @@ type opts struct {
 	rate        int
 	concurrency int
 	breaker     breaker.Config
+	claimDelay  time.Duration // makes every claim this much slower
+}
+
+// slowQueue delays claims, as a loaded database does.
+type slowQueue struct {
+	queue.Queue
+	delay time.Duration
+}
+
+func (q slowQueue) Claim(ctx context.Context, r queue.ClaimRequest) ([]*domain.Notification, error) {
+	time.Sleep(q.delay)
+	return q.Queue.Claim(ctx, r)
 }
 
 // startWorker runs a worker until the test ends; stop() shuts it down and
@@ -136,7 +148,7 @@ func startWorker(t *testing.T, p *fakeProvider, o opts) (w *worker.Worker, stop 
 		ShutdownGrace: 2 * time.Second,
 		Breaker:       o.breaker,
 	}, worker.Deps{
-		Queue:    store.Queue(),
+		Queue:    slowQueue{Queue: store.Queue(), delay: o.claimDelay},
 		Limiter:  ratelimit.NewLocal(ratelimit.Config{Rate: o.rate, Horizon: 500 * time.Millisecond}, nil),
 		Sender:   provider.NewHTTPClient(provider.HTTPConfig{URLs: map[domain.Channel]string{domain.ChannelSMS: p.srv.URL, domain.ChannelEmail: p.srv.URL, domain.ChannelPush: p.srv.URL}, Timeout: 2 * time.Second}),
 		Policy:   retry.Policy{Base: 20 * time.Millisecond, Max: 100 * time.Millisecond},
@@ -335,17 +347,7 @@ func TestWorker_RespectsRateLimitEndToEnd(t *testing.T) {
 	waitFor(t, 15*time.Second, func() bool { return statusCounts(t)[domain.StatusSent] == 125 })
 	elapsed := time.Since(start)
 
-	p.mu.Lock()
-	times := slices.Clone(p.times)
-	p.mu.Unlock()
-	slices.SortFunc(times, func(a, b time.Time) int { return a.Compare(b) })
-	worst := 0
-	for i, j := 0, 0; i < len(times); i++ {
-		for j < len(times) && times[j].Before(times[i].Add(time.Second)) {
-			j++
-		}
-		worst = max(worst, j-i)
-	}
+	worst := p.busiestSecond()
 	t.Logf("125 notifications in %s; busiest one-second window: %d", elapsed.Round(time.Millisecond), worst)
 	// Send slots are exactly 1/rate apart (the limiter tests prove that on
 	// the limiter's own clock). Arrival times at the receiver also carry
@@ -563,4 +565,40 @@ func TestWorker_Chaos(t *testing.T) {
 	t.Logf("attempts by outcome: %v", outcomes)
 	assert.Equal(t, total, outcomes[domain.OutcomeSuccess])
 	assert.Positive(t, outcomes[domain.OutcomeTransientError], "faults were injected and retried")
+}
+
+// busiestSecond is the most requests the provider received in any one
+// second (a sliding window over arrival times).
+func (p *fakeProvider) busiestSecond() int {
+	p.mu.Lock()
+	times := slices.Clone(p.times)
+	p.mu.Unlock()
+	slices.SortFunc(times, func(a, b time.Time) int { return a.Compare(b) })
+	worst := 0
+	for i, j := 0, 0; i < len(times); i++ {
+		for j < len(times) && times[j].Before(times[i].Add(time.Second)) {
+			j++
+		}
+		worst = max(worst, j-i)
+	}
+	return worst
+}
+
+// TestWorker_SlowClaimsDoNotBurstPastTheLimit reproduces a bug found by the
+// flash-sale load test. Send slots used to be reserved before the claim;
+// when the database made claims slow, the slots were in the past by the
+// time the claim returned, all those deliveries went out at once on top of
+// the next reservation's, and the provider saw 175/s at a 100/s limit.
+// Slots are now reserved after the claim.
+func TestWorker_SlowClaimsDoNotBurstPastTheLimit(t *testing.T) {
+	reset(t)
+	const rate = 50
+	p := newFakeProvider(t, alwaysAccept)
+	create(t, 150, nil)
+	startWorker(t, p, opts{rate: rate, claimDelay: 300 * time.Millisecond})
+
+	waitFor(t, 15*time.Second, func() bool { return statusCounts(t)[domain.StatusSent] == 150 })
+	worst := p.busiestSecond()
+	t.Logf("busiest one-second window with 300 ms claims: %d (limit %d)", worst, rate)
+	assert.LessOrEqual(t, worst, rate+rate/10)
 }

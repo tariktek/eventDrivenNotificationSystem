@@ -235,8 +235,8 @@ func (q QueueStore) ReapExpiredLeases(ctx context.Context, now time.Time) (queue
 	return res, nil
 }
 
-// notifyChannel is the LISTEN channel the notify_due_notification trigger
-// signals; the payload is the notification channel.
+// notifyChannel is the LISTEN channel the outbox relay signals (NotifyDue)
+// when work becomes due; the payload is the notification channel.
 const notifyChannel = "notification_due"
 
 // ListenDue calls onDue whenever a notification becomes due on a channel.

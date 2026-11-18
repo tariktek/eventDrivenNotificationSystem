@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres/sqlcgen"
 )
@@ -51,6 +53,48 @@ func (r *Repo) UnpublishedEvents(ctx context.Context, limit int) ([]events.Event
 func (r *Repo) MarkEventsPublished(ctx context.Context, ids []int64, now time.Time) error {
 	if err := r.q.MarkEventsPublished(ctx, sqlcgen.MarkEventsPublishedParams{Ids: ids, Now: &now}); err != nil {
 		return fmt.Errorf("mark events published: %w", err)
+	}
+	return nil
+}
+
+// NotifyDue wakes the workers listening for due work on these channels.
+func (r *Repo) NotifyDue(ctx context.Context, channels []string) error {
+	if err := r.q.NotifyDue(ctx, channels); err != nil {
+		return fmt.Errorf("notify due: %w", err)
+	}
+	return nil
+}
+
+// BatchProgress is a batch's state after AddBatchFinished.
+type BatchProgress = sqlcgen.AddBatchFinishedRow
+
+// AddBatchFinished adds deltas[i] to the finished count of batch ids[i]
+// and sets or clears completed_at accordingly.
+func (r *Repo) AddBatchFinished(ctx context.Context, ids []uuid.UUID, deltas []int32, now time.Time) ([]BatchProgress, error) {
+	rows, err := r.q.AddBatchFinished(ctx, sqlcgen.AddBatchFinishedParams{Now: now, Ids: ids, Deltas: deltas})
+	if err != nil {
+		return nil, fmt.Errorf("add batch finished: %w", err)
+	}
+	return rows, nil
+}
+
+// BatchStatusCounts returns a batch's notifications counted by status, as
+// a JSON object.
+func (r *Repo) BatchStatusCounts(ctx context.Context, id uuid.UUID) ([]byte, error) {
+	counts, err := r.q.BatchStatusCounts(ctx, &id)
+	if err != nil {
+		return nil, fmt.Errorf("batch status counts: %w", err)
+	}
+	return counts, nil
+}
+
+// InsertOutboxEvent adds an event to be published.
+func (r *Repo) InsertOutboxEvent(ctx context.Context, aggregateType string, aggregateID uuid.UUID, eventType string, payload []byte) error {
+	err := r.q.InsertOutboxEvent(ctx, sqlcgen.InsertOutboxEventParams{
+		AggregateType: aggregateType, AggregateID: aggregateID, EventType: eventType, Payload: payload,
+	})
+	if err != nil {
+		return fmt.Errorf("insert outbox event: %w", err)
 	}
 	return nil
 }

@@ -12,6 +12,95 @@ import (
 	"github.com/google/uuid"
 )
 
+const addBatchFinished = `-- name: AddBatchFinished :many
+UPDATE batches b
+SET finished_count = b.finished_count + d.delta,
+    completed_at   = CASE WHEN b.finished_count + d.delta >= b.created_count
+                          THEN coalesce(b.completed_at, $1::timestamptz) END
+FROM (SELECT unnest($2::uuid[]) AS id, unnest($3::int[]) AS delta) d
+WHERE b.id = d.id
+RETURNING b.id, b.total, b.created_count, b.finished_count, d.delta::int AS delta, b.completed_at
+`
+
+type AddBatchFinishedParams struct {
+	Now    time.Time
+	Ids    []uuid.UUID
+	Deltas []int32
+}
+
+type AddBatchFinishedRow struct {
+	ID            uuid.UUID
+	Total         int32
+	CreatedCount  int32
+	FinishedCount int32
+	Delta         int32
+	CompletedAt   *time.Time
+}
+
+// Batch progress, maintained by the relay from the status changes it
+// publishes. delta is the change in finished (sent/failed/cancelled)
+// items; a redrive makes it negative and reopens the batch.
+func (q *Queries) AddBatchFinished(ctx context.Context, arg AddBatchFinishedParams) ([]AddBatchFinishedRow, error) {
+	rows, err := q.db.Query(ctx, addBatchFinished, arg.Now, arg.Ids, arg.Deltas)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AddBatchFinishedRow
+	for rows.Next() {
+		var i AddBatchFinishedRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Total,
+			&i.CreatedCount,
+			&i.FinishedCount,
+			&i.Delta,
+			&i.CompletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const batchStatusCounts = `-- name: BatchStatusCounts :one
+SELECT coalesce(jsonb_object_agg(status, c), '{}'::jsonb)::jsonb AS counts
+FROM (SELECT status, count(*) AS c FROM notifications WHERE batch_id = $1 GROUP BY status) s
+`
+
+func (q *Queries) BatchStatusCounts(ctx context.Context, batchID *uuid.UUID) ([]byte, error) {
+	row := q.db.QueryRow(ctx, batchStatusCounts, batchID)
+	var counts []byte
+	err := row.Scan(&counts)
+	return counts, err
+}
+
+const insertOutboxEvent = `-- name: InsertOutboxEvent :exec
+INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+VALUES ($1, $2, $3, $4)
+`
+
+type InsertOutboxEventParams struct {
+	AggregateType string
+	AggregateID   uuid.UUID
+	EventType     string
+	Payload       []byte
+}
+
+func (q *Queries) InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) error {
+	_, err := q.db.Exec(ctx, insertOutboxEvent,
+		arg.AggregateType,
+		arg.AggregateID,
+		arg.EventType,
+		arg.Payload,
+	)
+	return err
+}
+
 const listUnpublishedEvents = `-- name: ListUnpublishedEvents :many
 SELECT id, aggregate_type, aggregate_id, event_type, payload, created_at
 FROM outbox_events
@@ -67,6 +156,18 @@ type MarkEventsPublishedParams struct {
 
 func (q *Queries) MarkEventsPublished(ctx context.Context, arg MarkEventsPublishedParams) error {
 	_, err := q.db.Exec(ctx, markEventsPublished, arg.Now, arg.Ids)
+	return err
+}
+
+const notifyDue = `-- name: NotifyDue :exec
+SELECT pg_notify('notification_due', ch) FROM unnest($1::text[]) AS ch
+`
+
+// Wakes workers listening on notification_due for these channels. Sent
+// by the relay once per round: NOTIFY serializes the commits of every
+// transaction that uses it, so it must stay out of request transactions.
+func (q *Queries) NotifyDue(ctx context.Context, channels []string) error {
+	_, err := q.db.Exec(ctx, notifyDue, channels)
 	return err
 }
 
