@@ -26,7 +26,7 @@ risks are accepted on purpose.
 | golangci-lint with gosec | Insecure code patterns. Every `//nolint:gosec` carries its justification (reviewed: see below). |
 | govulncheck | Known vulnerabilities in dependencies, limited to code the program can actually reach. Found two in `kin-openapi` (fixed by upgrading). |
 | Trivy | Known vulnerabilities in the container image (fails on fixable HIGH/CRITICAL). |
-| gitleaks | Secrets committed anywhere in the history. The public development defaults are allowlisted by value in `.gitleaks.toml`; one reviewed test fixture is listed in `.gitleaksignore`. |
+| gitleaks | Secrets committed anywhere in the history. The public development defaults and one test fixture are allowlisted by value in `.gitleaks.toml` (by value, so the allowlist survives edits and history rewrites). |
 | Dependabot | Weekly update PRs for Go modules, GitHub Actions and base images, vetted by the checks above. |
 
 The scanners run from pinned images, not third-party actions: an action's

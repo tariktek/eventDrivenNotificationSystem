@@ -1,4 +1,0 @@
-# Reviewed gitleaks findings that are not secrets (fingerprint per line).
-# Test fixture: a fake 32-character API key used to check production
-# key validation.
-8d379f44d7ce44e779ad6935b50c49960ebd3320:internal/config/config_test.go:generic-api-key:104

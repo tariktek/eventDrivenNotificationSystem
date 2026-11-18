@@ -1,13 +1,20 @@
-# gitleaks configuration: the default rules, plus the two development
-# defaults that are public on purpose. They appear in docker-compose.yml,
-# .env.example, the docs and examples, and production refuses them at
-# startup (internal/config). Real secrets are never committed.
+# gitleaks configuration: the default rules, plus values that look like
+# secrets but are public on purpose:
+#   - the two development defaults: they appear in docker-compose.yml,
+#     .env.example, the docs and examples, and production refuses them at
+#     startup (internal/config);
+#   - a test fixture: a fake 32-character key used to test production key
+#     validation.
+# Allowlisted by value, not by finding fingerprint: fingerprints include
+# the commit hash and the line number, so they break whenever a file is
+# edited or history is rewritten. Real secrets are never committed.
 [extend]
 useDefault = true
 
 [allowlist]
-description = "Public development defaults, rejected in production"
+description = "Public development defaults and test fixtures"
 regexes = [
   '''dev-api-key-change-me''',
   '''dev-callback-secret-change-me''',
+  '''0123456789abcdef0123456789abcdef''',
 ]
