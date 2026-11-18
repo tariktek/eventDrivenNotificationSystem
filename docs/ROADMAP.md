@@ -1,320 +1,323 @@
-# Event-Driven Notification System: Uygulama Yol Haritası (v2)
+# Event-Driven Notification System: Implementation Roadmap (v2)
 
-> Insider One Software Engineer Assessment (Golang) için tasarım ve uygulama planı.
-> Bu sürüm zaman kısıtı olmadan hazırlandı. Önceliğimiz bir MVP'den çok, üretime yakın kalitede bir sistem.
-> Her kararın gerekçesi yanında yazılı.
+> Design and implementation plan for the Insider One Software Engineer Assessment (Golang).
+> This version was written without a time constraint. The priority is a near-production-quality system rather than an MVP.
+> The reasoning behind every decision is written next to it.
+>
+> This is the plan as written before and during implementation. Where the code differs, the code,
+> the [ADRs](adr/), [architecture.md](architecture.md) and the [README](../README.md) are authoritative.
 
-## v1'e göre ne değişti?
+## What changed from v1?
 
-| Alan | v1 | v2 |
+| Area | v1 | v2 |
 |---|---|---|
-| Event-driven omurga | Redis pub/sub ile status yayını (fire-and-forget) | **Transactional outbox + Redis Streams.** Domain event'leri kaybolmaz, consumer group'larla işlenir |
-| Provider | Sadece webhook.site | webhook.site (varsayılan, PDF gereği) + **docker-compose içinde fault-injection'lı mock provider**. webhook.site'ın ücretsiz istek limiti yük testine yetmiyor |
-| API sözleşmesi | Elle yazılmış OpenAPI | **Spec-first:** `openapi.yaml` dosyasından `oapi-codegen` ile tip ve interface üretimi. Spec ile kod birbirinden kopamaz |
-| SQL | Elle yazılmış pgx | Statik sorgular için `sqlc` (tip güvenli), dinamik liste filtresi için elle yazılmış builder |
-| Redis arızası | Tanımsız | Yerel limiter'a **güvenli düşüş** (degraded mode), readiness'ta raporlanır |
-| Müşteriye görünürlük | Sorgu + WebSocket | Ek olarak bildirim başına **status callback (webhook)**, HMAC imzalı |
-| Güvenlik | Yok | API key, body limitleri, timeout'lar, callback için SSRF koruması |
-| Test | Unit + integration + e2e | Ek olarak OpenAPI contract testleri, fuzz, chaos (worker öldürme), k6 yük testi ve sonuçların README'de yayımlanması |
-| Operasyon | Prometheus | Ek olarak provision edilmiş **Grafana dashboard'u**, alert kuralları, veri saklama (retention) job'u |
-| Dokümantasyon | README | Ek olarak **ADR'ler** (mimari karar kayıtları), runbook, `.http` örnek dosyası |
-| CI | Lint + test + build | Ek olarak `govulncheck`, Trivy image taraması, coverage raporu, Dependabot |
+| Event-driven backbone | Status broadcast over Redis pub/sub (fire-and-forget) | **Transactional outbox + Redis Streams.** Domain events are never lost and are processed through consumer groups |
+| Provider | webhook.site only | webhook.site (supported, as the brief requires) + **a fault-injecting mock provider inside docker-compose**. webhook.site's free request limit is too low for load testing |
+| API contract | Hand-written OpenAPI | **Spec-first:** types and interfaces generated from `openapi.yaml` with `oapi-codegen`. The spec and the code cannot drift apart |
+| SQL | Hand-written pgx | `sqlc` for static queries (type-safe), a hand-written builder for the dynamic list filter |
+| Redis outage | Undefined | **Safe fallback** to a local limiter (degraded mode), reported by readiness |
+| Customer visibility | Queries + WebSocket | Additionally a per-notification **status callback (webhook)**, HMAC-signed |
+| Security | None | API key, body limits, timeouts, SSRF protection for callbacks |
+| Tests | Unit + integration + e2e | Additionally OpenAPI contract tests, fuzzing, chaos (killing workers), k6 load tests with results published in the README |
+| Operations | Prometheus | Additionally a provisioned **Grafana dashboard**, alert rules, a data retention job |
+| Documentation | README | Additionally **ADRs** (architecture decision records), a runbook, a `.http` examples file |
+| CI | Lint + test + build | Additionally `govulncheck`, Trivy image scan, coverage report, Dependabot |
 
 ---
 
-## 1. Teknoloji Kararları
+## 1. Technology Choices
 
-| Konu | Seçim | Gerekçe |
+| Topic | Choice | Reasoning |
 |---|---|---|
-| Dil | Go 1.23 | PDF "1.2x" istiyor |
-| HTTP router | `go-chi/chi` | Hafif, `net/http` uyumlu, oapi-codegen'in chi desteği var |
-| API kodu | `oapi-codegen` (spec-first) | Request ve response tipleri spec'ten üretilir, el ile senkron tutmak gerekmez |
-| Veritabanı | PostgreSQL 16 + `pgx/v5` | Asıl kayıt yeri; transaction, `SKIP LOCKED` ve `LISTEN/NOTIFY` desteği var |
-| Sorgular | `sqlc` + dinamik liste için küçük bir builder | Derleme zamanında tip güvenliği |
-| Migration | `golang-migrate` | Versiyonlu up/down SQL dosyaları |
-| İş kuyruğu | **PostgreSQL tabanlı** (`FOR UPDATE SKIP LOCKED`), `Queue` interface'inin arkasında | §1.1 |
+| Language | Go 1.23 | The brief asks for "1.2x" |
+| HTTP router | `go-chi/chi` | Lightweight, `net/http` compatible, supported by oapi-codegen |
+| API code | `oapi-codegen` (spec-first) | Request and response types are generated from the spec, no manual syncing |
+| Database | PostgreSQL 16 + `pgx/v5` | The system of record; supports transactions, `SKIP LOCKED` and `LISTEN/NOTIFY` |
+| Queries | `sqlc` + a small builder for the dynamic list | Compile-time type safety |
+| Migrations | `golang-migrate` | Versioned up/down SQL files |
+| Job queue | **PostgreSQL-based** (`FOR UPDATE SKIP LOCKED`), behind a `Queue` interface | §1.1 |
 | Event bus | **Transactional outbox → Redis Streams** | §1.2 |
-| Rate limit | Redis üzerinde GCRA / token bucket (Lua) | Tüm instance'larda ortak limit |
-| Log | `log/slog` (JSON) | Standart kütüphane |
-| Metrik | Prometheus client + Grafana | |
+| Rate limit | GCRA / token bucket on Redis (Lua) | One limit shared by all instances |
+| Logging | `log/slog` (JSON) | Standard library |
+| Metrics | Prometheus client + Grafana | |
 | Tracing | OpenTelemetry + Jaeger | |
 | Circuit breaker | `sony/gobreaker` | |
-| WebSocket | `coder/websocket` | Bakımı aktif, context destekli |
-| Test | `testify`, `testcontainers-go`, `kin-openapi` (contract), Go fuzzing, k6 | |
-| Kalite | `golangci-lint`, `govulncheck`, Trivy | |
+| WebSocket | `coder/websocket` | Actively maintained, context-aware |
+| Testing | `testify`, `testcontainers-go`, `kin-openapi` (contract), Go fuzzing, k6 | |
+| Quality | `golangci-lint`, `govulncheck`, Trivy | |
 
-### 1.1 İş kuyruğu neden Postgres? (ADR-001)
+### 1.1 Why a Postgres job queue? (ADR-001)
 
-Bildirimi DB'ye yazıp ardından RabbitMQ veya Kafka'ya ayrıca publish etmek *dual-write* problemi yaratır: biri başarılı olup diğeri başarısız olabilir. Postgres kuyruğu tek transaction içinde şunları sağlar:
+Writing the notification to the database and then publishing it separately to RabbitMQ or Kafka creates a *dual-write* problem: one can succeed while the other fails. A Postgres queue provides all of the following in a single transaction:
 
-- kalıcılık,
-- öncelik,
-- gecikmeli retry,
-- zamanlanmış gönderim,
-- atomik iptal.
+- durability,
+- priority,
+- delayed retries,
+- scheduled delivery,
+- atomic cancellation.
 
-Bunun için ek bir altyapı gerekmez.
+No extra infrastructure is needed for this.
 
-**Kapasite:** Kanal başına 100/s limitle sistemin tavanı 300 msg/s, yani günde yaklaşık 26 milyon mesaj. Bu, "günde milyonlarca" hedefini karşılar. Postgres `SKIP LOCKED` kuyruğu bu hacmin çok üzerine çıkabilir; yük testiyle (§13) ölçüp README'ye yazacağız.
+**Capacity:** With a limit of 100/s per channel, the system's ceiling is 300 msg/s, about 26 million messages a day. This meets the "millions per day" goal. A Postgres `SKIP LOCKED` queue can go well beyond this volume; we will measure it with load tests (§13) and publish the result in the README.
 
-**Geçiş yolu:** `Queue` interface'i sayesinde ölçek büyürse Kafka'ya geçilebilir. Bunun için kanal başına topic, öncelik başına topic ve retry için gecikmeli topic'ler gerekir. README'de ve ADR'de anlatılacak.
+**Migration path:** Thanks to the `Queue` interface, the system can move to Kafka if scale grows. That requires a topic per channel, a topic per priority and delayed topics for retries. This will be described in the README and an ADR.
 
-### 1.2 Event-driven omurga: Transactional Outbox (ADR-002)
+### 1.2 Event-driven backbone: Transactional Outbox (ADR-002)
 
-Her durum değişikliği, aynı transaction içinde `outbox_events` tablosuna bir domain event'i olarak yazılır. Event tipleri:
+Every status change is written as a domain event to the `outbox_events` table in the same transaction. Event types:
 
 - `notification.created`
 - `notification.status_changed`
 - `batch.completed`
 
-Bir **outbox relay** goroutine'i bu event'leri Redis Streams'e (`stream:notification-events`) taşır ve gönderilenleri işaretler. Consumer'lar şunlardır:
+An **outbox relay** goroutine moves these events to Redis Streams (`stream:notification-events`) and marks them as published. The consumers are:
 
-- **WebSocket hub'ları:** Her API instance'ı kendi consumer'ı ile okur ve bağlı client'lara yayınlar.
-- **Callback dispatcher:** Müşterinin verdiği `callback_url` adresine imzalı POST atar.
-- **Metrik toplayıcı:** Gerekirse.
+- **WebSocket hubs:** Each API instance reads with its own consumer and broadcasts to its connected clients.
+- **Callback dispatcher:** Sends a signed POST to the `callback_url` the customer provided.
+- **Metrics collector:** If needed.
 
-Redis pub/sub'dan farkı: event'ler kaybolmaz (stream kalıcıdır, consumer group'ta ACK vardır), consumer yeniden başlarsa kaldığı yerden devam eder. "Event-driven" başlığını gerçek anlamda karşılayan kısım burası.
+The difference from Redis pub/sub: events are not lost (the stream is durable, consumer groups have ACKs), and a restarted consumer resumes where it left off. This is the part that makes the system event-driven in the real sense.
 
 ---
 
-## 2. Klasör Yapısı
+## 2. Folder Structure
 
 ```
 insider-one/
 ├── cmd/
 │   ├── api/                   # HTTP API + WebSocket + outbox relay
-│   ├── worker/                # Kuyruk worker'ları + reaper + retention + callback dispatcher
-│   └── mockprovider/          # Fault-injection'lı sahte provider (lokal ve yük testi için)
+│   ├── worker/                # Queue workers + reaper + retention + callback dispatcher
+│   └── mockprovider/          # Fault-injecting fake provider (for local use and load tests)
 ├── internal/
-│   ├── config/                # env → struct, doğrulama (başlangıçta fail-fast)
-│   ├── domain/                # Entity'ler, value object'ler, state machine, domain hataları, event'ler
-│   ├── validation/            # Kanal bazlı içerik ve alıcı kuralları, SMS segment hesabı
-│   ├── template/              # Şablon render
-│   ├── service/               # Use-case'ler (create, batch, cancel, list, retry, template)
-│   ├── repository/postgres/   # sqlc çıktıları + dinamik sorgular + tx yöneticisi
-│   ├── queue/                 # Queue interface + postgres implementasyonu
+│   ├── config/                # env → struct, validation (fail-fast at startup)
+│   ├── domain/                # Entities, value objects, state machine, domain errors, events
+│   ├── validation/            # Per-channel content and recipient rules, SMS segment count
+│   ├── template/              # Template rendering
+│   ├── service/               # Use cases (create, batch, cancel, list, retry, template)
+│   ├── repository/postgres/   # sqlc output + dynamic queries + tx manager
+│   ├── queue/                 # Queue interface + postgres implementation
 │   ├── outbox/                # Outbox writer + relay
 │   ├── events/                # Redis Streams publisher/consumer
-│   ├── ratelimit/             # Redis GCRA (Lua) + yerel fallback + in-memory (test)
-│   ├── provider/              # HTTP client, hata sınıflandırma, circuit breaker sarmalayıcı
-│   ├── retry/                 # Backoff politikası
-│   ├── worker/                # Dispatcher, kanal havuzları, işleme döngüsü, reaper
-│   ├── callback/              # Müşteri webhook'ları, HMAC imzası, SSRF koruması
+│   ├── ratelimit/             # Redis GCRA (Lua) + local fallback + in-memory (tests)
+│   ├── provider/              # HTTP client, error classification, circuit breaker wrapper
+│   ├── retry/                 # Backoff policy
+│   ├── worker/                # Dispatcher, channel pools, processing loop, reaper
+│   ├── callback/              # Customer webhooks, HMAC signature, SSRF protection
 │   ├── http/
-│   │   ├── api/               # oapi-codegen çıktısı (generated)
-│   │   ├── handler/           # Strict server implementasyonu
+│   │   ├── api/               # oapi-codegen output (generated)
+│   │   ├── handler/           # Strict server implementation
 │   │   ├── middleware/        # auth, correlation-id, logging, recovery, tracing, metrics, body limit
 │   │   └── ws/                # WebSocket hub
-│   ├── observability/         # logger, metrics, tracer kurulumu
-│   └── platform/              # graceful shutdown, health check kayıtları, clock (test edilebilir zaman)
+│   ├── observability/         # logger, metrics, tracer setup
+│   └── platform/              # graceful shutdown, health check registry, clock (testable time)
 ├── migrations/
 ├── api/openapi.yaml
 ├── deploy/
-│   ├── prometheus/            # prometheus.yml, alert kuralları
+│   ├── prometheus/            # prometheus.yml, alert rules
 │   └── grafana/               # datasource + dashboard provisioning
 ├── docs/
-│   ├── adr/                   # Mimari karar kayıtları
-│   ├── architecture.md        # Diyagramlar (Mermaid): bileşen, sequence, state
-│   └── runbook.md             # Operasyon: DLQ boşaltma, devre açık kalırsa ne yapılır vb.
+│   ├── adr/                   # Architecture decision records
+│   ├── architecture.md        # Diagrams (Mermaid): components, sequence, state
+│   └── runbook.md             # Operations: draining the DLQ, what to do if a breaker stays open, etc.
 ├── test/
 │   ├── integration/
 │   ├── e2e/
-│   └── load/                  # k6 senaryoları
-├── examples/requests.http     # VS Code / JetBrains HTTP client örnekleri
+│   └── load/                  # k6 scenarios
+├── examples/requests.http     # VS Code / JetBrains HTTP client examples
 ├── .github/workflows/ci.yml
 ├── .github/dependabot.yml
 ├── .golangci.yml
-├── Dockerfile                 # Multi-stage, distroless, non-root, tek image + üç binary
+├── Dockerfile                 # Multi-stage, distroless, non-root, one image + three binaries
 ├── docker-compose.yml
 ├── Makefile
 ├── .env.example
 └── README.md
 ```
 
-Projede saf bir hexagonal mimari dayatmıyoruz, ama bağımlılık yönü tektir: `handler → service → (repository, queue, provider interface'leri)`. `domain` hiçbir şeye bağımlı değildir. Zaman (`clock`) ve rastgelelik (jitter) enjekte edilir, böylece testlerde deterministik çalışır.
+We do not impose a strict hexagonal architecture, but dependencies point one way: `handler → service → (repository, queue, provider interfaces)`. `domain` depends on nothing. Time (`clock`) and randomness (jitter) are injected, so tests are deterministic.
 
 ---
 
-## 3. Veri Modeli (Migration'lar)
+## 3. Data Model (Migrations)
 
 ### `notifications`
-| Kolon | Tip | Not |
+| Column | Type | Note |
 |---|---|---|
-| `id` | UUID v7 PK | Zamana göre sıralı, indeks dostu |
+| `id` | UUID v7 PK | Time-ordered, index-friendly |
 | `batch_id` | UUID NULL FK | |
 | `channel` | enum `sms, email, push` | |
 | `priority` | smallint | 0 = high, 1 = normal, 2 = low |
 | `recipient` | text | |
-| `subject` | text NULL | Email için |
-| `content` | text | Render edilmiş son içerik |
-| `template_id`, `template_vars` | UUID NULL, JSONB | İz sürmek için |
+| `subject` | text NULL | For email |
+| `content` | text | Final rendered content |
+| `template_id`, `template_vars` | UUID NULL, JSONB | For traceability |
 | `status` | enum `pending, scheduled, processing, sent, failed, cancelled` | |
-| `idempotency_key` | text NULL | `UNIQUE` (kısmi, NULL hariç) |
+| `idempotency_key` | text NULL | `UNIQUE` (partial, excluding NULL) |
 | `attempts`, `max_attempts` | int | |
-| `next_attempt_at` | timestamptz | Kuyruk sırası, retry zamanı ve schedule için tek alan |
-| `locked_until`, `locked_by` | timestamptz, text | Worker lease'i |
+| `next_attempt_at` | timestamptz | One field for queue order, retry time and schedule |
+| `locked_until`, `locked_by` | timestamptz, text | Worker lease |
 | `scheduled_at`, `sent_at`, `failed_at`, `cancelled_at` | timestamptz NULL | |
-| `provider_message_id` | text NULL | Provider'ın döndürdüğü `messageId` |
+| `provider_message_id` | text NULL | The `messageId` returned by the provider |
 | `last_error`, `last_error_code` | text | |
-| `callback_url` | text NULL | Opsiyonel status webhook'u |
-| `metadata` | JSONB | Müşterinin serbest etiketleri (kampanya ID'si vb.) |
-| `correlation_id`, `trace_parent` | text | Log ve trace zinciri |
+| `callback_url` | text NULL | Optional status webhook |
+| `metadata` | JSONB | Customer's free-form tags (campaign ID, etc.) |
+| `correlation_id`, `trace_parent` | text | Log and trace chain |
 | `created_at`, `updated_at` | timestamptz | |
 
-İndeksler:
-- Kuyruk için kısmi indeks: `(channel, priority, next_attempt_at) WHERE status IN ('pending','scheduled')`
-- Lease süresi dolan kayıtlar için kısmi indeks: `(locked_until) WHERE status = 'processing'`
-- Listeleme için: `(created_at DESC, id DESC)`, `(status, created_at)`, `(channel, created_at)`, `(batch_id)`
+Indexes:
+- Partial index for the queue: `(channel, priority, next_attempt_at) WHERE status IN ('pending','scheduled')`
+- Partial index for expired leases: `(locked_until) WHERE status = 'processing'`
+- For listing: `(created_at DESC, id DESC)`, `(status, created_at)`, `(channel, created_at)`, `(batch_id)`
 
 ### `batches`
-`id`, `total`, `metadata`, `correlation_id`, `created_at`. Durum özeti sorgu anında `GROUP BY status` ile hesaplanır. Tüm bildirimler son duruma gelince `batch.completed` event'i üretilir.
+`id`, `total`, `metadata`, `correlation_id`, `created_at`. The status summary is computed at query time with `GROUP BY status`. When every notification reaches a final state, a `batch.completed` event is produced.
 
 ### `notification_attempts`
-`id`, `notification_id`, `attempt_no`, `status_code`, `error_class` (transient/permanent), `error`, `provider_message_id`, `duration_ms`, `created_at`. Audit ve debug amaçlı tutulur; `GET /notifications/{id}` yanıtında gösterilir.
+`id`, `notification_id`, `attempt_no`, `status_code`, `error_class` (transient/permanent), `error`, `provider_message_id`, `duration_ms`, `created_at`. Kept for audit and debugging; shown in the `GET /notifications/{id}` response.
 
 ### `templates`
-`id`, `name` UNIQUE, `channel`, `subject`, `body`, `variables` (beklenen değişken listesi, JSON), `version`, `created_at`, `updated_at`. Şablon güncellenince versiyon artar; bildirim hangi versiyonla render edildiğini saklar.
+`id`, `name` UNIQUE, `channel`, `subject`, `body`, `variables` (expected variable list, JSON), `version`, `created_at`, `updated_at`. Updating a template increments its version; a notification stores which version it was rendered with.
 
 ### `idempotency_keys`
-`key` PK, `request_hash`, `response_status`, `response_body` JSONB, `locked_at`, `created_at`. TTL 24 saat; temizliği retention job yapar. `locked_at` alanı, aynı key ile eşzamanlı gelen iki isteğin ikisinin de işlenmesini engeller (§7).
+`key` PK, `request_hash`, `response_status`, `response_body` JSONB, `locked_at`, `created_at`. TTL 24 hours; cleaned up by the retention job. The `locked_at` field prevents two concurrent requests with the same key from both being processed (§7).
 
 ### `outbox_events`
-`id` BIGSERIAL, `aggregate_id`, `event_type`, `payload` JSONB, `created_at`, `published_at` NULL. Relay `published_at IS NULL` kayıtları sırayla gönderir.
+`id` BIGSERIAL, `aggregate_id`, `event_type`, `payload` JSONB, `created_at`, `published_at` NULL. The relay sends rows with `published_at IS NULL` in order.
 
 ### `callback_deliveries`
-Müşteri webhook denemelerinin kaydı: `id`, `notification_id`, `event_id`, `attempt_no`, `status_code`, `next_attempt_at`, `status`.
+Record of customer webhook attempts: `id`, `notification_id`, `event_id`, `attempt_no`, `status_code`, `next_attempt_at`, `status`.
 
-### Veri saklama
-Retention job son durumdaki (`sent/failed/cancelled`) ve `RETENTION_DAYS` (varsayılan 30) günden eski kayıtları siler. Ayrıca yayımlanmış outbox event'lerini ve süresi dolmuş idempotency key'lerini temizler. README'de, ölçek büyüdüğünde `created_at` ile aylık **partitioning** yapmanın kayıtları silmeyi `DROP PARTITION` kadar ucuz hale getireceği not edilir.
+### Data retention
+The retention job deletes rows in a final state (`sent/failed/cancelled`) older than `RETENTION_DAYS` (default 30). It also cleans up published outbox events and expired idempotency keys. The README notes that at larger scale, monthly **partitioning** by `created_at` would make deletion as cheap as `DROP PARTITION`.
 
 ---
 
-## 4. Durum Makinesi
+## 4. State Machine
 
 ```
-           ┌──────────► cancelled (sadece pending/scheduled'dan)
+           ┌──────────► cancelled (only from pending/scheduled)
            │
 pending/scheduled ──claim──► processing ──202──► sent
            ▲                     │
-           │   geçici hata,      │ kalıcı hata veya deneme hakkı bitti
+           │   transient error,  │ permanent error or attempts exhausted
            └── attempts<max ─────┤
                (next_attempt_at  ▼
-                ileri alınır)   failed  ──(manuel /retry)──► pending
-   lease süresi dolarsa (reaper):
+                moved forward)  failed  ──(manual /retry)──► pending
+   when the lease expires (reaper):
    processing ──────────────────► pending
 ```
 
-- Geçişler `domain` paketinde tek bir tabloda tanımlanır. Geçersiz geçiş `ErrInvalidTransition` döner ve tüm geçişler table-driven testlerle korunur.
-- DB güncellemeleri koşullu yapılır (`UPDATE ... WHERE id=$1 AND status='processing' AND locked_by=$me`). Etkilenen satır sayısı 0 ise başka bir aktör kaydı değiştirmiş demektir ve işlem güvenle bırakılır.
-- **İptal ve claim yarışı:** İptal `WHERE status IN ('pending','scheduled')` koşuluyla yapılır. Worker kaydı claim ettiyse iptal 409 döner ("zaten gönderiliyor"). İki aktör aynı anda kazanamaz.
-- Her geçiş aynı transaction içinde bir outbox event'i yazar.
+- Transitions are defined in a single table in the `domain` package. An invalid transition returns `ErrInvalidTransition`, and every transition is covered by table-driven tests.
+- Database updates are conditional (`UPDATE ... WHERE id=$1 AND status='processing' AND locked_by=$me`). If no row is affected, another actor changed the record and the operation is safely dropped.
+- **Cancel vs claim race:** Cancellation uses the condition `WHERE status IN ('pending','scheduled')`. If a worker has already claimed the record, cancel returns 409 ("already being sent"). Both actors can never win.
+- Every transition writes an outbox event in the same transaction.
 
 ---
 
 ## 5. API (`/api/v1`)
 
-### 5.1 Endpoint'ler
+### 5.1 Endpoints
 
-| Method | Path | Açıklama |
+| Method | Path | Description |
 |---|---|---|
-| POST | `/notifications` | Tekli oluşturma. Yanıt 201. `Idempotency-Key` header'ı desteklenir |
-| POST | `/notifications/batch` | 1–1000 bildirim. Davranış aşağıda |
-| GET | `/notifications/{id}` | Detay + deneme geçmişi |
-| GET | `/notifications` | Filtreler: `status, channel, priority, batch_id, created_from, created_to`. Cursor pagination (`limit` ≤ 100, `cursor`) |
-| POST | `/notifications/{id}/cancel` | Sadece pending/scheduled. Değilse 409 |
-| POST | `/notifications/{id}/retry` | `failed` durumundakini yeniden kuyruğa alır (DLQ'dan çıkarma). `attempts` sıfırlanır |
-| GET | `/batches/{id}` | Özet (status başına sayılar, ilerleme yüzdesi) |
-| GET | `/batches/{id}/notifications` | Batch içeriği, sayfalı |
-| POST | `/batches/{id}/cancel` | Batch'teki bekleyenleri iptal eder, kaç tane iptal edildiğini döner |
-| POST | `/templates` | Şablon oluşturma (render ön-doğrulamasıyla) |
+| POST | `/notifications` | Create one. Responds 201. Supports the `Idempotency-Key` header |
+| POST | `/notifications/batch` | 1–1000 notifications. Behaviour below |
+| GET | `/notifications/{id}` | Details + attempt history |
+| GET | `/notifications` | Filters: `status, channel, priority, batch_id, created_from, created_to`. Cursor pagination (`limit` ≤ 100, `cursor`) |
+| POST | `/notifications/{id}/cancel` | Only pending/scheduled. Otherwise 409 |
+| POST | `/notifications/{id}/retry` | Requeues a `failed` notification (takes it out of the DLQ). `attempts` is reset |
+| GET | `/batches/{id}` | Summary (counts per status, progress percentage) |
+| GET | `/batches/{id}/notifications` | The batch's notifications, paginated |
+| POST | `/batches/{id}/cancel` | Cancels the batch's waiting notifications and returns how many were cancelled |
+| POST | `/templates` | Create a template (with a render pre-check) |
 | GET | `/templates`, `/templates/{id}` | |
-| PUT | `/templates/{id}` | Yeni versiyon oluşturur |
+| PUT | `/templates/{id}` | Creates a new version |
 | DELETE | `/templates/{id}` | Soft delete |
-| POST | `/templates/{id}/preview` | Değişkenlerle render edip sonucu döner, kaydetmez |
-| GET | `/ws` | WebSocket. Abonelik mesajıyla `notification_id` / `batch_id` seçilir |
+| POST | `/templates/{id}/preview` | Renders with the given variables and returns the result without saving |
+| GET | `/ws` | WebSocket. `notification_id` / `batch_id` are chosen with a subscribe message |
 | GET | `/health` | Liveness |
-| GET | `/ready` | DB + Redis ping, bileşen bazlı durum (`ok/degraded/down`) |
+| GET | `/ready` | DB + Redis ping, per-component status (`ok/degraded/down`) |
 | GET | `/metrics` | Prometheus |
-| GET | `/api/v1/metrics` | JSON özet (kuyruk derinliği, başarı/hata oranları, p50/p95/p99 latency) |
-| GET | `/docs`, `/openapi.yaml` | Swagger UI ve spec |
+| GET | `/api/v1/metrics` | JSON summary (queue depth, success/failure rates, p50/p95/p99 latency) |
+| GET | `/docs`, `/openapi.yaml` | Swagger UI and the spec |
 
-### 5.2 Batch semantiği
-- **Varsayılan davranış "hepsi ya da hiçbiri":** Tek bir item geçersizse 422 döner ve hata detayında item index'i ile alan adı yer alır. Hiçbir kayıt yazılmaz.
-- Bu tercih, kampanya gönderen bir müşteri için "yarısı gitti, yarısı gitmedi" belirsizliğini ortadan kaldırır.
-- Yazma işlemi `COPY` ile yapılır, böylece 1000 satır tek round-trip ile yazılır.
-- Batch içindeki her item'ın kendi `idempotency_key` alanı olabilir.
+### 5.2 Batch semantics
+- **Default behaviour is all-or-nothing:** If a single item is invalid, the response is 422 and the error details include the item index and field name. Nothing is written.
+- This choice removes the "half of it went out, half didn't" ambiguity for a customer sending a campaign.
+- Rows are written with `COPY`, so 1000 rows go in one round trip.
+- Each item in a batch can have its own `idempotency_key`.
 
-### 5.3 Ortak kurallar
-- **Kimlik doğrulama:** `X-API-Key` header'ı. Anahtarlar env'den okunur. `/health`, `/ready` ve `/metrics` hariç her yerde zorunludur.
-- **Hata formatı:** RFC 7807 tarzı, tek tip:
+### 5.3 Common rules
+- **Authentication:** The `X-API-Key` header. Keys are read from the environment. Required everywhere except `/health`, `/ready` and `/metrics`.
+- **Error format:** RFC 7807-style, uniform:
   ```json
   {"error": {"code": "validation_failed", "message": "...", "details": [{"field": "items[3].recipient", "reason": "..."}]}, "correlation_id": "..."}
   ```
-- **Pagination:** Cursor, `(created_at, id)` çiftinin base64 kodlanmış hali. Milyonlarca satırda `OFFSET` yavaşladığı için cursor kullanılır. Yanıtta `next_cursor` ve `has_more` döner.
-- **Limitler:** Request body en fazla 5 MB (1000 email için yeterli), handler timeout 10 sn, `ReadHeaderTimeout` tanımlı (Slowloris'e karşı).
-- **Tarih formatı:** Her yerde RFC 3339 / UTC.
+- **Pagination:** The cursor is the base64-encoded `(created_at, id)` pair. A cursor is used because `OFFSET` gets slow over millions of rows. The response returns `next_cursor` and `has_more`.
+- **Limits:** Request body at most 5 MB (enough for 1000 emails), handler timeout 10 s, `ReadHeaderTimeout` set (against Slowloris).
+- **Date format:** RFC 3339 / UTC everywhere.
 
 ---
 
-## 6. Validation Kuralları
+## 6. Validation Rules
 
-| Kanal | Alıcı | İçerik |
+| Channel | Recipient | Content |
 |---|---|---|
-| SMS | E.164: `^\+[1-9]\d{7,14}$` | GSM-7 karakter setinde 160, UCS-2'de (Türkçe karakter veya emoji) 70 karakter tek segment. **Çok parçalı SMS desteklenir:** en fazla 6 segment (GSM-7: 153×6, UCS-2: 67×6). Segment sayısı hesaplanır ve kayda yazılır |
-| Email | RFC 5322 (`net/mail`), en fazla 254 karakter | `subject` zorunlu, en fazla 255 karakter; gövde en fazla 100 KB |
-| Push | Device token: boş olmayan, en fazla 4096 karakter (FCM token'ları uzun olabilir) | En fazla 1024 karakter; `subject` opsiyonel (başlık olarak kullanılır) |
+| SMS | E.164: `^\+[1-9]\d{7,14}$` | One segment is 160 characters in the GSM-7 character set and 70 in UCS-2 (Turkish characters or emoji). **Multi-part SMS is supported:** at most 6 segments (GSM-7: 153×6, UCS-2: 67×6). The segment count is computed and stored |
+| Email | RFC 5322 (`net/mail`), at most 254 characters | `subject` required, at most 255 characters; body at most 100 KB |
+| Push | Device token: non-empty, at most 4096 characters (FCM tokens can be long) | At most 1024 characters; `subject` optional (used as the title) |
 
-Ortak kurallar:
-- `priority` varsayılan olarak `normal`.
-- `content` ile `template_id` birbirini dışlar; ikisinden biri zorunludur.
-- `scheduled_at` geçmişte olamaz ve en fazla 30 gün ileride olabilir.
-- `callback_url` sadece `https` olabilir ve SSRF koruması uygulanır (§9.6).
-- `metadata` en fazla 4 KB.
-- Template kullanılıyorsa önce render edilir, limitler render edilmiş içerik üzerinden kontrol edilir.
-- Validation hataları tek seferde döner (ilk hatada durmaz), her hata alan yoluyla gösterilir.
-- Validation fonksiyonları fuzz testinden geçirilir: hiçbir girdi panic üretmemeli.
-
----
-
-## 7. Idempotency (İki Katman)
-
-### 7.1 API katmanı (`Idempotency-Key` header'ı)
-1. İstek gelince key için `INSERT ... ON CONFLICT DO NOTHING` ile "işleniyor" kaydı oluşturulur (`locked_at`).
-2. Kayıt zaten varsa:
-   - yanıtı kaydedilmişse ve request hash'i (SHA-256) aynıysa, ilk yanıt aynen döner (`Idempotent-Replayed: true` header'ıyla);
-   - hash farklıysa 422 (`idempotency_key_reused`) döner;
-   - hâlâ işleniyorsa 409 (`request_in_progress`) döner.
-3. İşlem bitince yanıt kaydedilir. İşlem hata ile biterse, istemcinin tekrar deneyebilmesi için kayıt silinir.
-
-Bu akış, eşzamanlı aynı-key istekleri de doğru yönetir. Integration testiyle kanıtlanır.
-
-### 7.2 Bildirim katmanı
-- `idempotency_key` alanında kısmi unique constraint vardır. Çakışan item mevcut kaydı döndürür ve yeni gönderim olmaz.
-- Worker sadece `processing` durumundaki ve lease'i kendisine ait kaydı gönderir. `sent` olan bir kayıt asla tekrar gönderilmez.
-- Provider'a `X-Idempotency-Key: <notification_id>` header'ı gönderilir.
-
-### 7.3 Teslim garantisi
-Sistem **at-least-once** çalışır. Worker provider'dan 202 aldıktan sonra, DB'yi güncelleyemeden çökerse lease dolar ve kayıt tekrar gönderilebilir. Bu pencere iki şekilde daraltılır:
-
-- Provider çağrısından hemen sonra yapılan güncelleme kısa ve tek bir sorgudur.
-- Provider tarafında idempotency key bulunur. Exactly-once garantisini yalnızca provider sağlayabilir.
-
-Bu durum README'de açıkça yazılır.
+Common rules:
+- `priority` defaults to `normal`.
+- `content` and `template_id` are mutually exclusive; one of them is required.
+- `scheduled_at` cannot be in the past and can be at most 30 days ahead.
+- `callback_url` must be `https`, and SSRF protection applies (§9.6).
+- `metadata` at most 4 KB.
+- If a template is used, it is rendered first and limits are checked against the rendered content.
+- Validation errors are returned all at once (validation does not stop at the first error), each with its field path.
+- Validation functions are fuzz-tested: no input may cause a panic.
 
 ---
 
-## 8. İşleme Motoru (Worker)
+## 7. Idempotency (Two Layers)
 
-### 8.1 Yapı
+### 7.1 API layer (`Idempotency-Key` header)
+1. When a request arrives, an "in progress" record is created for the key with `INSERT ... ON CONFLICT DO NOTHING` (`locked_at`).
+2. If the record already exists:
+   - if its response is stored and the request hash (SHA-256) matches, the original response is returned as is (with an `Idempotent-Replayed: true` header);
+   - if the hash differs, 422 (`idempotency_key_reused`) is returned;
+   - if it is still in progress, 409 (`request_in_progress`) is returned.
+3. When processing finishes, the response is stored. If processing ends with an error, the record is deleted so the client can retry.
+
+This flow also handles concurrent requests with the same key correctly. Proven with an integration test.
+
+### 7.2 Notification layer
+- The `idempotency_key` field has a partial unique constraint. A conflicting item returns the existing record and nothing new is sent.
+- A worker only sends a record that is in `processing` and whose lease it owns. A `sent` record is never sent again.
+- The provider receives an `X-Idempotency-Key: <notification_id>` header.
+
+### 7.3 Delivery guarantee
+The system is **at-least-once**. If a worker crashes after getting 202 from the provider but before updating the database, the lease expires and the record may be sent again. This window is narrowed in two ways:
+
+- The update right after the provider call is short and a single query.
+- The provider side gets an idempotency key. Only the provider can guarantee exactly-once.
+
+The README states this explicitly.
+
+---
+
+## 8. Processing Engine (Worker)
+
+### 8.1 Structure
 ```
-                 ┌─────────── Dispatcher (kanal başına) ───────────┐
-LISTEN/NOTIFY ──►│  claim(batch=N) → yerel buffer → worker goroutine'leri │──► rate limiter ──► circuit breaker ──► provider
-   + poll        └──────────────────────────────────────────────────┘
-Reaper (lease dolanları geri alır) · Retention job · Queue depth sampler · Outbox relay
+                 ┌───────────── Dispatcher (per channel) ─────────────┐
+LISTEN/NOTIFY ──►│  claim(batch=N) → local buffer → worker goroutines  │──► rate limiter ──► circuit breaker ──► provider
+   + poll        └─────────────────────────────────────────────────────┘
+Reaper (takes back expired leases) · Retention job · Queue depth sampler · Outbox relay
 ```
 
-- **Kanal başına ayrı havuz:** SMS'in rate limit'e takılması ya da circuit breaker'ının açılması Email'i etkilemez.
-- **Claim sorgusu:**
+- **A separate pool per channel:** SMS hitting its rate limit or opening its circuit breaker does not affect email.
+- **Claim query:**
   ```sql
   UPDATE notifications
   SET status='processing', locked_until=now()+$lease, locked_by=$worker, attempts=attempts+1
@@ -326,74 +329,74 @@ Reaper (lease dolanları geri alır) · Retention job · Queue depth sampler · 
     LIMIT $n)
   RETURNING ...;
   ```
-  `SKIP LOCKED` sayesinde N worker instance'ı aynı kaydı almadan paralel çalışabilir.
-- **Claim miktarı rate limit'e bağlıdır:** Bir seferde en fazla o anda harcanabilecek token kadar kayıt claim edilir. Böylece kayıtlar uzun süre `processing` durumunda bekleyip lease'i doldurmaz.
-- **Öncelik ve aging:** Katı öncelik uygulanır. Ancak low önceliğin hiç işlenmeme (starvation) riskine karşı, 5 dakikadan uzun bekleyen kayıtların efektif önceliği bir kademe yükselir: `ORDER BY GREATEST(priority - floor(bekleme/5dk), 0), next_attempt_at`. Aging eşiği ayarlanabilir ve testle doğrulanır.
-- **Lease ve reaper:** Lease 30 sn sürer; uzun süren provider çağrılarında lease uzatılır (heartbeat). Reaper, lease'i dolmuş `processing` kayıtlarını `pending` durumuna geri çeker ve `worker_lease_expired_total` metriğini artırır.
-- **Uyanma stratejisi:** Insert sonrası `NOTIFY notifications_<channel>` gönderilir, worker hemen uyanır. Bağlantı koparsa ya da NOTIFY kaçarsa, yedek olarak 1 sn'lik poll devreye girer. Böylece gecikme düşük kalır ve boşta DB yükü olmaz.
-- **Graceful shutdown:** SIGTERM gelince yeni claim yapılmaz, eldeki işler bitirilir (yapılandırılabilir timeout ile). Bitmeyenler lease süresi sonunda reaper tarafından geri alınır, yani hiçbir kayıt kaybolmaz.
+  Thanks to `SKIP LOCKED`, N worker instances can work in parallel without taking the same record.
+- **The claim size is tied to the rate limit:** At most as many records as there are tokens available right now are claimed at once. This keeps records from sitting in `processing` long enough for their lease to expire.
+- **Priority and aging:** Strict priority applies. To prevent starvation of low priority, records waiting longer than 5 minutes move up one level in effective priority: `ORDER BY GREATEST(priority - floor(wait/5min), 0), next_attempt_at`. The aging threshold is configurable and verified by tests.
+- **Lease and reaper:** A lease lasts 30 s; it is extended (heartbeat) during long provider calls. The reaper moves `processing` records with expired leases back to `pending` and increments the `worker_lease_expired_total` metric.
+- **Wake-up strategy:** After an insert, `NOTIFY notifications_<channel>` is sent and the worker wakes up immediately. If the connection drops or a NOTIFY is missed, a 1 s poll acts as a fallback. This keeps latency low with no database load while idle.
+- **Graceful shutdown:** On SIGTERM, no new claims are made and work in hand is finished (with a configurable timeout). Anything unfinished is taken back by the reaper when its lease expires, so no record is lost.
 
 ### 8.2 Rate limiting
-- Redis üzerinde Lua script ile atomik çalışan **GCRA** (token bucket'ın tek anahtarlı, bellek dostu türevi). Anahtar `ratelimit:{channel}`, limit 100/s, burst 100 (ayarlanabilir).
-- Limit **tüm worker instance'ları genelinde** geçerlidir. Script izin verilmediğinde bekleme süresini döner, worker o kadar uyur. Kayıt kaybolmaz.
-- **Redis erişilemezse:** Worker, `limit / beklenen_instance_sayısı` değeriyle çalışan yerel bir token bucket'a düşer. Bu muhafazakâr bir tercih: limiti aşmaktansa yavaş göndermek daha iyi. `/ready` "degraded" döner ve `rate_limiter_fallback_active` metriği 1 olur.
-- Test: Birden çok goroutine ve instance simülasyonuyla 10 saniyelik pencerede hiçbir 1 saniyelik dilimde 100'ün aşılmadığı ölçülür.
+- **GCRA** (a single-key, memory-friendly variant of the token bucket) running atomically on Redis as a Lua script. Key `ratelimit:{channel}`, limit 100/s, burst 100 (configurable).
+- The limit applies **across all worker instances**. When a request is not allowed, the script returns how long to wait, and the worker sleeps for that long. No record is lost.
+- **If Redis is unreachable:** The worker falls back to a local token bucket running at `limit / expected_instance_count`. This is a conservative choice: sending slowly is better than exceeding the limit. `/ready` returns "degraded" and the `rate_limiter_fallback_active` metric becomes 1.
+- Test: with multiple goroutines and simulated instances, measure that no 1-second slice in a 10-second window exceeds 100.
 
-### 8.3 Burst trafiği
-API sadece DB'ye yazar ve hemen döner. Kuyruk tamponlama işini üstlenir, worker sabit hızla (100/s/kanal) eritir. Flash sale anında sistem çökmez, sadece kuyruk derinliği artar. Bu metriklerde ve Grafana'da görünür. Yük testi tam olarak bu senaryoyu ölçer (§13).
+### 8.3 Burst traffic
+The API only writes to the database and returns immediately. The queue acts as the buffer, and workers drain it at a steady rate (100/s per channel). During a flash sale the system does not fall over; only the queue depth grows. This is visible in the metrics and in Grafana. The load test measures exactly this scenario (§13).
 
 ---
 
-## 9. Teslimat ve Retry Tasarımı
+## 9. Delivery and Retry Design
 
 ### 9.1 Provider client
-- Provider URL'i kanal başına yapılandırılabilir (`PROVIDER_URL_SMS`, `_EMAIL`, `_PUSH`). Ayrı tanımlanmamışsa ortak `PROVIDER_URL` kullanılır.
-- Gönderilen istek PDF formatındadır: `{"to": "...", "channel": "sms", "content": "..."}`. Ek olarak header'larda `X-Idempotency-Key`, `X-Correlation-ID` ve `traceparent` gönderilir.
-- Yanıt `{messageId, status, timestamp}` olarak parse edilir. `status != "accepted"` ya da `messageId` boşsa yanıt geçersiz sayılır.
-- 10 sn timeout, connection pooling (`MaxIdleConnsPerHost` ayarlı), `context` ile iptal edilebilir, yanıt gövdesi en fazla 1 MB okunur.
+- The provider URL is configurable per channel (`PROVIDER_URL_SMS`, `_EMAIL`, `_PUSH`). If one is not set, the shared `PROVIDER_URL` is used.
+- The request uses the format from the brief: `{"to": "...", "channel": "sms", "content": "..."}`. The `X-Idempotency-Key`, `X-Correlation-ID` and `traceparent` headers are also sent.
+- The response is parsed as `{messageId, status, timestamp}`. If `status != "accepted"` or `messageId` is empty, the response is considered invalid.
+- 10 s timeout, connection pooling (`MaxIdleConnsPerHost` set), cancellable through `context`, response body read up to 1 MB.
 
-### 9.2 Hata sınıflandırması
+### 9.2 Error classification
 
-| Durum | Sınıf | Davranış |
+| Case | Class | Behaviour |
 |---|---|---|
-| 202 + geçerli body | Başarılı | `sent`, `provider_message_id` kaydedilir |
-| 2xx ama beklenmeyen body | Geçici | Retry, `error_code=invalid_provider_response` |
-| 408, 429 | Geçici | `Retry-After` varsa ona uyulur (en fazla max delay kadar) |
-| 5xx | Geçici | Backoff ile retry |
-| Timeout, connection refused/reset, DNS hatası | Geçici | Backoff ile retry |
-| 400, 401, 403, 404, 410, 413, 422 | Kalıcı | Retry yapılmaz, doğrudan `failed` |
-| Diğer 4xx | Kalıcı | Aynı |
+| 202 + valid body | Success | `sent`, `provider_message_id` stored |
+| 2xx but unexpected body | Transient | Retry, `error_code=invalid_provider_response` |
+| 408, 429 | Transient | `Retry-After` honoured if present (capped at the max delay) |
+| 5xx | Transient | Retry with backoff |
+| Timeout, connection refused/reset, DNS error | Transient | Retry with backoff |
+| 400, 401, 403, 404, 410, 413, 422 | Permanent | No retry, straight to `failed` |
+| Other 4xx | Permanent | Same |
 
 ### 9.3 Backoff
-- Formül: `delay = rand(0, min(base · 2^attempt, max))` (AWS "full jitter").
-- Varsayılanlar: base 2 sn, max 5 dk, `max_attempts` 5. Hepsi env ile ayarlanabilir; `max_attempts` bildirim başına da verilebilir (1–10).
-- Jitter, provider toparlandığında bütün retry'ların aynı anda saldırmasını (thundering herd) önler.
-- Retry, kaydın `next_attempt_at` alanını ileri almaktan ibarettir. Worker içinde `sleep` yoktur; kayıt kuyruğa geri döner ve başka bir worker alabilir.
-- **Retry kaydı öncelik kaybetmez:** high öncelikli bir bildirim retry'da da high kalır.
+- Formula: `delay = rand(0, min(base · 2^attempt, max))` (AWS "full jitter").
+- Defaults: base 2 s, max 5 min, `max_attempts` 5. All configurable through the environment; `max_attempts` can also be set per notification (1–10).
+- Jitter keeps all retries from hitting the provider at the same moment when it recovers (thundering herd).
+- A retry is just moving the record's `next_attempt_at` forward. There is no `sleep` in the worker; the record goes back to the queue and any worker can pick it up.
+- **A retried record keeps its priority:** a high-priority notification stays high on retry.
 
-### 9.4 Circuit breaker (kanal başına)
-- Devre, 10 saniyelik pencerede en az 20 istek varsa ve hata oranı %50'yi geçerse açılır.
-- **Açıkken** dispatcher o kanaldan claim yapmaz. Kayıtlar kuyrukta bekler, retry hakları **harcanmaz**. Bu kritik bir nokta: provider kesintisi, bildirimlerin boşuna `failed` olmasına yol açmamalı.
-- 30 sn sonra **half-open** durumuna geçilir; birkaç deneme isteği başarılı olursa devre kapanır.
-- Devre durumu metrik olarak yayınlanır ve `/ready` sonucuna "degraded" olarak yansır.
+### 9.4 Circuit breaker (per channel)
+- The breaker opens when there are at least 20 requests in a 10-second window and the failure rate exceeds 50%.
+- **While open**, the dispatcher does not claim from that channel. Records wait in the queue and their retry attempts are **not spent**. This is critical: a provider outage must not make notifications fail for nothing.
+- After 30 s it moves to **half-open**; if a few probe requests succeed, the breaker closes.
+- The breaker state is published as a metric and reflected in `/ready` as "degraded".
 
 ### 9.5 DLQ
-- Deneme hakkı biten ya da kalıcı hata alan kayıt `failed` olur; `last_error` ve `last_error_code` doldurulur.
-- `failed` durumu DLQ görevi görür: `?status=failed` ile listelenir, `/retry` ile tekil olarak tekrar kuyruğa alınır.
-- Runbook'ta "provider kesintisinden sonra DLQ'yu toplu boşaltma" prosedürü anlatılır (filtreli toplu retry SQL'i ve endpoint örneği).
+- A record that runs out of attempts or gets a permanent error becomes `failed`; `last_error` and `last_error_code` are filled in.
+- The `failed` status serves as the DLQ: it is listed with `?status=failed` and requeued one by one with `/retry`.
+- The runbook describes the procedure for bulk-draining the DLQ after a provider outage (filtered bulk retry SQL and an endpoint example).
 
-### 9.6 Status callback'leri (müşteri webhook'u)
-- `callback_url` verilmişse, son durum değişikliklerinde (`sent`, `failed`, `cancelled`) müşteriye POST atılır.
-- Gövde event payload'ıdır. `X-Signature: sha256=HMAC(secret, timestamp + "." + body)` ve `X-Timestamp` header'ları eklenir, böylece müşteri isteğin bize ait olduğunu ve tekrar oynatılmadığını doğrulayabilir.
-- Kendi retry politikası vardır (backoff, en fazla 5 deneme) ve `callback_deliveries` tablosuna kaydedilir.
-- **SSRF koruması:** Sadece `https` kabul edilir. Hostname çözüldükten sonra private, loopback ve link-local IP'ler reddedilir; kontrol, DNS rebinding'e karşı bağlantı anında (custom dialer'da) tekrar yapılır. Lokal geliştirme için env ile kapatılabilir.
+### 9.6 Status callbacks (customer webhook)
+- If a `callback_url` is given, the customer receives a POST on final status changes (`sent`, `failed`, `cancelled`).
+- The body is the event payload. `X-Signature: sha256=HMAC(secret, timestamp + "." + body)` and `X-Timestamp` headers are added, so the customer can verify that the request comes from us and is not a replay.
+- Callbacks have their own retry policy (backoff, at most 5 attempts) and are recorded in the `callback_deliveries` table.
+- **SSRF protection:** Only `https` is accepted. After the hostname is resolved, private, loopback and link-local IPs are rejected; the check is repeated at connect time (in a custom dialer) against DNS rebinding. It can be turned off through the environment for local development.
 
 ---
 
-## 10. Gözlemlenebilirlik
+## 10. Observability
 
-### 10.1 Metrikler (Prometheus)
-| Metrik | Tip | Label'lar |
+### 10.1 Metrics (Prometheus)
+| Metric | Type | Labels |
 |---|---|---|
 | `notifications_created_total` | counter | channel, priority |
 | `notifications_sent_total` | counter | channel |
@@ -412,210 +415,210 @@ API sadece DB'ye yazar ve hemen döner. Kuyruk tamponlama işini üstlenir, work
 | `callback_deliveries_total` | counter | result |
 | `http_requests_total`, `http_request_duration_seconds` | counter, histogram | route, method, status |
 
-Notlar:
-- `notification_delivery_latency_seconds`, oluşturmadan `sent` olana kadar geçen süredir. Zamanlanmış bildirimlerde başlangıç noktası `scheduled_at` alınır.
-- Kuyruk derinliği her istekte `COUNT(*)` ile hesaplanmaz. Arka planda 5 sn'de bir örnekleme yapılır, böylece DB'ye yük bindirilmez.
-- `/api/v1/metrics` uç noktası aynı verilerin JSON özetini döner: kanal başına kuyruk derinliği, son 1/5/15 dakikanın başarı/hata oranları, p50/p95/p99 latency. PDF'teki "real-time metrics endpoint" maddesi doğrudan bununla karşılanır.
+Notes:
+- `notification_delivery_latency_seconds` is the time from creation until `sent`. For scheduled notifications, `scheduled_at` is the starting point.
+- Queue depth is not computed with `COUNT(*)` on every request. It is sampled in the background every 5 s, so the database is not loaded.
+- The `/api/v1/metrics` endpoint returns a JSON summary of the same data: queue depth per channel, success/failure rates for the last 1/5/15 minutes, p50/p95/p99 latency. This directly covers the "real-time metrics endpoint" item of the brief.
 
-### 10.2 Grafana ve alert'ler
-- Provision edilmiş bir dashboard docker-compose ile otomatik gelir. Panelleri: kanal başına throughput, kuyruk derinliği, hata oranı, latency yüzdelikleri, devre durumu, rate limit bekleme süreleri.
-- Örnek alert kuralları:
-  - kuyruktaki en eski kaydın yaşı 5 dk'yı geçerse,
-  - hata oranı 5 dk boyunca %10'u geçerse,
-  - devre 2 dk'dan uzun açık kalırsa,
-  - outbox gecikmesi 30 sn'yi geçerse.
+### 10.2 Grafana and alerts
+- A provisioned dashboard comes automatically with docker-compose. Panels: throughput per channel, queue depth, error rate, latency percentiles, breaker state, rate limit wait times.
+- Example alert rules:
+  - the oldest record in the queue is older than 5 min,
+  - the error rate is above 10% for 5 min,
+  - a breaker stays open longer than 2 min,
+  - outbox lag exceeds 30 s.
 
-### 10.3 Loglar
-- Format JSON (`slog`). Ortak alanlar: `time, level, msg, service, version, correlation_id, trace_id, span_id`; bağlama göre `notification_id, batch_id, channel, attempt` eklenir.
-- Middleware `X-Correlation-ID` header'ını okur, yoksa üretir ve yanıta ekler. ID `context` içinde taşınır, DB'ye yazılır. Worker kaydı alınca aynı ID ile log basar ve provider'a da header olarak iletir. Böylece **API isteğinden provider çağrısına kadar tek bir ID ile iz sürülebilir**.
-- PII koruması: Telefon numarası ve email loglarda maskelenir (`+90555***4567`). İçerik hiç loglanmaz.
-- Log seviyesi env ile ayarlanır.
+### 10.3 Logs
+- JSON format (`slog`). Common fields: `time, level, msg, service, version, correlation_id, trace_id, span_id`; depending on context, `notification_id, batch_id, channel, attempt` are added.
+- A middleware reads the `X-Correlation-ID` header, generates one if missing, and adds it to the response. The ID travels in the `context` and is stored in the database. When a worker picks the record up, it logs with the same ID and forwards it to the provider as a header. This makes it possible to **trace a request from the API call to the provider call with a single ID**.
+- PII protection: phone numbers and emails are masked in logs (`+90555***4567`). Content is never logged.
+- The log level is set through the environment.
 
 ### 10.4 Tracing
-- OpenTelemetry ile şunlar span olarak kaydedilir: HTTP (otelhttp), DB (pgx tracer), Redis, provider çağrısı ve worker işleme adımları.
-- API'deki `traceparent` DB'ye yazılır. Worker span'ı bu değere **link** ile bağlanır; asenkron sınırda doğru model parent değil link'tir.
-- Sonuçlar Jaeger UI'da görülebilir. Sampling oranı env ile ayarlanır.
+- OpenTelemetry records the following as spans: HTTP (otelhttp), database (pgx tracer), Redis, the provider call and the worker processing steps.
+- The `traceparent` from the API is stored in the database. The worker span is connected to it with a **link**; at an asynchronous boundary, a link rather than a parent is the right model.
+- Results are visible in the Jaeger UI. The sampling rate is set through the environment.
 
 ### 10.5 Health
-- `/health`: Process ayaktaysa her zaman 200 döner (liveness).
-- `/ready`: DB ve Redis'i 1 sn timeout ile ping'ler. Bileşen bazlı JSON döner. DB yoksa 503; Redis yoksa veya bir devre açıksa 200 + `degraded`.
+- `/health`: always 200 while the process is up (liveness).
+- `/ready`: pings the database and Redis with a 1 s timeout. Returns per-component JSON. 503 if the database is down; 200 + `degraded` if Redis is down or a breaker is open.
 
 ---
 
-## 11. Bonus Özellikler (hepsi uygulanacak)
+## 11. Bonus Features (all to be implemented)
 
-| Bonus | Uygulama |
+| Bonus | Implementation |
 |---|---|
-| Failure handling | Circuit breaker, DLQ + manuel retry, lease/reaper, graceful shutdown, Redis fallback, outbox ile kayıpsız event'ler (§8, §9) |
-| Scheduled notifications | `scheduled_at` dolu kayıt `scheduled` statüsüne girer, `next_attempt_at = scheduled_at` olur. Claim sorgusu doğru zamanda yakalar, ayrı bir scheduler gerekmez. Zamanı gelene kadar iptal edilebilir |
-| Template system | Go `text/template` (`missingkey=error`). Şablon kaydında değişkenler ve kanal uyumluluğu doğrulanır. Versiyonlama ve `preview` endpoint'i var. Güvenlik için şablonlarda fonksiyon seti kısıtlıdır; sadece `upper`, `lower`, `default` gibi güvenli yardımcılar kullanılabilir |
-| WebSocket updates | Client bağlanınca `{"action":"subscribe","notification_ids":[...],"batch_ids":[...]}` gönderir. Hub, Redis Streams'ten gelen event'leri filtreleyip iletir. Ping/pong ile canlılık kontrol edilir, yavaş client'ın tamponu dolarsa bağlantı kesilir (backpressure). Kimlik doğrulama query param veya ilk mesajdaki API key ile yapılır |
-| Distributed tracing | OpenTelemetry + Jaeger, asenkron sınırda span link'leri (§10.4) |
+| Failure handling | Circuit breaker, DLQ + manual retry, lease/reaper, graceful shutdown, Redis fallback, lossless events through the outbox (§8, §9) |
+| Scheduled notifications | A record with `scheduled_at` set enters the `scheduled` status and `next_attempt_at = scheduled_at`. The claim query picks it up at the right time, so no separate scheduler is needed. It can be cancelled until it is due |
+| Template system | Go `text/template` (`missingkey=error`). Variables and channel compatibility are validated when a template is saved. Versioning and a `preview` endpoint. For safety, templates have a restricted function set; only safe helpers such as `upper`, `lower`, `default` are available |
+| WebSocket updates | On connect, the client sends `{"action":"subscribe","notification_ids":[...],"batch_ids":[...]}`. The hub filters events coming from Redis Streams and forwards them. Liveness is checked with ping/pong; a slow client whose buffer fills up is disconnected (backpressure). Authentication uses the API key in a query parameter or the first message |
+| Distributed tracing | OpenTelemetry + Jaeger, span links at the asynchronous boundary (§10.4) |
 | GitHub Actions CI/CD | §14 |
 
 ---
 
-## 12. Güvenlik ve Sağlamlık
+## 12. Security and Robustness
 
-- API key doğrulaması `crypto/subtle` ile sabit zamanlı karşılaştırmayla yapılır.
-- Request body limiti, JSON'da bilinmeyen alanlar reddedilir (`DisallowUnknownFields`), sunucu timeout'ları tanımlı.
-- Panic recovery middleware'i var; stack trace loga yazılır, istemciye dönmez.
-- SQL injection yok: tüm sorgular parametrelidir. Dinamik liste filtresi de whitelist'li builder ile kurulur.
-- Callback'ler için SSRF koruması (§9.6).
-- Container: distroless base image, non-root kullanıcı, read-only filesystem.
-- Secret'lar sadece env'den okunur. `.env.example` dosyasında gerçek değer yoktur.
-- Config başlangıçta doğrulanır; eksik veya hatalı değerde servis anlaşılır bir hata mesajıyla hiç ayağa kalkmaz (fail-fast).
+- API keys are checked with a constant-time comparison from `crypto/subtle`.
+- Request body limit, unknown JSON fields rejected (`DisallowUnknownFields`), server timeouts set.
+- A panic recovery middleware; the stack trace goes to the log, never to the client.
+- No SQL injection: every query is parameterized. The dynamic list filter is built with a whitelisting builder too.
+- SSRF protection for callbacks (§9.6).
+- Container: distroless base image, non-root user, read-only filesystem.
+- Secrets are read only from the environment. `.env.example` contains no real values.
+- Config is validated at startup; with a missing or invalid value, the service refuses to start with a clear error message (fail-fast).
 
 ---
 
-## 13. Test Stratejisi
+## 13. Test Strategy
 
-| Katman | Kapsam | Araç |
+| Layer | Scope | Tools |
 |---|---|---|
-| Unit | Validation tabloları (SMS segment hesabı dahil), state machine, backoff (seed'li jitter, enjekte edilmiş clock), hata sınıflandırması, template render, cursor encode/decode, HMAC imzası, SSRF IP filtresi | `testing`, `testify` |
-| Fuzz | Validation ve cursor decode: hiçbir girdi panic üretmemeli | Go native fuzzing |
-| Handler | Her endpoint için başarılı ve hatalı akışlar (mock servis ile) | `httptest` |
-| Contract | Tüm handler yanıtları OpenAPI spec'e karşı doğrulanır | `kin-openapi` |
-| Integration | Repository sorguları; `SKIP LOCKED` altında eşzamanlı claim (aynı kayıt iki kez alınmamalı); eşzamanlı aynı-key idempotency; iptal-claim yarışı; outbox relay; Redis rate limiter'ın 100/s'ı aşmadığı | `testcontainers-go` |
-| E2E | Gerçek API + worker + mock provider ile: 503→503→202 (retry ve attempts kaydı), 400 (doğrudan failed), provider kesintisinde devrenin açılması ve retry hakkının korunması, scheduled gönderim, batch iptali, WebSocket'e event gelmesi, callback imzası | `testcontainers-go`, mock provider |
-| Chaos | Worker işlerin ortasında öldürülür; lease dolduktan sonra kayıtların başka worker tarafından tamamlandığı ve kayıp olmadığı doğrulanır | E2E içinde |
-| Load | k6 senaryoları: (a) sürekli yük, (b) flash sale burst'ü (60 sn'de 50.000 bildirim), (c) provider %20 hata verirken. Ölçülenler: API p99 latency, kanal başına gerçekleşen gönderim hızının 100/s'ı aşmadığı, kuyruk erime süresi. **Sonuçlar README'de tablo olarak yayımlanır** | k6 + mock provider |
+| Unit | Validation tables (including the SMS segment count), state machine, backoff (seeded jitter, injected clock), error classification, template rendering, cursor encode/decode, HMAC signature, SSRF IP filter | `testing`, `testify` |
+| Fuzz | Validation and cursor decoding: no input may cause a panic | Go native fuzzing |
+| Handler | Success and failure paths for every endpoint (with a mock service) | `httptest` |
+| Contract | Every handler response validated against the OpenAPI spec | `kin-openapi` |
+| Integration | Repository queries; concurrent claims under `SKIP LOCKED` (a record must never be taken twice); concurrent same-key idempotency; the cancel-claim race; the outbox relay; the Redis rate limiter never exceeding 100/s | `testcontainers-go` |
+| E2E | With the real API + worker + mock provider: 503→503→202 (retry and attempt records), 400 (straight to failed), the breaker opening during a provider outage while retry attempts are preserved, scheduled delivery, batch cancellation, events reaching WebSocket, callback signatures | `testcontainers-go`, mock provider |
+| Chaos | A worker is killed mid-work; verify that after the lease expires another worker completes the records and nothing is lost | Within E2E |
+| Load | k6 scenarios: (a) sustained load, (b) a flash sale burst (50,000 notifications in 60 s), (c) the provider failing 20% of calls. Measured: API p99 latency, the actual send rate per channel never exceeding 100/s, queue drain time. **Results are published as a table in the README** | k6 + mock provider |
 
-Komutlar:
-- `make test`: unit + integration + e2e (Docker gerekir), `-race` açık.
-- `make test-unit`: Docker gerektirmez, saniyeler içinde biter.
-- `make test-load`: k6 senaryolarını çalıştırır.
-- `make cover`: Coverage raporu üretir. Hedef: domain, service ve worker paketlerinde %80+ (sayı tek başına amaç değil; kritik yollar mutlaka test edilecek).
+Commands:
+- `make test`: unit + integration + e2e (needs Docker), with `-race`.
+- `make test-unit`: no Docker needed, finishes in seconds.
+- `make test-load`: runs the k6 scenarios.
+- `make cover`: produces a coverage report. Target: 80%+ in the domain, service and worker packages (the number is not a goal in itself; critical paths must be tested).
 
 ---
 
 ## 14. CI/CD (GitHub Actions)
 
-- **Tetikleyiciler:** push ve pull request.
-- **Job'lar** (paralel):
+- **Triggers:** push and pull request.
+- **Jobs** (in parallel):
   1. `lint`: `golangci-lint` (errcheck, govet, staticcheck, gosec, revive, gofumpt…).
-  2. `generate-check`: `oapi-codegen` ve `sqlc` çıktıları yeniden üretilir ve git diff boş olmalı. Böylece spec ile kod arasında kopukluk olamaz.
-  3. `test-unit`: race detector ile çalışır, coverage artifact olarak yüklenir.
-  4. `test-integration`: testcontainers ile çalışır (GitHub runner'da Docker mevcut).
-  5. `security`: `govulncheck` ve Trivy ile image taraması.
-  6. `build`: Docker image build edilir. Main branch'te GHCR'ye push edilir; bu CD kısmıdır.
-- **Dependabot:** Go modülleri, GitHub Actions ve Docker base image'ları için.
+  2. `generate-check`: `oapi-codegen` and `sqlc` output is regenerated and the git diff must be empty. This way the spec and the code cannot drift apart.
+  3. `test-unit`: runs with the race detector, coverage uploaded as an artifact.
+  4. `test-integration`: runs with testcontainers (Docker is available on GitHub runners).
+  5. `security`: `govulncheck` and a Trivy image scan.
+  6. `build`: builds the Docker image. On the main branch it is pushed to GHCR; this is the CD part.
+- **Dependabot:** for Go modules, GitHub Actions and Docker base images.
 
 ---
 
 ## 15. Docker Compose
 
-`docker-compose up` ile ayağa kalkan servisler:
+Services started by `docker-compose up`:
 
-| Servis | Port | Not |
+| Service | Port | Note |
 |---|---|---|
-| `postgres` | 5432 | healthcheck'li, volume'lu |
-| `redis` | 6379 | healthcheck'li |
-| `migrate` | — | Bir kere çalışır ve çıkar; `api` ve `worker` buna bağımlı (`service_completed_successfully`) |
+| `postgres` | 5432 | With healthcheck and volume |
+| `redis` | 6379 | With healthcheck |
+| `migrate` | — | Runs once and exits; `api` and `worker` depend on it (`service_completed_successfully`) |
 | `api` | 8080 | |
-| `worker` | — | `replicas: 2` ile yatay ölçeklenmeyi ve ortak rate limit'i gösterir |
-| `mockprovider` | 9000 | Varsayılan provider. Hata oranı, gecikme ve 429 oranı env ile ayarlanır |
+| `worker` | — | `replicas: 2` to demonstrate horizontal scaling and the shared rate limit |
+| `mockprovider` | 9000 | The default provider. Failure rate, latency and 429 rate are set through the environment |
 | `jaeger` | 16686 | |
-| `prometheus` | 9090 | Alert kurallarıyla birlikte |
-| `grafana` | 3000 | Dashboard provision edilmiş, anonim okuma açık |
+| `prometheus` | 9090 | With alert rules |
+| `grafana` | 3000 | Dashboard provisioned, anonymous read access |
 
-- **webhook.site'a geçiş:** `.env` dosyasında `PROVIDER_URL=https://webhook.site/<uuid>` ayarlamak yeterli. Neden mock varsayılan? webhook.site'ın ücretsiz planında istek ve süre limitleri var; yük testi ve tekrarlanabilir hata senaryoları için kendi kontrolümüzdeki mock gerekiyor. README'de iki kullanım da adım adım anlatılır.
-- `make up`, `make down`, `make logs`, `make seed` (örnek şablon ve bildirimler) komutları sağlanır.
+- **Switching to webhook.site:** setting `PROVIDER_URL=https://webhook.site/<uuid>` in the `.env` file is enough. Why is the mock the default? webhook.site's free plan has request and time limits; load testing and reproducible failure scenarios need a mock under our own control. The README explains both setups step by step.
+- `make up`, `make down`, `make logs`, `make seed` (sample templates and notifications) commands are provided.
 
 ---
 
-## 16. Dokümantasyon
+## 16. Documentation
 
 - **README.md:**
-  - proje özeti,
-  - 30 saniyede başlatma,
-  - mimari diyagramı (Mermaid),
-  - tasarım kararları ve trade-off'lar,
-  - API örnekleri (curl),
-  - konfigürasyon tablosu (tüm env değişkenleri),
-  - test komutları,
-  - yük testi sonuçları,
-  - bilinen sınırlamalar ve "ölçek büyürse ne yapardık" bölümü.
-- **docs/architecture.md:** Bileşen diyagramı, "bildirimin yaşamı" sequence diyagramı (create → claim → send → retry → event → WebSocket/callback), durum diyagramı.
-- **docs/adr/:** Her mimari karar için kısa bir kayıt (bağlam, karar, sonuçlar):
-  - 001 Postgres kuyruğu,
+  - project summary,
+  - starting it in 30 seconds,
+  - architecture diagram (Mermaid),
+  - design decisions and trade-offs,
+  - API examples (curl),
+  - configuration table (every environment variable),
+  - test commands,
+  - load test results,
+  - known limitations and a "what we would do at larger scale" section.
+- **docs/architecture.md:** Component diagram, a "life of a notification" sequence diagram (create → claim → send → retry → event → WebSocket/callback), state diagram.
+- **docs/adr/:** A short record for each architecture decision (context, decision, consequences):
+  - 001 Postgres queue,
   - 002 Transactional outbox + Redis Streams,
   - 003 Redis GCRA rate limit + fallback,
-  - 004 Retry ve circuit breaker politikası,
-  - 005 At-least-once teslim garantisi,
+  - 004 Retry and circuit breaker policy,
+  - 005 At-least-once delivery guarantee,
   - 006 Spec-first API.
-- **docs/runbook.md:** DLQ boşaltma, açık kalan devre, büyüyen kuyruk, Redis kesintisi durumunda ne yapılacağı.
-- **api/openapi.yaml:** Tüm endpoint'ler, şemalar, örnekler ve hata yanıtları. `/docs` adresinde Swagger UI ile sunulur.
-- **examples/requests.http:** IDE içinden tek tıkla çalıştırılabilir örnek istekler.
+- **docs/runbook.md:** What to do when draining the DLQ, when a breaker stays open, when the queue keeps growing, and during a Redis outage.
+- **api/openapi.yaml:** Every endpoint, schema, example and error response. Served with Swagger UI at `/docs`.
+- **examples/requests.http:** Example requests runnable with one click from the IDE.
 
 ---
 
-## 17. Adım Adım Uygulama Sırası
+## 17. Step-by-Step Implementation Order
 
-Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test:`, `docs:`, `chore:`). Her commit derlenir ve testleri geçer. Her fazın sonunda "bitti" kriteri (DoD) kontrol edilir.
+Commits follow the **Conventional Commits** format (`feat:`, `fix:`, `test:`, `docs:`, `chore:`). Every commit builds and passes its tests. At the end of each phase, its definition of done (DoD) is checked.
 
-**İlerleme:** `[x]` tamamlandı, `[ ]` bekliyor. Her adım bitince işaretlenir ve o adımın commit'ine dahil edilir.
+**Progress:** `[x]` done, `[ ]` pending. Each step is ticked when it is finished, in that step's commit.
 
-### Faz 0: Hazırlık
-- [x] 0. Go 1.27, Docker Desktop kurulumu ✅ · GitHub repo ✅ · webhook.site URL'i ✅
-   - webhook.site'ta URL açılır: "Edit" → status 202, content-type `application/json`, body `{"messageId":"$request.uuid$","status":"accepted","timestamp":"$time$"}` (webhook.site'ın değişken desteğiyle).
-   - GitHub'da boş bir repo açılır.
-   - **DoD:** `go version`, `docker compose version` çalışıyor; webhook.site'a atılan curl isteği 202 dönüyor.
+### Phase 0: Preparation
+- [x] 0. Go 1.27 and Docker Desktop installed ✅ · GitHub repo ✅ · webhook.site URL ✅
+   - Open a URL on webhook.site: "Edit" → status 202, content type `application/json`, body `{"messageId":"$request.uuid$","status":"accepted","timestamp":"$time$"}` (using webhook.site's variable support).
+   - Create an empty repository on GitHub.
+   - **DoD:** `go version` and `docker compose version` work; a curl request to webhook.site returns 202.
 
-### Faz 1: Temel
-- [x] 1. **İskelet:** `go mod init`, klasör yapısı, config (fail-fast), logger, Makefile, `.golangci.yml`, `.gitignore`, `.env.example`, `git init`. İlk CI iskeleti (lint + build).
-- [x] 2. **Altyapı:** Dockerfile ve docker-compose'un ilk hali (postgres, redis, migrate), graceful shutdown iskeleti, `/health` ve `/ready`.
-- [x] 3. **Migration'lar ve domain:** Tüm tablolar; entity'ler, state machine ve testleri.
-- [x] 4. **Validation ve template motoru:** SMS segment hesabı dahil, table-driven testler ve fuzz.
-   - **DoD:** `docker compose up` DB'yi migrate ediyor, `make test-unit` geçiyor.
+### Phase 1: Foundation
+- [x] 1. **Skeleton:** `go mod init`, folder structure, config (fail-fast), logger, Makefile, `.golangci.yml`, `.gitignore`, `.env.example`, `git init`. First CI skeleton (lint + build).
+- [x] 2. **Infrastructure:** First version of the Dockerfile and docker-compose (postgres, redis, migrate), graceful shutdown skeleton, `/health` and `/ready`.
+- [x] 3. **Migrations and domain:** All tables; entities, the state machine and its tests.
+- [x] 4. **Validation and the template engine:** Including the SMS segment count, table-driven tests and fuzzing.
+   - **DoD:** `docker compose up` migrates the database, `make test-unit` passes.
 
-### Faz 2: API
-- [x] 5. **OpenAPI spec (ilk tam hali)** ve `oapi-codegen` kurulumu.
-- [x] 6. **Repository katmanı:** sqlc sorguları, dinamik liste builder'ı, tx yöneticisi, `unnest` ile tek sorguda batch insert (`COPY` yerine: `ON CONFLICT` desteği için), integration testleri.
-- [x] 7. **Servis ve handler'lar:** create, batch, get, list, cancel, retry, template CRUD ve preview.
-- [x] 8. **Middleware'ler:** auth, correlation ID, request log, recovery, body limit; idempotency (eşzamanlılık testiyle birlikte).
-   - **DoD:** Tüm endpoint'ler curl ile çalışıyor, contract testleri geçiyor.
+### Phase 2: API
+- [x] 5. **OpenAPI spec (first complete version)** and the `oapi-codegen` setup.
+- [x] 6. **Repository layer:** sqlc queries, the dynamic list builder, the tx manager, a single-query batch insert with `unnest` (instead of `COPY`, to support `ON CONFLICT`), integration tests.
+- [x] 7. **Services and handlers:** create, batch, get, list, cancel, retry, template CRUD and preview.
+- [x] 8. **Middleware:** auth, correlation ID, request logging, recovery, body limit; idempotency (with a concurrency test).
+   - **DoD:** Every endpoint works with curl, contract tests pass.
 
-### Faz 3: İşleme motoru
-- [x] 9. **Kuyruk:** Claim, lease, heartbeat, reaper, `LISTEN/NOTIFY` + poll.
-- [x] 10. **Rate limiter:** Redis GCRA Lua, yerel fallback, doğruluk testi.
-- [x] 11. **Provider client ve mock provider:** Hata sınıflandırması, fault injection.
-- [x] 12. **Worker:** Kanal havuzları, öncelik ve aging, claim miktarının limite bağlanması, graceful shutdown.
-- [x] 13. **Retry ve failure handling:** Backoff, `Retry-After`, circuit breaker, DLQ, attempts kaydı.
-    - **DoD:** E2E testleri (retry, kalıcı hata, devre açılması, chaos) geçiyor; uçtan uca bir bildirim webhook.site'a ulaşıyor.
+### Phase 3: Processing engine
+- [x] 9. **Queue:** Claim, lease, heartbeat, reaper, `LISTEN/NOTIFY` + poll.
+- [x] 10. **Rate limiter:** Redis GCRA in Lua, local fallback, accuracy test.
+- [x] 11. **Provider client and mock provider:** Error classification, fault injection.
+- [x] 12. **Worker:** Channel pools, priority and aging, claim size tied to the limit, graceful shutdown.
+- [x] 13. **Retry and failure handling:** Backoff, `Retry-After`, circuit breaker, DLQ, attempt records.
+    - **DoD:** E2E tests (retry, permanent error, breaker opening, chaos) pass; a notification reaches webhook.site end to end.
 
-### Faz 4: Event'ler ve gerçek zamanlılık
-- [x] 14. **Outbox ve relay:** Redis Streams publisher, consumer group yönetimi.
-- [x] 15. **WebSocket hub:** Abonelik, filtreleme, ping/pong, backpressure.
-- [x] 16. **Status callback'leri:** HMAC imzası, retry, SSRF koruması.
-- [x] 17. **Scheduled bildirimler:** Uçtan uca test (scheduled → pending → sent ve iptal).
-    - **DoD:** Bir batch gönderildiğinde WebSocket client'ı tüm durum değişikliklerini sırayla görüyor; callback alıcısı imzayı doğrulayabiliyor.
+### Phase 4: Events and real time
+- [x] 14. **Outbox and relay:** Redis Streams publisher, consumer group management.
+- [x] 15. **WebSocket hub:** Subscriptions, filtering, ping/pong, backpressure.
+- [x] 16. **Status callbacks:** HMAC signature, retries, SSRF protection.
+- [x] 17. **Scheduled notifications:** End-to-end test (scheduled → pending → sent, and cancellation).
+    - **DoD:** When a batch is sent, a WebSocket client sees every status change in order; a callback receiver can verify the signature.
 
-### Faz 5: Gözlemlenebilirlik
-- [x] 18. **Prometheus metrikleri** ve `/api/v1/metrics` JSON özeti, queue depth sampler.
-- [x] 19. **OpenTelemetry + Jaeger:** Span link'leri, log'larda `trace_id`.
-- [x] 20. **Grafana dashboard'u ve alert kuralları:** Provisioning dahil.
-- [x] 21. **Log'larda PII maskeleme.**
-    - **DoD:** Tek bir bildirim, correlation ID ile loglardan ve trace ID ile Jaeger'dan uçtan uca takip edilebiliyor; dashboard canlı veri gösteriyor.
+### Phase 5: Observability
+- [x] 18. **Prometheus metrics** and the `/api/v1/metrics` JSON summary, queue depth sampler.
+- [x] 19. **OpenTelemetry + Jaeger:** Span links, `trace_id` in the logs.
+- [x] 20. **Grafana dashboard and alert rules:** Including provisioning.
+- [x] 21. **PII masking in the logs.**
+    - **DoD:** A single notification can be followed end to end through the logs by correlation ID and in Jaeger by trace ID; the dashboard shows live data.
 
-### Faz 6: Kalite ve kanıt
-- [x] 22. **E2E test setinin tamamlanması**; `make test` tek komutla her şeyi çalıştırıyor.
-- [x] 23. **k6 yük testleri:** Sonuçların ölçülmesi; gerekirse indeks ve batch boyutu ayarı (bulgular ADR'ye yazılır).
-- [x] 24. **CI'ın tamamlanması:** Generate-check, integration, govulncheck, Trivy, coverage, Dependabot, GHCR push.
-- [x] 25. **Güvenlik gözden geçirmesi:** gosec bulguları, container sertleştirme, secret taraması.
-    - **DoD:** CI yeşil; yük testi kanal başına 100/s limitinin aşılmadığını ve burst'ün kayıpsız eridiğini gösteriyor.
+### Phase 6: Quality and evidence
+- [x] 22. **Completing the E2E test suite**; `make test` runs everything with one command.
+- [x] 23. **k6 load tests:** Measuring the results; tuning indexes and batch size if needed (findings written into an ADR).
+- [x] 24. **Completing CI:** generate-check, integration, govulncheck, Trivy, coverage, Dependabot, GHCR push.
+- [x] 25. **Security review:** gosec findings, container hardening, secret scanning.
+    - **DoD:** CI is green; the load test shows that the 100/s per-channel limit is never exceeded and that a burst drains without loss.
 
-### Faz 7: Teslim
-- [x] 26. **OpenAPI'nin son hali:** Örnekler ve hata yanıtları.
-- [x] 27. **Dokümantasyon:** README, architecture.md, ADR'ler, runbook, `requests.http`.
-- [x] 28. **Temiz kurulum provası:** Repo sıfırdan klonlanır, sadece `docker-compose up` ve README'deki adımlarla her şeyin çalıştığı doğrulanır. Commit geçmişi gözden geçirilir.
-- [ ] 29. **Teslim:** Repo linki paylaşılır.
+### Phase 7: Delivery
+- [x] 26. **Final OpenAPI:** Examples and error responses.
+- [x] 27. **Documentation:** README, architecture.md, ADRs, runbook, `requests.http`.
+- [x] 28. **Clean install rehearsal:** The repo is cloned from scratch and everything is verified to work with only `docker-compose up` and the steps in the README. The commit history is reviewed.
+- [ ] 29. **Delivery:** The repository link is shared.
 
 ---
 
-## 18. Gereksinim Karşılama Tablosu
+## 18. Requirements Coverage
 
-| PDF gereksinimi | Karşılayan bölüm |
+| Requirement from the brief | Covered in |
 |---|---|
 | Create (recipient, channel, content, priority) | §5, §6 |
 | Batch (≤1000) | §5.2 |
@@ -623,26 +626,26 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
 | Cancel pending | §4, §5 |
 | List + filter + pagination | §5.1, §5.3 |
 | Async queue workers | §8 |
-| 100 msg/s/kanal rate limit | §8.2 |
+| 100 msg/s per channel rate limit | §8.2 |
 | Priority queue (high/normal/low) | §8.1 |
 | Content validation | §6 |
 | Idempotency | §7 |
-| Delivery & retry (aday tasarımı) | §9 |
+| Delivery & retry (candidate's design) | §9 |
 | Metrics endpoint (queue depth, success/failure, latency) | §10.1 |
 | Structured logging + correlation ID | §10.3 |
 | Health check | §10.5 |
-| webhook.site provider | §9.1, §15, §17 Faz 0 |
-| Burst trafiği | §8.3, §13 (yük testi) |
-| İç ekipler ve API kullanıcıları için görünürlük | §5, §9.6, §10, §11 (WebSocket) |
+| webhook.site provider | §9.1, §15, §17 Phase 0 |
+| Burst traffic | §8.3, §13 (load test) |
+| Visibility for internal teams and API users | §5, §9.6, §10, §11 (WebSocket) |
 | Bonus: failure handling | §8, §9, §11 |
 | Bonus: scheduled | §11 |
 | Bonus: template | §11 |
 | Bonus: WebSocket | §11 |
 | Bonus: distributed tracing | §10.4 |
 | Bonus: GitHub Actions CI/CD | §14 |
-| Repo + temiz commit geçmişi | §17 |
+| Repository + clean commit history | §17 |
 | README | §16 |
 | docker-compose up | §15 |
 | Swagger/OpenAPI | §5, §16 |
-| Versiyonlu migration'lar | §3 |
-| Tek komutla test | §13 |
+| Versioned migrations | §3 |
+| Single-command testing | §13 |
