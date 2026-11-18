@@ -54,7 +54,7 @@ jobs:
           path: coverage.out
 
   integration:
-    name: Integration tests
+    name: All tests (unit, integration, end-to-end)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -62,7 +62,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Test (testcontainers, Docker is preinstalled on the runner)
-        run: go test -race -count=1 -tags=integration ./...
+        run: make test
 
   build:
     name: Build

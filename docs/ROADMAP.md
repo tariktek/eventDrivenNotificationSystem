@@ -599,7 +599,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
     - **DoD:** Tek bir bildirim, correlation ID ile loglardan ve trace ID ile Jaeger'dan uçtan uca takip edilebiliyor; dashboard canlı veri gösteriyor.
 
 ### Faz 6: Kalite ve kanıt
-- [ ] 22. **E2E test setinin tamamlanması**; `make test` tek komutla her şeyi çalıştırıyor.
+- [x] 22. **E2E test setinin tamamlanması**; `make test` tek komutla her şeyi çalıştırıyor.
 - [ ] 23. **k6 yük testleri:** Sonuçların ölçülmesi; gerekirse indeks ve batch boyutu ayarı (bulgular ADR'ye yazılır).
 - [ ] 24. **CI'ın tamamlanması:** Generate-check, integration, govulncheck, Trivy, coverage, Dependabot, GHCR push.
 - [ ] 25. **Güvenlik gözden geçirmesi:** gosec bulguları, container sertleştirme, secret taraması.

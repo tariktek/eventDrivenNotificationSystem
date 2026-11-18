@@ -72,3 +72,28 @@ func TestNarrow(t *testing.T) {
 	_, err = narrow[int32](1<<40, "total")
 	assert.Error(t, err)
 }
+
+// FuzzDecodeCursor: the cursor comes from the client, so any string must
+// either decode to a cursor that encodes back to the same position or be
+// rejected as ErrInvalidCursor (a 422), never panic or slip through as
+// some other error (a 500).
+func FuzzDecodeCursor(f *testing.F) {
+	f.Add("")
+	f.Add(cursor{CreatedAt: time.Unix(1_800_000_000, 0), ID: uuid.New()}.encode())
+	f.Add("MTc4MDAwMDAwMDAwMDAwMHx4")
+	f.Add("!!!")
+	f.Fuzz(func(t *testing.T, s string) {
+		c, err := decodeCursor(s)
+		if err != nil {
+			require.ErrorIs(t, err, domain.ErrInvalidCursor)
+			return
+		}
+		if c == nil {
+			require.Empty(t, s)
+			return
+		}
+		again, err := decodeCursor(c.encode())
+		require.NoError(t, err)
+		require.Equal(t, c, again)
+	})
+}

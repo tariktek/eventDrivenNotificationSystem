@@ -73,19 +73,35 @@ ps: ## Show container status
 
 ## ---------- Tests ----------
 
+# The race detector needs cgo (a C compiler); use it wherever it is available.
+RACE := $(if $(filter 1,$(shell go env CGO_ENABLED)),-race,)
+FUZZTIME ?= 30s
+
+# -p 1 runs one package at a time: each package starts its own PostgreSQL
+# and Redis containers, and the delivery tests measure timing (rate limits,
+# scheduled sends) that a machine starting a dozen containers at once would
+# disturb.
 .PHONY: test
-test: test-unit test-integration ## Run all tests (integration tests need Docker)
+test: ## Run every test: unit, integration and end-to-end (needs Docker)
+	go test $(RACE) -count=1 -p 1 -tags=integration ./...
 
 .PHONY: test-unit
-test-unit: ## Run unit tests with the race detector
-	go test -race -count=1 ./...
+test-unit: ## Run unit tests only (no Docker, seconds)
+	go test $(RACE) -count=1 ./...
 
-.PHONY: test-integration
-test-integration: ## Run integration tests (requires Docker)
-	go test -race -count=1 -tags=integration ./...
+.PHONY: test-e2e
+test-e2e: ## Run the end-to-end tests: API + worker + relay + callbacks (needs Docker)
+	go test $(RACE) -count=1 -tags=integration ./test/e2e/...
+
+.PHONY: test-fuzz
+test-fuzz: ## Fuzz the input parsers for FUZZTIME each (default 30s)
+	go test -run '^$$' -fuzz '^FuzzNotification$$' -fuzztime $(FUZZTIME) ./internal/validation/
+	go test -run '^$$' -fuzz '^FuzzAnalyzeSMS$$' -fuzztime $(FUZZTIME) ./internal/validation/
+	go test -run '^$$' -fuzz '^FuzzParseAndRender$$' -fuzztime $(FUZZTIME) ./internal/msgtemplate/
+	go test -run '^$$' -fuzz '^FuzzDecodeCursor$$' -fuzztime $(FUZZTIME) ./internal/repository/postgres/
 
 .PHONY: cover
-cover: ## Run unit tests and write an HTML coverage report
-	go test -count=1 -coverprofile=coverage.out ./...
+cover: ## Run all tests and write an HTML coverage report (needs Docker)
+	go test -count=1 -p 1 -tags=integration -coverpkg=./internal/... -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
 	@go tool cover -func=coverage.out | tail -1

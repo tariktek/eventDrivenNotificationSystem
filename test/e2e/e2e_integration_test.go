@@ -62,6 +62,11 @@ var secret = []byte("e2e-callback-secret-0123456789abcdef")
 
 // system is everything running for one test.
 type system struct {
+	// respond, if set, picks the provider's status for the nth call (from
+	// 1) about a notification; the default accepts everything.
+	respond func(n int) int
+	perKey  sync.Map // idempotency key -> *atomic.Int64
+
 	api       string // http://...
 	ws        string // ws://...
 	callbacks string // the client's callback URL
@@ -113,7 +118,7 @@ func TestMain(m *testing.M) {
 }
 
 // start runs every component until the test ends.
-func start(t *testing.T) *system {
+func start(t *testing.T, opts ...func(*system)) *system {
 	t.Helper()
 	_, err := pool.Exec(t.Context(), `TRUNCATE notifications, batches, notification_attempts, outbox_events, callback_deliveries CASCADE`)
 	require.NoError(t, err)
@@ -123,13 +128,24 @@ func start(t *testing.T) *system {
 	var wg sync.WaitGroup
 	t.Cleanup(func() { cancel(); wg.Wait() })
 	sys := &system{}
+	for _, o := range opts {
+		o(sys)
+	}
 
-	// The provider: accepts everything.
-	prov := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		n := sys.sent.Add(1)
+	// The provider: accepts everything unless told otherwise.
+	prov := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, _ := sys.perKey.LoadOrStore(r.Header.Get("X-Idempotency-Key"), new(atomic.Int64))
+		call := c.(*atomic.Int64).Add(1)
+		status := http.StatusAccepted
+		if sys.respond != nil {
+			status = sys.respond(int(call))
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = fmt.Fprintf(w, `{"messageId":"msg-%d","status":"accepted"}`, n)
+		w.WriteHeader(status)
+		if status == http.StatusAccepted {
+			n := sys.sent.Add(1)
+			_, _ = fmt.Fprintf(w, `{"messageId":"msg-%d","status":"accepted"}`, n)
+		}
 	}))
 	t.Cleanup(prov.Close)
 
@@ -517,4 +533,86 @@ func TestE2E_ExhaustedCallbackIsNotSentAgain(t *testing.T) {
 	assert.Zero(t, calls.Load())
 	_, attempts := callbackRow(t, id)
 	assert.Equal(t, 5, attempts)
+}
+
+// TestE2E_RetryChainIsVisibleEverywhere: the provider fails twice with 503
+// and then accepts. The client sees each step live over WebSocket, the
+// REST API shows all three attempts, and the callback reports the success.
+func TestE2E_RetryChainIsVisibleEverywhere(t *testing.T) {
+	sys := start(t, func(s *system) {
+		s.respond = func(n int) int {
+			if n <= 2 {
+				return http.StatusServiceUnavailable
+			}
+			return http.StatusAccepted
+		}
+	})
+	ws := sys.watch(t, "channel=sms")
+	n := sys.call(t, http.MethodPost, "/api/v1/notifications", map[string]any{
+		"channel": "sms", "recipient": "+905551234567", "content": "Your code is 4821", "callback_url": sys.callbacks,
+	})
+	id := n["id"].(string)
+
+	var changes []string
+	for len(changes) < 6 {
+		changes = append(changes, nextChange(t, ws))
+	}
+	assert.Equal(t, []string{
+		"pending>processing", "processing>pending", // 503, backoff
+		"pending>processing", "processing>pending", // 503, backoff
+		"pending>processing", "processing>sent", // 202
+	}, changes)
+
+	got := sys.call(t, http.MethodGet, "/api/v1/notifications/"+id, nil)
+	assert.Equal(t, "sent", got["status"])
+	assert.InDelta(t, 3, got["attempts"], 0)
+	attempts := got["delivery_attempts"].([]any)
+	require.Len(t, attempts, 3)
+	var codes []any
+	for _, a := range attempts {
+		codes = append(codes, a.(map[string]any)["status_code"])
+	}
+	assert.Equal(t, []any{503.0, 503.0, 202.0}, codes, "every attempt is recorded")
+
+	require.Eventually(t, func() bool { return sys.receivedCallbacks(t).Valid == 1 }, 5*time.Second, 50*time.Millisecond)
+	assert.Equal(t, "notification.sent", sys.receivedCallbacks(t).Callbacks[0].Type, "one callback, for the final status only")
+}
+
+// TestE2E_CancelBatch: a scheduled campaign is called off before it goes
+// out. Every item is cancelled, nothing reaches the provider, the batch
+// completes, and each client callback reports the cancellation.
+func TestE2E_CancelBatch(t *testing.T) {
+	sys := start(t)
+	due := time.Now().Add(3 * time.Second).UTC()
+	at := due.Format(time.RFC3339Nano)
+	items := make([]map[string]any, 5)
+	for i := range items {
+		items[i] = map[string]any{
+			"channel": "push", "recipient": fmt.Sprintf("device-%d", i), "subject": "Sale", "content": "Starts now",
+			"scheduled_at": at, "callback_url": sys.callbacks,
+		}
+	}
+	batchID := sys.call(t, http.MethodPost, "/api/v1/notifications/batch", map[string]any{"items": items})["batch_id"].(string)
+	ws := sys.watch(t, "batch_id="+batchID)
+
+	res := sys.call(t, http.MethodPost, "/api/v1/batches/"+batchID+"/cancel", nil)
+	assert.InDelta(t, 5, res["cancelled"], 0)
+
+	for {
+		m := next(t, ws)
+		if m.EventType == events.TypeBatchCompleted {
+			assert.Equal(t, map[string]int{"cancelled": 5}, m.Data.Counts)
+			break
+		}
+	}
+	b := sys.call(t, http.MethodGet, "/api/v1/batches/"+batchID, nil)
+	assert.NotNil(t, b["completed_at"])
+	assert.InDelta(t, 1, b["progress"], 0)
+
+	require.Eventually(t, func() bool { return sys.receivedCallbacks(t).Valid == 5 }, 5*time.Second, 50*time.Millisecond)
+	for _, cb := range sys.receivedCallbacks(t).Callbacks {
+		assert.Equal(t, "notification.cancelled", cb.Type)
+	}
+	time.Sleep(time.Until(due) + 500*time.Millisecond) // past the scheduled time
+	assert.Zero(t, sys.sent.Load(), "nothing went out after the scheduled time")
 }
