@@ -3,6 +3,7 @@
 package worker_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,7 +26,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/breaker"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/provider"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/queue"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/ratelimit"
@@ -112,6 +116,41 @@ type opts struct {
 	concurrency int
 	breaker     breaker.Config
 	claimDelay  time.Duration // makes every claim this much slower
+	log         *slog.Logger  // default: discarded
+}
+
+// logBuffer collects a worker's log output; the worker writes from many
+// goroutines while the test reads.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// breakerChanges lists the breaker transitions in JSON log output, as
+// "channel from→state".
+func breakerChanges(t *testing.T, logs string) []string {
+	t.Helper()
+	var changes []string
+	for line := range strings.Lines(logs) {
+		var rec struct{ Msg, Channel, From, State string }
+		require.NoError(t, json.Unmarshal([]byte(line), &rec), line)
+		if rec.Msg == "circuit breaker state changed" {
+			changes = append(changes, rec.Channel+" "+rec.From+"→"+rec.State)
+		}
+	}
+	return changes
 }
 
 // slowQueue delays claims, as a loaded database does.
@@ -135,7 +174,10 @@ func startWorker(t *testing.T, p *fakeProvider, o opts) (w *worker.Worker, stop 
 	if o.concurrency == 0 {
 		o.concurrency = 50
 	}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	log := o.log
+	if log == nil {
+		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	w = worker.New(worker.Config{
 		ID:            "test-" + uuid.NewString()[:8],
 		Channels:      domain.Channels,
@@ -441,12 +483,19 @@ func TestWorker_CircuitBreakerPreservesAttempts(t *testing.T) {
 	})
 	const total = 60
 	create(t, total, func(_ int, p *domain.NewNotificationParams) { p.MaxAttempts = 10 })
-	w, _ := startWorker(t, p, opts{breaker: breaker.Config{
-		Window: 10 * time.Second, MinRequests: 5, FailureRatio: 0.5, OpenTimeout: 300 * time.Millisecond, Probes: 2,
-	}})
+	// The production logger, PII masking included: the state change must
+	// survive it, or an operator cannot see an outage in the logs.
+	logs := &logBuffer{}
+	w, _ := startWorker(t, p, opts{
+		breaker: breaker.Config{
+			Window: 10 * time.Second, MinRequests: 5, FailureRatio: 0.5, OpenTimeout: 300 * time.Millisecond, Probes: 2,
+		},
+		log: observability.NewLogger(logs, config.LogConfig{Level: "info", Format: "json"}, "worker", "test"),
+	})
 
 	waitFor(t, 5*time.Second, func() bool { return w.BreakerStates()[domain.ChannelSMS] != breaker.StateClosed })
 	assert.Equal(t, breaker.StateClosed, w.BreakerStates()[domain.ChannelEmail], "other channels are unaffected")
+	assert.Contains(t, breakerChanges(t, logs.String()), "sms closed→open", "the log names the state the breaker moved to")
 
 	time.Sleep(1500 * time.Millisecond) // ~5 open/probe cycles of outage
 

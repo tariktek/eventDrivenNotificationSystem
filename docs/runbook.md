@@ -6,7 +6,7 @@ API at `http://localhost:8080` and `X-API-Key: $KEY`.
 ## Provider outage: circuit breaker open
 
 **Symptoms.** Worker logs show `circuit breaker state changed` with
-`"to":"open"`. The worker's `GET /ready` reports `degraded` with
+`"state":"open"`. The worker's `GET /ready` reports `degraded` with
 `circuit_breakers: provider failing, deliveries paused: sms=open`.
 Notifications on that channel stay `pending`; other channels keep sending.
 

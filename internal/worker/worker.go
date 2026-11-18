@@ -118,7 +118,8 @@ func New(cfg Config, d Deps) *Worker {
 		w.wake[ch] = make(chan struct{}, 1)
 		w.Metrics.BreakerState.WithLabelValues(string(ch)).Set(0)
 		w.breakers[ch] = breaker.New(string(ch), cfg.Breaker, func(from, to breaker.State) {
-			w.Log.Warn("circuit breaker state changed", "channel", ch, "from", from, "to", to)
+			// "state", not "to": the logger masks "to" as a recipient (pii.go).
+			w.Log.Warn("circuit breaker state changed", "channel", ch, "from", from, "state", to)
 			w.Metrics.BreakerState.WithLabelValues(string(ch)).Set(breakerValue(to))
 		})
 	}
