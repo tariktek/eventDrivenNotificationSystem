@@ -1,6 +1,6 @@
 # Assessment document and local planning notes (not part of the project)
 *.pdf
-
+/CLAUDE roadmap/
 # Binaries and build output
 /bin/
 /dist/
