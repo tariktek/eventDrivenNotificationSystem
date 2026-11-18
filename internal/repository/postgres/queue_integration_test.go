@@ -258,6 +258,11 @@ func TestReapExpiredLeases(t *testing.T) {
 	assert.Equal(t, retryable.ID, again[0].ID)
 }
 
+// TestListenDue: workers hear the wake-ups the outbox relay sends with
+// NotifyDue. Inserting notifications sends none by itself any more: a
+// NOTIFY in every write transaction serialized all API writes under load
+// (migration 14). Which channels the relay wakes is tested in package
+// outbox (TestRelay_WakesWorkersForDueWork).
 func TestListenDue(t *testing.T) {
 	reset(t)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -267,36 +272,27 @@ func TestListenDue(t *testing.T) {
 	go store.Queue().ListenDue(ctx, func(ch domain.Channel) { signals <- ch }, func(err error) { t.Log(err) })
 	time.Sleep(300 * time.Millisecond) // let LISTEN register
 
-	// A notification scheduled for later must not wake anyone.
-	later := time.Now().Add(time.Hour)
-	scheduled, err := domain.NewNotification(domain.NewNotificationParams{
-		Channel: domain.ChannelPush, Recipient: "t", Content: "c", ScheduledAt: &later,
-	}, time.Now())
-	require.NoError(t, err)
-	insertOne(t, scheduled)
-	select {
-	case ch := <-signals:
-		t.Fatalf("scheduled notification sent a wake-up for %s", ch)
-	case <-time.After(300 * time.Millisecond):
-	}
-
-	// A batch of due notifications wakes the channel, once per transaction.
 	ns := make([]*domain.Notification, 50)
 	for i := range ns {
 		ns[i] = newSMS(t)
 	}
-	_, err = store.InsertNotifications(t.Context(), ns)
+	_, err := store.InsertNotifications(t.Context(), ns)
 	require.NoError(t, err)
-
 	select {
 	case ch := <-signals:
-		assert.Equal(t, domain.ChannelSMS, ch)
-	case <-time.After(2 * time.Second):
-		t.Fatal("no wake-up for due notifications")
-	}
-	select {
-	case <-signals:
-		t.Fatal("50 rows in one statement must produce a single wake-up")
+		t.Fatalf("an insert sent a wake-up for %s; only the relay should", ch)
 	case <-time.After(300 * time.Millisecond):
 	}
+
+	require.NoError(t, store.NotifyDue(t.Context(), []string{"sms", "email"}))
+	got := map[domain.Channel]bool{}
+	for range 2 {
+		select {
+		case ch := <-signals:
+			got[ch] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("missing wake-up; got %v", got)
+		}
+	}
+	assert.Equal(t, map[domain.Channel]bool{domain.ChannelSMS: true, domain.ChannelEmail: true}, got)
 }
