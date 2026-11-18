@@ -97,6 +97,7 @@ func TestLoadFrom_Invalid(t *testing.T) {
 		{"retry max below base", map[string]string{"RETRY_BASE_DELAY": "10s", "RETRY_MAX_DELAY": "1s"}, "RETRY_BASE_DELAY"},
 		{"breaker ratio above 1", map[string]string{"BREAKER_FAILURE_RATIO": "1.5"}, "BREAKER_FAILURE_RATIO"},
 		{"zero breaker probes", map[string]string{"BREAKER_PROBES": "0"}, "BREAKER_PROBES"},
+		{"breaker min requests too large", map[string]string{"BREAKER_MIN_REQUESTS": "2000000"}, "BREAKER_MIN_REQUESTS"},
 		{"zero breaker open timeout", map[string]string{"BREAKER_OPEN_TIMEOUT": "0s"}, "BREAKER_OPEN_TIMEOUT"},
 		{"tiny stream", map[string]string{"EVENTS_STREAM_MAX_LEN": "10"}, "EVENTS_STREAM_MAX_LEN"},
 		{"zero outbox batch", map[string]string{"OUTBOX_BATCH_SIZE": "0"}, "OUTBOX_BATCH_SIZE"},

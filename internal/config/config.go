@@ -296,8 +296,10 @@ func (c Config) Validate() error {
 	if c.Breaker.Window <= 0 || c.Breaker.OpenTimeout <= 0 {
 		errs = append(errs, errors.New("BREAKER_WINDOW/BREAKER_OPEN_TIMEOUT: must be positive"))
 	}
-	if c.Breaker.MinRequests < 1 || c.Breaker.Probes < 1 {
-		errs = append(errs, errors.New("BREAKER_MIN_REQUESTS/BREAKER_PROBES: must be at least 1"))
+	// The upper bounds also keep the conversion to uint32 (gobreaker's
+	// type) exact.
+	if c.Breaker.MinRequests < 1 || c.Breaker.MinRequests > 1_000_000 || c.Breaker.Probes < 1 || c.Breaker.Probes > 1000 {
+		errs = append(errs, errors.New("BREAKER_MIN_REQUESTS/BREAKER_PROBES: need 1..1000000 requests and 1..1000 probes"))
 	}
 	if c.Breaker.FailureRatio <= 0 || c.Breaker.FailureRatio > 1 {
 		errs = append(errs, errors.New("BREAKER_FAILURE_RATIO: must be in (0, 1]"))

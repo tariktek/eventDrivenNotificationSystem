@@ -602,7 +602,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
 - [x] 22. **E2E test setinin tamamlanması**; `make test` tek komutla her şeyi çalıştırıyor.
 - [x] 23. **k6 yük testleri:** Sonuçların ölçülmesi; gerekirse indeks ve batch boyutu ayarı (bulgular ADR'ye yazılır).
 - [x] 24. **CI'ın tamamlanması:** Generate-check, integration, govulncheck, Trivy, coverage, Dependabot, GHCR push.
-- [ ] 25. **Güvenlik gözden geçirmesi:** gosec bulguları, container sertleştirme, secret taraması.
+- [x] 25. **Güvenlik gözden geçirmesi:** gosec bulguları, container sertleştirme, secret taraması.
     - **DoD:** CI yeşil; yük testi kanal başına 100/s limitinin aşılmadığını ve burst'ün kayıpsız eridiğini gösteriyor.
 
 ### Faz 7: Teslim

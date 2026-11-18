@@ -138,10 +138,10 @@ func run() error {
 		ShutdownGrace: cfg.ShutdownTimeout,
 		Breaker: breaker.Config{
 			Window:       cfg.Breaker.Window,
-			MinRequests:  uint32(cfg.Breaker.MinRequests), //nolint:gosec // validated >= 1 at startup
+			MinRequests:  uint32(cfg.Breaker.MinRequests), //nolint:gosec // validated 1..1000000 at startup
 			FailureRatio: cfg.Breaker.FailureRatio,
 			OpenTimeout:  cfg.Breaker.OpenTimeout,
-			Probes:       uint32(cfg.Breaker.Probes), //nolint:gosec // validated >= 1 at startup
+			Probes:       uint32(cfg.Breaker.Probes), //nolint:gosec // validated 1..1000 at startup
 		},
 	}, worker.Deps{
 		Queue:    store.Queue(),

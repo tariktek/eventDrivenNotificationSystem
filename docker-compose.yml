@@ -9,6 +9,13 @@ x-app: &app
       COMMIT: ${COMMIT:-none}
   image: notification-system:local
   restart: unless-stopped
+  <<: &hardened
+    # The binaries write nothing to disk and need no kernel privileges:
+    # a read-only root filesystem, no Linux capabilities and no privilege
+    # escalation leave an attacker who got in little to work with.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
   # Must exceed SHUTDOWN_TIMEOUT so Docker never SIGKILLs a draining process.
   stop_grace_period: 30s
   environment: &app-env
@@ -110,6 +117,7 @@ services:
   #   PUT  http://localhost:9000/admin/config  {"failure_rate": 0.5, "latency": "50ms"}
   mockprovider:
     image: notification-system:local
+    <<: *hardened
     entrypoint: ["/app/mockprovider"]
     environment:
       MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0}
