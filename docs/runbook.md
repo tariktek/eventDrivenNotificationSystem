@@ -99,3 +99,81 @@ WHERE id IN (
   ORDER BY created_at LIMIT 1000
   FOR UPDATE SKIP LOCKED);
 ```
+
+## Queue growing or messages arriving late
+
+**Symptoms.** Alert `QueueBacklogStale` (oldest due notification waiting
+over 5 minutes); `queue` in `GET /api/v1/metrics` keeps rising; the
+dashboard's "Oldest due pending" panel climbs.
+
+**Check, in order:**
+
+1. **Is a breaker open?** The dashboard's "Circuit breakers" panel, or
+   worker `/ready`. If so, see "Provider outage" above: the backlog is
+   intentional and drains on recovery.
+2. **Are workers running and healthy?** `docker compose ps`. With no
+   worker, nothing is claimed; `/ready` of each worker shows its
+   dependencies.
+3. **Is it just the rate limit?** A backlog of N on one channel takes at
+   least N / `WORKER_RATE_LIMIT` seconds (50,000 at 100/s ≈ 8 minutes).
+   "Sent per second" sitting at the limit means the system is healthy and
+   saturated: nothing to fix except the provider contract.
+4. **Is low priority starving?** It cannot for long: waiting work rises
+   one priority level every `WORKER_PRIORITY_AGING` (5 minutes).
+
+**Act:**
+
+- More throughput needs a higher provider limit (`WORKER_RATE_LIMIT`).
+  More workers do not help once the limit is reached; they only help when
+  workers, not the limit, are the bottleneck (sends per second below the
+  limit while the backlog grows).
+- To drop a campaign that is no longer worth sending:
+  `POST /api/v1/batches/{id}/cancel` cancels everything not yet sent.
+
+## Redis unavailable
+
+**Symptoms.** Alert `RateLimiterFallback`; API and worker `/ready` report
+`degraded` (`redis` check failing); logs: "shared limiter unavailable" and
+"outbox relay round failed; events stay queued"; alert `OutboxLagging`
+after 30 seconds.
+
+**What keeps working:** creating notifications and delivering them.
+Each worker rate-limits itself at `WORKER_RATE_LIMIT /
+WORKER_EXPECTED_INSTANCES` (keep that setting equal to the real replica
+count, or the provider may see more than the limit, or less).
+
+**What pauses:** WebSocket events and status callbacks. Events are
+safe in the `outbox_events` table and are published, in order, when
+Redis returns. Nothing needs replaying by hand.
+
+**Act:** restore Redis (`docker compose up -d redis`). Workers switch
+back to the shared limiter within seconds; the outbox backlog drains
+(watch `outbox_backlog_events` fall to zero).
+
+**If Redis lost its data** (compose runs it with an append-only file, so
+a restart does not): the callback consumer group is recreated
+automatically. Events that were already published to the stream but not
+yet consumed are gone with it, so their callbacks are not sent; the
+events themselves remain in `outbox_events` for `OUTBOX_RETENTION`.
+WebSocket clients are unaffected beyond the outage (they resync over
+REST when they reconnect).
+
+## Outbox lag without a Redis outage
+
+**Symptoms.** Alert `OutboxLagging`, Redis healthy.
+
+**Check:** is any worker running? The relay runs inside workers; with
+none, events accumulate (safely). Worker logs show relay errors, if any.
+
+**Act:** start a worker. A large backlog (after an outage) publishes at
+`OUTBOX_BATCH_SIZE` events per round back to back, ~several thousand per
+second.
+
+## A worker crashed or was killed
+
+Nothing to do. Its claimed notifications keep their lease for at most
+`WORKER_LEASE` (30 s); then any worker's reaper returns them to `pending`
+(`worker_lease_expired_total` counts them) and they are delivered.
+A notification may be sent twice if the provider had already accepted it
+when the worker died (at-least-once; the provider receives the same
+`X-Idempotency-Key` both times).

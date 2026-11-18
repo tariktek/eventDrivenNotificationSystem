@@ -1,0 +1,170 @@
+# Example requests for the running docker compose stack.
+# VS Code: install "REST Client" and click "Send Request" above a request.
+# JetBrains IDEs: click the run icon in the gutter.
+# Requests that start with "# @name" store their response; later requests
+# reuse ids from it ({{create.response.body.id}}). Run them top to bottom.
+
+@base = http://localhost:8080/api/v1
+@key = dev-api-key-change-me
+
+### Create a high-priority SMS
+# @name create
+POST {{base}}/notifications
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{
+  "channel": "sms",
+  "recipient": "+905551234567",
+  "content": "Your verification code is 4821",
+  "priority": "high",
+  "metadata": { "user_id": "42" }
+}
+
+### Its status and delivery attempts (sent within a second)
+GET {{base}}/notifications/{{create.response.body.id}}
+X-API-Key: {{key}}
+
+### Same request again with an Idempotency-Key: the second call replays the first response
+POST {{base}}/notifications
+X-API-Key: {{key}}
+Idempotency-Key: demo-order-42
+Content-Type: application/json
+
+{ "channel": "email", "recipient": "ada@example.com", "subject": "Receipt", "content": "Thanks for order 42." }
+
+### A batch (all-or-nothing validation, up to 1,000 items)
+# @name batch
+POST {{base}}/notifications/batch
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{
+  "metadata": { "campaign": "black-friday" },
+  "items": [
+    { "channel": "sms", "recipient": "+905551234567", "content": "50% off today only" },
+    { "channel": "email", "recipient": "ada@example.com", "subject": "Black Friday", "content": "50% off today only" },
+    { "channel": "push", "recipient": "device-token-1", "subject": "Black Friday", "content": "50% off today only", "priority": "low" }
+  ]
+}
+
+### Batch progress: counts per status
+GET {{base}}/batches/{{batch.response.body.batch_id}}
+X-API-Key: {{key}}
+
+### The batch's notifications
+GET {{base}}/batches/{{batch.response.body.batch_id}}/notifications?limit=10
+X-API-Key: {{key}}
+
+### Validation: every problem reported at once, by field
+POST {{base}}/notifications/batch
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{
+  "items": [
+    { "channel": "sms", "recipient": "05551234567", "content": "missing country code" },
+    { "channel": "email", "recipient": "not-an-email", "content": "and no subject" },
+    { "channel": "fax", "recipient": "x", "content": "unknown channel" }
+  ]
+}
+
+### Scheduled for later, with a signed status callback (the mock provider verifies it)
+# @name scheduled
+POST {{base}}/notifications
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{
+  "channel": "push",
+  "recipient": "device-token-1",
+  "subject": "Reminder",
+  "content": "Your appointment is tomorrow at 10:00",
+  "scheduled_at": "2030-01-01T09:00:00Z",
+  "callback_url": "http://mockprovider:9000/callbacks"
+}
+
+### Cancel it before it is due (a callback "notification.cancelled" follows)
+POST {{base}}/notifications/{{scheduled.response.body.id}}/cancel
+X-API-Key: {{key}}
+
+### Callbacks the mock provider received, with verified signatures
+GET http://localhost:9000/admin/callbacks
+
+### Create a template
+# Template placeholders use {{ }} like this file's own variables, so the
+# braces are written as JSON escapes ({ = "{", } = "}"): the
+# API receives "Order {{.order_id}} has shipped".
+# @name template
+POST {{base}}/templates
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{
+  "name": "order-shipped-{{$timestamp}}",
+  "channel": "email",
+  "subject": "Order {{.order_id}} has shipped",
+  "body": "Hi {{.name}}, your order {{.order_id}} is on its way."
+}
+
+### Preview it
+POST {{base}}/templates/{{template.response.body.id}}/preview
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{ "template_vars": { "name": "Ada", "order_id": "A-1042" } }
+
+### Send with it
+POST {{base}}/notifications
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{
+  "channel": "email",
+  "recipient": "ada@example.com",
+  "template_id": "{{template.response.body.id}}",
+  "template_vars": { "name": "Ada", "order_id": "A-1042" }
+}
+
+### List with filters (then pass next_cursor as &cursor=…)
+GET {{base}}/notifications?channel=sms&priority=high&limit=20
+X-API-Key: {{key}}
+
+### Live metrics: queue depth, success rates, latency percentiles
+GET {{base}}/metrics
+X-API-Key: {{key}}
+
+### ---- Failure handling --------------------------------------------------
+
+### Make the provider fail every call (503)
+PUT http://localhost:9000/admin/config
+Content-Type: application/json
+
+{ "failure_rate": 1.0, "latency": "20ms" }
+
+### ...send a few SMS now (first request above, several times): after ~20
+### failures the sms breaker opens; they wait in "pending" without spending
+### attempts. Worker readiness turns "degraded".
+
+### Recover the provider: within 30 s the breaker probes, closes, and they go out
+PUT http://localhost:9000/admin/config
+Content-Type: application/json
+
+{ "failure_rate": 0, "latency": "20ms" }
+
+### Dead-letter queue: count what failed with 503 (dry run)
+POST {{base}}/notifications/retry-failed
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{ "error_code": "http_503", "dry_run": true }
+
+### ...and redrive it
+POST {{base}}/notifications/retry-failed
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{ "error_code": "http_503" }
+
+### What the provider saw: per-channel peak per second, duplicates
+GET http://localhost:9000/admin/stats
