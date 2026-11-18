@@ -193,6 +193,25 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/NotificationDetail" }
+              example:
+                id: 01a1ee3b-9741-7bee-8c79-34c1a7d09aa3
+                channel: sms
+                priority: high
+                recipient: "+905551234567"
+                content: Your verification code is 4821
+                segments: 1
+                status: sent
+                attempts: 2
+                max_attempts: 5
+                next_attempt_at: "2026-11-18T10:00:01.850Z"
+                sent_at: "2026-11-18T10:00:01.912Z"
+                provider_message_id: 3f1c2a9e-7b1d-4c55-9d5e-2a6f0e9b1c77
+                metadata: {}
+                created_at: "2026-11-18T10:00:00.004Z"
+                updated_at: "2026-11-18T10:00:01.912Z"
+                delivery_attempts:
+                  - { attempt_no: 1, outcome: transient_error, status_code: 503, error_code: http_503, error: "provider unavailable", duration_ms: 48, created_at: "2026-11-18T10:00:00.051Z" }
+                  - { attempt_no: 2, outcome: success, status_code: 202, provider_message_id: 3f1c2a9e-7b1d-4c55-9d5e-2a6f0e9b1c77, duration_ms: 41, created_at: "2026-11-18T10:00:01.912Z" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -361,6 +380,9 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error: { code: service_unavailable, message: "Too many WebSocket connections on this instance; retry later." }
+                correlation_id: 0192f5e4-7c1a-7b3e-9a41-2f0c8d6b1e77
 
   /api/v1/batches/{id}:
     parameters:
@@ -495,6 +517,11 @@ paths:
         content:
           application/json:
             schema: { $ref: "#/components/schemas/TemplateWrite" }
+            example:
+              name: order-shipped
+              channel: email
+              subject: "Order {{.order_id}} has shipped"
+              body: "Hi {{.name | default \"there\"}}, your order {{.order_id}} is on its way."
       responses:
         "200":
           description: Updated.
@@ -620,26 +647,54 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: { code: bad_request, message: "invalid JSON body: json: unknown field \"chanel\"" }
+            correlation_id: 0192f5e4-7c1a-7b3e-9a41-2f0c8d6b1e77
     Unauthorized:
       description: Missing or invalid API key.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: { code: unauthorized, message: "Invalid API key." }
+            correlation_id: 0192f5e4-7c1a-7b3e-9a41-2f0c8d6b1e77
     NotFound:
       description: No such resource.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: { code: not_found, message: "The requested resource does not exist." }
+            correlation_id: 0192f5e4-7c1a-7b3e-9a41-2f0c8d6b1e77
     Conflict:
       description: The request conflicts with the current state (e.g. cancelling a notification already being sent, or an idempotent request still in progress).
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            invalid_status_transition:
+              summary: Cancelling a notification that is already being sent
+              value:
+                error: { code: invalid_status_transition, message: "Only pending or scheduled notifications can be cancelled; this one is processing." }
+                correlation_id: 0192f5e4-7c1a-7b3e-9a41-2f0c8d6b1e77
+            request_in_progress:
+              summary: The same Idempotency-Key is still being processed
+              value:
+                error: { code: request_in_progress, message: "A request with this Idempotency-Key is still being processed; retry shortly." }
+                correlation_id: 0192f5e4-7c1a-7b3e-9a41-2f0c8d6b1e77
+            name_taken:
+              summary: A template with this name already exists
+              value:
+                error: { code: conflict, message: "A resource with the same unique name already exists." }
+                correlation_id: 0192f5e4-7c1a-7b3e-9a41-2f0c8d6b1e77
     PayloadTooLarge:
       description: Request body exceeds the size limit.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: { code: payload_too_large, message: "request body exceeds 5242880 bytes" }
+            correlation_id: 0192f5e4-7c1a-7b3e-9a41-2f0c8d6b1e77
     ValidationFailed:
       description: The request is well-formed but breaks a business rule.
       content:
@@ -657,6 +712,9 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: { code: internal_error, message: "An unexpected error occurred." }
+            correlation_id: 0192f5e4-7c1a-7b3e-9a41-2f0c8d6b1e77
 
   schemas:
     Channel:
@@ -734,6 +792,24 @@ components:
 
     Notification:
       type: object
+      example:
+        id: 01a1ee3b-9741-7bee-8c79-34c1a7d09aa3
+        channel: sms
+        priority: high
+        recipient: "+905551234567"
+        content: Your verification code is 4821
+        segments: 1
+        status: sent
+        idempotency_key: otp-user-42-2026-11-18T10:00
+        attempts: 2
+        max_attempts: 5
+        next_attempt_at: "2026-11-18T10:00:01.850Z"
+        sent_at: "2026-11-18T10:00:01.912Z"
+        provider_message_id: 3f1c2a9e-7b1d-4c55-9d5e-2a6f0e9b1c77
+        callback_url: https://example.com/hooks/notifications
+        metadata: { user_id: "42" }
+        created_at: "2026-11-18T10:00:00.004Z"
+        updated_at: "2026-11-18T10:00:01.912Z"
       required: [id, channel, priority, recipient, content, status, attempts, max_attempts, next_attempt_at, metadata, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
@@ -775,6 +851,7 @@ components:
 
     DeliveryAttempt:
       type: object
+      example: { attempt_no: 1, outcome: transient_error, status_code: 503, error_code: http_503, error: "provider unavailable", duration_ms: 48, created_at: "2026-11-18T10:00:00.051Z" }
       required: [attempt_no, outcome, duration_ms, created_at]
       properties:
         attempt_no: { type: integer }
@@ -790,6 +867,24 @@ components:
 
     NotificationPage:
       type: object
+      example:
+        items:
+          - id: 01a1ee3b-9741-7bee-8c79-34c1a7d09aa3
+            batch_id: 01a1ee3b-9741-7baf-8c55-74528dd709d0
+            channel: email
+            priority: normal
+            recipient: ada@example.com
+            subject: Your order has shipped
+            content: Hi Ada, order A-1042 is on its way.
+            status: pending
+            attempts: 0
+            max_attempts: 5
+            next_attempt_at: "2026-11-18T10:00:00Z"
+            metadata: { campaign: black-friday }
+            created_at: "2026-11-18T10:00:00Z"
+            updated_at: "2026-11-18T10:00:00Z"
+        next_cursor: MTc5NDk5ODIyMDc0ODE0NnwwMWExZWUzYi05NzQxLTdiZWUtOGM3OS0zNGMxYTdkMDlhYTM
+        has_more: true
       required: [items, has_more]
       properties:
         items:
@@ -812,6 +907,12 @@ components:
 
     BatchCreated:
       type: object
+      example:
+        batch_id: 01a1ee3b-9741-7baf-8c55-74528dd709d0
+        total: 2
+        notifications:
+          - { id: 01a1ee3b-9741-7bee-8c79-34c1a7d09aa3, status: pending, duplicate: false }
+          - { id: 01a1ee3a-1c20-7e01-9d4f-6b2e8a0c3d11, status: sent, duplicate: true }
       required: [batch_id, total, notifications]
       properties:
         batch_id: { type: string, format: uuid }
@@ -833,6 +934,13 @@ components:
 
     Batch:
       type: object
+      example:
+        id: 01a1ee3b-9741-7baf-8c55-74528dd709d0
+        total: 1000
+        counts: { pending: 312, scheduled: 0, processing: 50, sent: 630, failed: 8, cancelled: 0 }
+        progress: 0.638
+        metadata: { campaign: black-friday }
+        created_at: "2026-11-18T10:00:00Z"
       required: [id, total, counts, progress, metadata, created_at]
       properties:
         id: { type: string, format: uuid }
@@ -867,6 +975,7 @@ components:
 
     BatchCancelled:
       type: object
+      example: { batch_id: 01a1ee3b-9741-7baf-8c55-74528dd709d0, cancelled: 362 }
       required: [batch_id, cancelled]
       properties:
         batch_id: { type: string, format: uuid }
@@ -990,6 +1099,16 @@ components:
 
     Template:
       type: object
+      example:
+        id: 01a1ee40-2b1c-7a55-8e3f-9c0d1e2f3a4b
+        name: order-shipped
+        channel: email
+        subject: "Order {{.order_id}} has shipped"
+        body: "Hi {{.name | default \"there\"}}, your order {{.order_id}} is on its way."
+        variables: [name, order_id]
+        version: 2
+        created_at: "2026-11-17T09:00:00Z"
+        updated_at: "2026-11-18T08:30:00Z"
       required: [id, name, channel, body, variables, version, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
@@ -1007,6 +1126,18 @@ components:
 
     TemplatePage:
       type: object
+      example:
+        items:
+          - id: 01a1ee40-2b1c-7a55-8e3f-9c0d1e2f3a4b
+            name: order-shipped
+            channel: email
+            subject: "Order {{.order_id}} has shipped"
+            body: "Hi {{.name | default \"there\"}}, your order {{.order_id}} is on its way."
+            variables: [name, order_id]
+            version: 2
+            created_at: "2026-11-17T09:00:00Z"
+            updated_at: "2026-11-18T08:30:00Z"
+        has_more: false
       required: [items, has_more]
       properties:
         items:
@@ -1025,6 +1156,7 @@ components:
 
     TemplatePreview:
       type: object
+      example: { subject: Order A-1042 has shipped, content: "Hi Ada, your order A-1042 is on its way." }
       required: [content]
       properties:
         subject: { type: string }
@@ -1033,6 +1165,11 @@ components:
 
     HealthReport:
       type: object
+      example:
+        status: degraded
+        checks:
+          postgres: { status: ok, critical: true, latency_ms: 2 }
+          redis: { status: down, critical: false, latency_ms: 1000, error: "dial tcp redis:6379: connect: connection refused" }
       required: [status]
       properties:
         status:

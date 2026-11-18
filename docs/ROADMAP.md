@@ -606,7 +606,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
     - **DoD:** CI yeşil; yük testi kanal başına 100/s limitinin aşılmadığını ve burst'ün kayıpsız eridiğini gösteriyor.
 
 ### Faz 7: Teslim
-- [ ] 26. **OpenAPI'nin son hali:** Örnekler ve hata yanıtları.
+- [x] 26. **OpenAPI'nin son hali:** Örnekler ve hata yanıtları.
 - [ ] 27. **Dokümantasyon:** README, architecture.md, ADR'ler, runbook, `requests.http`.
 - [ ] 28. **Temiz kurulum provası:** Repo sıfırdan klonlanır, sadece `docker-compose up` ve README'deki adımlarla her şeyin çalıştığı doğrulanır. Commit geçmişi gözden geçirilir.
 - [ ] 29. **Teslim:** Repo linki paylaşılır.
