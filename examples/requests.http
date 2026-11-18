@@ -70,6 +70,7 @@ Content-Type: application/json
 }
 
 ### Scheduled for later, with a signed status callback (the mock provider verifies it)
+# scheduled_at must be in the future and at most 30 days ahead: tomorrow.
 # @name scheduled
 POST {{base}}/notifications
 X-API-Key: {{key}}
@@ -80,7 +81,7 @@ Content-Type: application/json
   "recipient": "device-token-1",
   "subject": "Reminder",
   "content": "Your appointment is tomorrow at 10:00",
-  "scheduled_at": "2030-01-01T09:00:00Z",
+  "scheduled_at": "{{$datetime iso8601 1 d}}",
   "callback_url": "http://mockprovider:9000/callbacks"
 }
 
