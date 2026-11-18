@@ -608,7 +608,7 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
 ### Faz 7: Teslim
 - [x] 26. **OpenAPI'nin son hali:** Örnekler ve hata yanıtları.
 - [x] 27. **Dokümantasyon:** README, architecture.md, ADR'ler, runbook, `requests.http`.
-- [ ] 28. **Temiz kurulum provası:** Repo sıfırdan klonlanır, sadece `docker-compose up` ve README'deki adımlarla her şeyin çalıştığı doğrulanır. Commit geçmişi gözden geçirilir.
+- [x] 28. **Temiz kurulum provası:** Repo sıfırdan klonlanır, sadece `docker-compose up` ve README'deki adımlarla her şeyin çalıştığı doğrulanır. Commit geçmişi gözden geçirilir.
 - [ ] 29. **Teslim:** Repo linki paylaşılır.
 
 ---
