@@ -45,14 +45,18 @@ func (r *Repo) EnqueueCallback(ctx context.Context, eventID int64, notificationI
 	return n == 1, nil
 }
 
-// ClaimCallbacks takes up to limit due callbacks for lease and counts the
-// attempt.
-func (r *Repo) ClaimCallbacks(ctx context.Context, now time.Time, lease time.Duration, limit int) ([]*CallbackDelivery, error) {
+// ClaimCallbacks takes up to limit due callbacks with attempts left for
+// lease and counts the attempt.
+func (r *Repo) ClaimCallbacks(ctx context.Context, now time.Time, lease time.Duration, limit, maxAttempts int) ([]*CallbackDelivery, error) {
 	maxRows, err := narrow[int32](limit, "limit")
 	if err != nil {
 		return nil, err
 	}
-	rows, err := r.q.ClaimCallbacks(ctx, sqlcgen.ClaimCallbacksParams{LeaseUntil: now.Add(lease), Now: now, MaxRows: maxRows})
+	attempts, err := narrow[int32](maxAttempts, "max_attempts")
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.q.ClaimCallbacks(ctx, sqlcgen.ClaimCallbacksParams{LeaseUntil: now.Add(lease), Now: now, MaxAttempts: attempts, MaxRows: maxRows})
 	if err != nil {
 		return nil, fmt.Errorf("claim callbacks: %w", err)
 	}
@@ -64,6 +68,20 @@ func (r *Repo) ClaimCallbacks(ctx context.Context, now time.Time, lease time.Dur
 		}
 	}
 	return out, nil
+}
+
+// ExpireExhaustedCallbacks fails callbacks that used every attempt
+// without a recorded outcome and whose lease has run out.
+func (r *Repo) ExpireExhaustedCallbacks(ctx context.Context, now time.Time, maxAttempts int) (int64, error) {
+	attempts, err := narrow[int32](maxAttempts, "max_attempts")
+	if err != nil {
+		return 0, err
+	}
+	n, err := r.q.ExpireExhaustedCallbacks(ctx, sqlcgen.ExpireExhaustedCallbacksParams{MaxAttempts: attempts, Now: now})
+	if err != nil {
+		return 0, fmt.Errorf("expire exhausted callbacks: %w", err)
+	}
+	return n, nil
 }
 
 // CallbackOutcome is the result of one delivery attempt.

@@ -94,6 +94,9 @@ type outMessage struct {
 // Publish forwards an event to every matching client. It never blocks on
 // a client.
 func (h *Hub) Publish(e events.Event) {
+	if h.Clients() == 0 {
+		return // the usual case: nobody is watching, skip decoding
+	}
 	var k eventKeys
 	if err := json.Unmarshal(e.Payload, &k); err != nil {
 		h.log.Error("undecodable event payload", "event_id", e.ID, "error", err)

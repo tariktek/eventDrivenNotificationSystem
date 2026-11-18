@@ -135,10 +135,12 @@ func NewGroup(rdb redis.UniversalClient, cfg GroupConfig) *Group {
 }
 
 // Ensure creates the consumer group if it does not exist. A new group
-// starts at the beginning of the stream, so events published before the
-// first consumer started are not skipped.
+// starts at the end of the stream: deploying a new consumer must not act on
+// history (a new callback group would otherwise call clients back about
+// notifications that finished days ago). Call Ensure before publishing
+// starts, so the first events after a deployment are not missed.
 func (g *Group) Ensure(ctx context.Context) error {
-	err := g.rdb.XGroupCreateMkStream(ctx, g.cfg.Stream, g.cfg.Group, "0").Err()
+	err := g.rdb.XGroupCreateMkStream(ctx, g.cfg.Stream, g.cfg.Group, "$").Err()
 	if err != nil && !strings.HasPrefix(err.Error(), "BUSYGROUP") {
 		return fmt.Errorf("create consumer group %s: %w", g.cfg.Group, err)
 	}

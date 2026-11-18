@@ -136,3 +136,10 @@ func TestLoadFrom_DoesNotLeakDatabasePassword(t *testing.T) {
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "s3cret")
 }
+
+func TestDevCallbackSecretIsTheDefault(t *testing.T) {
+	cfg, err := config.LoadFrom(map[string]string{})
+	require.NoError(t, err)
+	assert.Equal(t, config.DevCallbackSecret, cfg.Callback.SigningSecret,
+		"the mock provider verifies with DevCallbackSecret; they must agree")
+}

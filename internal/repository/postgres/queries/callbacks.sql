@@ -18,12 +18,20 @@ UPDATE callback_deliveries c
 SET attempts = c.attempts + 1, next_attempt_at = @lease_until
 WHERE c.id IN (
     SELECT d.id FROM callback_deliveries d
-    WHERE d.status = 'pending' AND d.next_attempt_at <= @now
+    WHERE d.status = 'pending' AND d.next_attempt_at <= @now AND d.attempts < @max_attempts
     ORDER BY d.next_attempt_at
     LIMIT @max_rows
     FOR UPDATE SKIP LOCKED
 )
 RETURNING c.id, c.notification_id, c.event_id, c.event_type, c.url, c.payload, c.attempts;
+
+-- A claim whose outcome was never recorded (the dispatcher crashed or
+-- could not write) comes back after its lease. Once it has used every
+-- attempt it must not be sent again: give up on it.
+-- name: ExpireExhaustedCallbacks :execrows
+UPDATE callback_deliveries
+SET status = 'failed', last_error = coalesce(last_error, 'attempts exhausted without a recorded outcome')
+WHERE status = 'pending' AND attempts >= @max_attempts AND next_attempt_at <= @now;
 
 -- name: MarkCallbackDelivered :execrows
 UPDATE callback_deliveries

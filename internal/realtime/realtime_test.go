@@ -256,3 +256,23 @@ func TestChannelSubscriptionFromQuery(t *testing.T) {
 	assert.Equal(t, "event", m.Type)
 	assert.Contains(t, string(m.Data), `"sms"`)
 }
+
+func TestSubscriptionLimitCountsDistinctNewIDs(t *testing.T) {
+	s := newServer(t, realtime.Config{MaxClients: 10, BufferSize: 64})
+	c := dial(t, s, "")
+	ids := make([]string, 600)
+	for i := range ids {
+		ids[i] = uuid.NewString()
+	}
+	send(t, c, map[string]any{"action": "subscribe", "batch_ids": ids})
+	require.Equal(t, "subscribed", read(t, c).Type)
+	send(t, c, map[string]any{"action": "subscribe", "batch_ids": append(ids, ids...)})
+	assert.Equal(t, "subscribed", read(t, c).Type, "re-sending the same ids is not 1800 subscriptions")
+
+	more := make([]string, 401) // pushes the total to one over the limit
+	for i := range more {
+		more[i] = uuid.NewString()
+	}
+	send(t, c, map[string]any{"action": "subscribe", "batch_ids": more})
+	assert.Equal(t, "error", read(t, c).Type, "1001 distinct ids is over the limit")
+}

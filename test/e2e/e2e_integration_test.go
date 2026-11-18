@@ -437,3 +437,84 @@ func TestE2E_CallbackRetriesUntilTheReceiverRecovers(t *testing.T) {
 	assert.Equal(t, 3, ds[0].Attempts, "two 503s, then delivered")
 	assert.Equal(t, http.StatusOK, ds[0].LastStatusCode)
 }
+
+// insertCallback stores a notification and one pending callback for it,
+// bypassing the event pipeline, for dispatcher-only tests.
+func insertCallback(t *testing.T, url string, attempts int) int64 {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `TRUNCATE notifications, batches, notification_attempts, outbox_events, callback_deliveries CASCADE`)
+	require.NoError(t, err)
+	n, err := domain.NewNotification(domain.NewNotificationParams{Channel: domain.ChannelSMS, Recipient: "+905551234567", Content: "hi"}, time.Now())
+	require.NoError(t, err)
+	_, err = store.InsertNotifications(t.Context(), []*domain.Notification{n})
+	require.NoError(t, err)
+	var id int64
+	require.NoError(t, pool.QueryRow(t.Context(), `
+		INSERT INTO callback_deliveries (notification_id, event_id, event_type, url, payload, attempts, next_attempt_at)
+		VALUES ($1, 1, 'notification.sent', $2, '{"type":"notification.sent"}', $3, now() - interval '1 second')
+		RETURNING id`, n.ID, url, attempts).Scan(&id))
+	return id
+}
+
+func dispatcher() *callback.Dispatcher {
+	return callback.NewDispatcher(store, callback.DispatcherConfig{
+		Client: callback.ClientConfig{Timeout: 5 * time.Second, AllowInsecure: true, AllowPrivate: true},
+		Secret: secret, Concurrency: 4, MaxAttempts: 5, Backoff: retry.Policy{Base: time.Second, Max: time.Second},
+		Lease: 10 * time.Second, PollInterval: 20 * time.Millisecond,
+	}, quiet)
+}
+
+func callbackRow(t *testing.T, id int64) (status string, attempts int) {
+	t.Helper()
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT status, attempts FROM callback_deliveries WHERE id = $1`, id).Scan(&status, &attempts))
+	return status, attempts
+}
+
+// TestE2E_ShutdownLetsInFlightCallbacksFinish: a POST under way when the
+// worker stops completes and is recorded, instead of being cut off and
+// counted as a failed attempt.
+func TestE2E_ShutdownLetsInFlightCallbacksFinish(t *testing.T) {
+	started := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		time.Sleep(500 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(slow.Close)
+	id := insertCallback(t, slow.URL, 4) // its last attempt
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { dispatcher().Run(ctx); close(done) }()
+	<-started
+	cancel() // shutdown while the receiver is still answering
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatcher did not stop")
+	}
+	status, attempts := callbackRow(t, id)
+	assert.Equal(t, postgres.CallbackDelivered, status)
+	assert.Equal(t, 5, attempts)
+}
+
+// TestE2E_ExhaustedCallbackIsNotSentAgain: a callback whose last attempt
+// was claimed but never recorded (the worker crashed) is given up on once
+// its lease expires, not sent a sixth time.
+func TestE2E_ExhaustedCallbackIsNotSentAgain(t *testing.T) {
+	var calls atomic.Int64
+	recv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(recv.Close)
+	id := insertCallback(t, recv.URL, 5)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go dispatcher().Run(ctx)
+	require.Eventually(t, func() bool { s, _ := callbackRow(t, id); return s == postgres.CallbackFailed }, 5*time.Second, 20*time.Millisecond)
+	assert.Zero(t, calls.Load())
+	_, attempts := callbackRow(t, id)
+	assert.Equal(t, 5, attempts)
+}

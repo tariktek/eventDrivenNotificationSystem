@@ -2,6 +2,12 @@
 -- (notification_id, event_type), would drop the second callback of a
 -- notification that failed, was redriven and failed again. The URL is
 -- copied so delivery needs no join and is not affected by later changes.
+--
+-- Nothing wrote to this table before this migration (callbacks start with
+-- it), and old rows could not be given an event id: clear any strays so
+-- the NOT NULL columns can be added.
+DELETE FROM callback_deliveries;
+
 ALTER TABLE callback_deliveries
     DROP CONSTRAINT callback_deliveries_unique_event,
     ADD COLUMN event_id bigint NOT NULL,

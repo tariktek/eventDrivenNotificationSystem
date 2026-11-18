@@ -27,7 +27,8 @@ type settings struct {
 	LatencyJitter time.Duration `env:"MOCK_LATENCY_JITTER"         envDefault:"30ms"`
 	// CallbackSecret verifies status callbacks posted to /callbacks; it
 	// must match the workers' CALLBACK_SIGNING_SECRET.
-	CallbackSecret string `env:"MOCK_CALLBACK_SECRET" envDefault:"dev-callback-secret-change-me"`
+	// Empty means the workers' development default.
+	CallbackSecret string `env:"MOCK_CALLBACK_SECRET"`
 }
 
 func main() {
@@ -55,7 +56,11 @@ func run() error {
 	}, nil)
 
 	mux := mock.Mux()
-	mockprovider.NewCallbackReceiver([]byte(s.CallbackSecret), nil).Register(mux)
+	secret := s.CallbackSecret
+	if secret == "" {
+		secret = config.DevCallbackSecret
+	}
+	mockprovider.NewCallbackReceiver([]byte(secret), nil).Register(mux)
 
 	srv := httpserver.New(config.HTTPConfig{
 		Addr: s.Addr, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second,

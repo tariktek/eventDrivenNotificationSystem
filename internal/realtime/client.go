@@ -21,8 +21,8 @@ import (
 
 // Connection limits.
 const (
-	maxSubscriptions = 1000 // ids per connection
-	maxClientMessage = 16 << 10
+	maxSubscriptions = 1000     // ids per connection
+	maxClientMessage = 64 << 10 // fits maxSubscriptions ids (~40 bytes each) in one message
 	writeTimeout     = 10 * time.Second
 	pingInterval     = 30 * time.Second
 	pingTimeout      = 10 * time.Second
@@ -82,7 +82,8 @@ func (s *subscription) apply(r *subscriptionRequest) error {
 		}
 		chans = append(chans, ch)
 	}
-	if add && len(s.Notifications)+len(s.Batches)+len(r.NotificationIDs)+len(r.BatchIDs) > maxSubscriptions {
+	if add && len(s.Notifications)+len(s.Batches)+
+		countNew(s.Notifications, r.NotificationIDs)+countNew(s.Batches, r.BatchIDs) > maxSubscriptions {
 		return fmt.Errorf("at most %d notification and batch ids per connection", maxSubscriptions)
 	}
 	if r.All != nil {
@@ -92,6 +93,18 @@ func (s *subscription) apply(r *subscriptionRequest) error {
 	set(s.Batches, r.BatchIDs, add)
 	set(s.Channels, chans, add)
 	return nil
+}
+
+// countNew counts the distinct keys not yet in m, so re-subscribing to
+// what a client already has (e.g. a resync) never hits the limit.
+func countNew[K comparable](m map[K]struct{}, keys []K) int {
+	seen := make(map[K]struct{}, len(keys))
+	for _, k := range keys {
+		if _, ok := m[k]; !ok {
+			seen[k] = struct{}{}
+		}
+	}
+	return len(seen)
 }
 
 func set[K comparable](m map[K]struct{}, keys []K, add bool) {

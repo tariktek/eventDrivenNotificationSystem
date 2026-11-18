@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
@@ -81,34 +83,65 @@ func NewDispatcher(store *postgres.Store, cfg DispatcherConfig, log *slog.Logger
 }
 
 // Run sends callbacks until ctx is done.
+//
+// It keeps up to Concurrency POSTs in flight and claims more as soon as
+// one finishes, so a receiver that hangs until the timeout occupies one
+// slot, not the whole round. At shutdown it stops claiming and lets the
+// POSTs already in flight finish (each is bounded by the client timeout,
+// which is shorter than the shutdown grace): cutting them off would burn
+// an attempt, or fail a callback on its last one, though nothing is wrong
+// with the receiver.
 func (d *Dispatcher) Run(ctx context.Context) {
+	var (
+		inflight sync.WaitGroup
+		slots    = make(chan struct{}, d.cfg.Concurrency)
+		freed    = make(chan struct{}, 1)
+	)
+	defer inflight.Wait()
+	sendCtx := context.WithoutCancel(ctx)
+
 	for ctx.Err() == nil {
-		n, err := d.RunOnce(ctx)
-		switch {
-		case err != nil:
-			if ctx.Err() == nil {
-				d.log.WarnContext(ctx, "callback dispatch round failed", "error", err)
-			}
-		case n == d.cfg.Concurrency:
-			continue // more are due
+		free := d.cfg.Concurrency - len(slots)
+		if free == 0 {
+			wait(ctx, freed, d.cfg.PollInterval)
+			continue
 		}
-		sleep(ctx, d.cfg.PollInterval)
+		now := d.now()
+		if n, err := d.store.ExpireExhaustedCallbacks(ctx, now, d.cfg.MaxAttempts); err != nil {
+			d.fail(ctx, "expire exhausted callbacks", err)
+			continue
+		} else if n > 0 {
+			d.log.WarnContext(ctx, "callbacks failed: attempts exhausted without a recorded outcome", "count", n)
+		}
+		due, err := d.store.ClaimCallbacks(ctx, now, d.cfg.Lease, free, d.cfg.MaxAttempts)
+		if err != nil {
+			d.fail(ctx, "claim callbacks", err)
+			continue
+		}
+		for _, cb := range due {
+			slots <- struct{}{}
+			inflight.Go(func() {
+				defer func() {
+					<-slots
+					select {
+					case freed <- struct{}{}:
+					default:
+					}
+				}()
+				d.deliver(sendCtx, cb)
+			})
+		}
+		if len(due) < free { // nothing more due right now
+			wait(ctx, nil, d.cfg.PollInterval)
+		}
 	}
 }
 
-// RunOnce claims up to Concurrency due callbacks, sends them in parallel
-// and records the outcomes. It returns how many it claimed.
-func (d *Dispatcher) RunOnce(ctx context.Context) (int, error) {
-	due, err := d.store.ClaimCallbacks(ctx, d.now(), d.cfg.Lease, d.cfg.Concurrency)
-	if err != nil {
-		return 0, err
+func (d *Dispatcher) fail(ctx context.Context, what string, err error) {
+	if ctx.Err() == nil {
+		d.log.WarnContext(ctx, what, "error", err)
+		wait(ctx, nil, d.cfg.PollInterval)
 	}
-	var wg sync.WaitGroup
-	for _, cb := range due {
-		wg.Go(func() { d.deliver(ctx, cb) })
-	}
-	wg.Wait()
-	return len(due), nil
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, cb *postgres.CallbackDelivery) {
@@ -129,8 +162,7 @@ func (d *Dispatcher) deliver(ctx context.Context, cb *postgres.CallbackDelivery)
 		out.Status = postgres.CallbackFailed
 		out.Error = truncate(res.Err.Error())
 	}
-	// Record even if shutdown began: the request was already sent.
-	applied, err := d.store.FinishCallback(context.WithoutCancel(ctx), cb, out)
+	applied, err := d.store.FinishCallback(ctx, cb, out)
 	switch {
 	case err != nil:
 		log.ErrorContext(ctx, "record callback outcome; it will be retried after the lease", "error", err)
@@ -145,19 +177,30 @@ func (d *Dispatcher) deliver(ctx context.Context, cb *postgres.CallbackDelivery)
 	}
 }
 
+// truncate makes an error message safe to store: at most 500 bytes, cut
+// on a character boundary, valid UTF-8 and free of NUL. PostgreSQL rejects
+// invalid UTF-8 and NUL in text; a rejected write would leave the
+// callback without a recorded outcome.
 func truncate(s string) string {
 	const maxLen = 500
-	if len(s) > maxLen {
-		return s[:maxLen]
+	s = strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", ""), "\uFFFD")
+	if len(s) <= maxLen {
+		return s
 	}
-	return s
+	cut := maxLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
-func sleep(ctx context.Context, d time.Duration) {
+// wait returns after d, a signal on c (if not nil), or ctx is done.
+func wait(ctx context.Context, c <-chan struct{}, d time.Duration) {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():
+	case <-c:
 	case <-t.C:
 	}
 }

@@ -192,7 +192,8 @@ type CallbackConfig struct {
 }
 
 // DevCallbackSecret is the default signing secret for local development;
-// rejected in production.
+// rejected in production. It must match CallbackConfig.SigningSecret's
+// envDefault (TestDevCallbackSecretIsTheDefault guards that).
 const DevCallbackSecret = "dev-callback-secret-change-me" //nolint:gosec // public on purpose; rejected in production
 
 // Load reads configuration from the process environment and validates it.

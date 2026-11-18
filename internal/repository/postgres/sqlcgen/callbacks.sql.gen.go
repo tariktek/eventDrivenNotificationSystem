@@ -17,18 +17,19 @@ UPDATE callback_deliveries c
 SET attempts = c.attempts + 1, next_attempt_at = $1
 WHERE c.id IN (
     SELECT d.id FROM callback_deliveries d
-    WHERE d.status = 'pending' AND d.next_attempt_at <= $2
+    WHERE d.status = 'pending' AND d.next_attempt_at <= $2 AND d.attempts < $3
     ORDER BY d.next_attempt_at
-    LIMIT $3
+    LIMIT $4
     FOR UPDATE SKIP LOCKED
 )
 RETURNING c.id, c.notification_id, c.event_id, c.event_type, c.url, c.payload, c.attempts
 `
 
 type ClaimCallbacksParams struct {
-	LeaseUntil time.Time
-	Now        time.Time
-	MaxRows    int32
+	LeaseUntil  time.Time
+	Now         time.Time
+	MaxAttempts int32
+	MaxRows     int32
 }
 
 type ClaimCallbacksRow struct {
@@ -45,7 +46,12 @@ type ClaimCallbacksRow struct {
 // them from other dispatchers; if this one dies, they become due again
 // when the lease runs out. attempts doubles as the fencing token.
 func (q *Queries) ClaimCallbacks(ctx context.Context, arg ClaimCallbacksParams) ([]ClaimCallbacksRow, error) {
-	rows, err := q.db.Query(ctx, claimCallbacks, arg.LeaseUntil, arg.Now, arg.MaxRows)
+	rows, err := q.db.Query(ctx, claimCallbacks,
+		arg.LeaseUntil,
+		arg.Now,
+		arg.MaxAttempts,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -99,6 +105,28 @@ func (q *Queries) EnqueueCallback(ctx context.Context, arg EnqueueCallbackParams
 		arg.Payload,
 		arg.NotificationID,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const expireExhaustedCallbacks = `-- name: ExpireExhaustedCallbacks :execrows
+UPDATE callback_deliveries
+SET status = 'failed', last_error = coalesce(last_error, 'attempts exhausted without a recorded outcome')
+WHERE status = 'pending' AND attempts >= $1 AND next_attempt_at <= $2
+`
+
+type ExpireExhaustedCallbacksParams struct {
+	MaxAttempts int32
+	Now         time.Time
+}
+
+// A claim whose outcome was never recorded (the dispatcher crashed or
+// could not write) comes back after its lease. Once it has used every
+// attempt it must not be sent again: give up on it.
+func (q *Queries) ExpireExhaustedCallbacks(ctx context.Context, arg ExpireExhaustedCallbacksParams) (int64, error) {
+	result, err := q.db.Exec(ctx, expireExhaustedCallbacks, arg.MaxAttempts, arg.Now)
 	if err != nil {
 		return 0, err
 	}
