@@ -115,13 +115,13 @@ jobs:
             COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Scan with Trivy (fail on fixable HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: notification-system:ci
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
+      # Trivy runs from its official image, pinned, rather than through a
+      # third-party action whose tags can be moved or removed (a supply-
+      # chain risk of its own). Fails on HIGH/CRITICAL issues that have a
+      # fix available.
+      - name: Scan with Trivy
+        run: |
+          docker run --rm             -v /var/run/docker.sock:/var/run/docker.sock             -v "$HOME/.cache/trivy:/root/.cache/trivy"             aquasec/trivy:0.56.2 image             --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress             notification-system:ci
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3

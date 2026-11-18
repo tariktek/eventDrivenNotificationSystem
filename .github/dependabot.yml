@@ -10,12 +10,14 @@ updates:
       go-minor-patch:
         update-types: [minor, patch]
 
+  # All action updates in one PR, majors included: they rarely conflict,
+  # and CI vets the whole set at once.
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
     groups:
       actions:
-        update-types: [minor, patch]
+        patterns: ["*"]
 
   - package-ecosystem: docker
     directory: /
