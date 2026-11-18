@@ -1,0 +1,13 @@
+# gitleaks configuration: the default rules, plus the two development
+# defaults that are public on purpose. They appear in docker-compose.yml,
+# .env.example, the docs and examples, and production refuses them at
+# startup (internal/config). Real secrets are never committed.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Public development defaults, rejected in production"
+regexes = [
+  '''dev-api-key-change-me''',
+  '''dev-callback-secret-change-me''',
+]
