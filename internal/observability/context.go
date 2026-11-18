@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"slices"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 type correlationKey struct{}
@@ -17,6 +19,20 @@ func WithCorrelationID(ctx context.Context, id string) context.Context {
 func CorrelationID(ctx context.Context) string {
 	id, _ := ctx.Value(correlationKey{}).(string)
 	return id
+}
+
+// contextAttrs are the request-scoped IDs carried by ctx: the correlation
+// ID, and the trace and span IDs when a sampled span is active, so a log
+// line leads to its trace in Jaeger.
+func contextAttrs(ctx context.Context) []slog.Attr {
+	var attrs []slog.Attr
+	if id := CorrelationID(ctx); id != "" {
+		attrs = append(attrs, slog.String("correlation_id", id))
+	}
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() && sc.IsSampled() {
+		attrs = append(attrs, slog.String("trace_id", sc.TraceID().String()), slog.String("span_id", sc.SpanID().String()))
+	}
+	return attrs
 }
 
 // contextHandler adds request-scoped attributes from the context to every
@@ -45,17 +61,17 @@ func (h contextHandler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h contextHandler) Handle(ctx context.Context, r slog.Record) error {
-	id := CorrelationID(ctx)
-	if id == "" {
+	attrs := contextAttrs(ctx)
+	if len(attrs) == 0 {
 		return h.inner.Handle(ctx, r)
 	}
 	if len(h.afterGroup) == 0 {
-		r.AddAttrs(slog.String("correlation_id", id))
+		r.AddAttrs(attrs...)
 		return h.inner.Handle(ctx, r)
 	}
-	// Grouped logger: attach the ID before the groups, then rebuild them.
+	// Grouped logger: attach the IDs before the groups, then rebuild them.
 	// Grouped loggers are rare, so the extra allocation is acceptable.
-	out := h.beforeGroup.WithAttrs([]slog.Attr{slog.String("correlation_id", id)})
+	out := h.beforeGroup.WithAttrs(attrs)
 	for _, apply := range h.afterGroup {
 		out = apply(out)
 	}

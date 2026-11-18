@@ -687,3 +687,53 @@ func TestUnknownRouteIsJSON(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, res.Code)
 	assert.Equal(t, "not_found", errorCode(t, res))
 }
+
+func TestMetricsSummary(t *testing.T) {
+	reset(t)
+	for range 4 {
+		call(t, http.MethodPost, "/api/v1/notifications", sms())
+	}
+	call(t, http.MethodPost, "/api/v1/notifications", sms(map[string]any{"priority": "high"}))
+	// Two of the normal ones finished: one sent 2s after creation, one failed.
+	var sentID, failedID string
+	require.NoError(t, pool.QueryRow(t.Context(),
+		`SELECT (array_agg(id::text ORDER BY id))[1], (array_agg(id::text ORDER BY id))[2] FROM notifications WHERE priority = 1`).
+		Scan(&sentID, &failedID))
+	_, err := pool.Exec(t.Context(),
+		`UPDATE notifications SET status = 'sent', sent_at = created_at + interval '2 seconds', attempts = 1 WHERE id = $1`, sentID)
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(),
+		`UPDATE notifications SET status = 'failed', failed_at = now(), attempts = 1 WHERE id = $1`, failedID)
+	require.NoError(t, err)
+
+	res := call(t, http.MethodGet, "/api/v1/metrics", nil)
+	require.Equal(t, http.StatusOK, res.Code, "%s", res.Body)
+	var m struct {
+		Queue map[string]struct {
+			Pending           int64            `json:"pending"`
+			PendingByPriority map[string]int64 `json:"pending_by_priority"`
+		} `json:"queue"`
+		Deliveries map[string]map[string]struct {
+			Sent, Failed int64
+			SuccessRate  float64 `json:"success_rate"`
+		} `json:"deliveries"`
+		Latency map[string]struct {
+			Count int64   `json:"count"`
+			P50   float64 `json:"p50_seconds"`
+		} `json:"latency"`
+	}
+	require.NoError(t, json.Unmarshal(res.Body, &m))
+	assert.Equal(t, int64(3), m.Queue["sms"].Pending)
+	assert.Equal(t, map[string]int64{"high": 1, "normal": 2, "low": 0}, m.Queue["sms"].PendingByPriority)
+	assert.Zero(t, m.Queue["email"].Pending, "every channel is listed")
+	w := m.Deliveries["sms"]["15m"]
+	assert.Equal(t, int64(1), w.Sent)
+	assert.Equal(t, int64(1), w.Failed)
+	assert.InDelta(t, 0.5, w.SuccessRate, 0.001)
+	assert.Equal(t, int64(1), m.Deliveries["all"]["15m"].Sent)
+	assert.Equal(t, int64(1), m.Latency["sms"].Count)
+	assert.InDelta(t, 2.0, m.Latency["sms"].P50, 0.01)
+	assert.Equal(t, int64(1), m.Latency["all"].Count)
+
+	assert.Equal(t, http.StatusUnauthorized, callWith(t, http.MethodGet, "/api/v1/metrics", nil, map[string]string{"X-API-Key": "wrong"}).Code)
+}

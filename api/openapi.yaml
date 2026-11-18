@@ -54,6 +54,8 @@ tags:
     description: Notifications created together in one request.
   - name: templates
     description: Reusable message templates with `{{.variable}}` placeholders.
+  - name: metrics
+    description: Delivery statistics.
   - name: realtime
     description: Live status events over WebSocket.
   - name: ops
@@ -274,6 +276,37 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/metrics:
+    get:
+      tags: [metrics]
+      operationId: getMetrics
+      summary: Real-time delivery metrics (JSON summary)
+      description: |
+        System-wide figures computed from the database, the same on every
+        API instance whichever worker did the work:
+
+        * `queue`: per channel, how many notifications are pending,
+          scheduled and being processed, pending ones by priority, and how
+          long the oldest due one has waited;
+        * `deliveries`: per channel and `all`, notifications sent and failed
+          in the last 1, 5 and 15 minutes, success rate and sends per second;
+        * `latency`: per channel and `all`, delivery latency percentiles over
+          the last 15 minutes (from creation, or from `scheduled_at`, to
+          acceptance by the provider);
+        * `outbox` and `callbacks`: event and callback backlogs.
+
+        Sampled in the background every few seconds (`generated_at`), so
+        polling this endpoint does not load the database. Prometheus
+        metrics are at `/metrics`.
+      responses:
+        "200":
+          description: The latest sample.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MetricsSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "500": { $ref: "#/components/responses/InternalError" }
 
   /api/v1/ws:
@@ -861,6 +894,78 @@ components:
       properties:
         requeued: { type: integer, description: Moved back to pending by this call (0 for a dry run). }
         remaining: { type: integer, description: Still failed and matching the filters. }
+
+    MetricsSummary:
+      type: object
+      required: [generated_at, queue, deliveries, latency, outbox, callbacks]
+      properties:
+        generated_at: { type: string, format: date-time }
+        queue:
+          type: object
+          description: By channel.
+          additionalProperties: { $ref: "#/components/schemas/QueueStats" }
+        deliveries:
+          type: object
+          description: By channel and `all`, then by window (`1m`, `5m`, `15m`).
+          additionalProperties:
+            type: object
+            additionalProperties: { $ref: "#/components/schemas/WindowStats" }
+        latency:
+          type: object
+          description: By channel and `all`, over the last 15 minutes.
+          additionalProperties: { $ref: "#/components/schemas/LatencyStats" }
+        outbox:
+          type: object
+          required: [backlog, lag_seconds]
+          properties:
+            backlog: { type: integer, format: int64, description: Events not yet published. }
+            lag_seconds: { type: number, description: Age of the oldest unpublished event. }
+        callbacks:
+          type: object
+          required: [pending]
+          properties:
+            pending: { type: integer, format: int64 }
+      example:
+        generated_at: "2026-11-18T10:00:05Z"
+        queue:
+          sms: { pending: 420, scheduled: 12, processing: 50, pending_by_priority: { high: 0, normal: 400, low: 20 }, oldest_pending_age_seconds: 4.2 }
+        deliveries:
+          all:
+            1m: { sent: 5940, failed: 12, success_rate: 0.998, per_second: 99 }
+        latency:
+          all: { count: 81000, p50_seconds: 0.4, p95_seconds: 3.1, p99_seconds: 9.8 }
+        outbox: { backlog: 3, lag_seconds: 0.08 }
+        callbacks: { pending: 0 }
+
+    QueueStats:
+      type: object
+      required: [pending, scheduled, processing, pending_by_priority, oldest_pending_age_seconds]
+      properties:
+        pending: { type: integer, format: int64 }
+        scheduled: { type: integer, format: int64 }
+        processing: { type: integer, format: int64 }
+        pending_by_priority:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+        oldest_pending_age_seconds: { type: number }
+
+    WindowStats:
+      type: object
+      required: [sent, failed, success_rate, per_second]
+      properties:
+        sent: { type: integer, format: int64 }
+        failed: { type: integer, format: int64 }
+        success_rate: { type: number, description: "sent / (sent + failed); 1 when nothing finished." }
+        per_second: { type: number, description: Sent per second over the window. }
+
+    LatencyStats:
+      type: object
+      required: [count, p50_seconds, p95_seconds, p99_seconds]
+      properties:
+        count: { type: integer, format: int64 }
+        p50_seconds: { type: number }
+        p95_seconds: { type: number }
+        p99_seconds: { type: number }
 
     TemplateWrite:
       type: object

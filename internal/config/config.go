@@ -43,6 +43,16 @@ type Config struct {
 	Events   EventsConfig   `envPrefix:"EVENTS_"`
 	Outbox   OutboxConfig   `envPrefix:"OUTBOX_"`
 	WS       WSConfig       `envPrefix:"WS_"`
+	Tracing  TracingConfig  `envPrefix:"TRACING_"`
+}
+
+// TracingConfig controls OpenTelemetry tracing.
+type TracingConfig struct {
+	Enabled bool `env:"ENABLED" envDefault:"false"`
+	// Endpoint is the OTLP/HTTP collector base URL (Jaeger accepts OTLP).
+	Endpoint string `env:"ENDPOINT" envDefault:"http://localhost:4318"`
+	// SampleRatio is the share of new traces kept, in [0, 1].
+	SampleRatio float64 `env:"SAMPLE_RATIO" envDefault:"1"`
 }
 
 // WSConfig tunes the WebSocket endpoint.
@@ -303,6 +313,14 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("OUTBOX_POLL_INTERVAL/OUTBOX_RETENTION/OUTBOX_PRUNE_INTERVAL: must be positive"))
 	}
 
+	if c.Tracing.SampleRatio < 0 || c.Tracing.SampleRatio > 1 {
+		errs = append(errs, errors.New("TRACING_SAMPLE_RATIO: must be between 0 and 1"))
+	}
+	if c.Tracing.Enabled {
+		if err := validateURL(c.Tracing.Endpoint, "http", "https"); err != nil {
+			errs = append(errs, fmt.Errorf("TRACING_ENDPOINT: %w", err))
+		}
+	}
 	if c.WS.MaxClients < 1 || c.WS.BufferSize < 1 {
 		errs = append(errs, errors.New("WS_MAX_CLIENTS/WS_BUFFER_SIZE: must be at least 1"))
 	}

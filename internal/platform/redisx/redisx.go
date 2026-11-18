@@ -3,7 +3,9 @@ package redisx
 
 import (
 	"errors"
+	"fmt"
 
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
@@ -19,5 +21,10 @@ func NewClient(cfg config.RedisConfig) (*redis.Client, error) {
 		// Parse errors can echo the URL, which may contain a password.
 		return nil, errors.New("parse REDIS_URL: invalid connection string")
 	}
-	return redis.NewClient(opts), nil
+	rdb := redis.NewClient(opts)
+	// Commands become spans inside the trace of the work running them.
+	if err := redisotel.InstrumentTracing(rdb, redisotel.WithDBStatement(false)); err != nil {
+		return nil, fmt.Errorf("instrument redis: %w", err)
+	}
+	return rdb, nil
 }

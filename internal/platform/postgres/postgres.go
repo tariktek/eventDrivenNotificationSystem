@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
@@ -25,6 +26,10 @@ func NewPool(ctx context.Context, cfg config.DatabaseConfig) (*pgxpool.Pool, err
 	}
 	pc.MaxConns = cfg.MaxConns
 	pc.MinConns = cfg.MinConns
+	// Queries become spans inside the trace of the work running them (an
+	// API request, a delivery). Background polls start no trace of their
+	// own: see observability.SetupTracing.
+	pc.ConnConfig.Tracer = otelpgx.NewTracer()
 
 	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()

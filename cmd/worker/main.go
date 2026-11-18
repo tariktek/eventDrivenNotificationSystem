@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/breaker"
@@ -21,6 +22,7 @@ import (
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/config"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/metrics"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/outbox"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/buildinfo"
@@ -60,6 +62,19 @@ func run() error {
 
 	log.Info("starting", "env", cfg.Env, "commit", buildinfo.Commit)
 
+	shutdownTracing, err := observability.SetupTracing(ctx, cfg.Tracing, serviceName, buildinfo.Version)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// Flush buffered spans; ctx is already cancelled at this point.
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			log.Warn("flush traces", "error", err)
+		}
+	}()
+
 	pool, err := pgplatform.NewPool(ctx, cfg.Database)
 	if err != nil {
 		return err
@@ -81,6 +96,7 @@ func run() error {
 	defer context.AfterFunc(ctx, checks.SetDraining)()
 
 	store := postgres.NewStore(pool)
+	m := metrics.New()
 	rate := ratelimit.Config{Rate: cfg.Worker.RateLimit, Horizon: cfg.Worker.RateHorizon}
 	limiter := ratelimit.NewFallback(ratelimit.FallbackConfig{
 		Primary:    ratelimit.NewRedis(rdb, rate, "ratelimit:"),
@@ -89,6 +105,15 @@ func run() error {
 		Log:        log,
 		RetryEvery: 5 * time.Second,
 	})
+	m.Registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "rate_limiter_fallback_active",
+		Help: "1 while Redis is unreachable and the local fallback limiter is in use.",
+	}, func() float64 {
+		if limiter.Degraded() {
+			return 1
+		}
+		return 0
+	}))
 	checks.Register("rate_limiter", false, func(context.Context) error {
 		if limiter.Degraded() {
 			return errors.New("shared limiter unavailable; using local fallback")
@@ -124,6 +149,7 @@ func run() error {
 		Sender:   provider.NewHTTPClient(provider.HTTPConfig{URLs: urls, Timeout: cfg.Provider.Timeout}),
 		Policy:   retry.Policy{Base: cfg.Retry.BaseDelay, Max: cfg.Retry.MaxDelay},
 		Notifier: store.Queue(),
+		Metrics:  m,
 		Log:      log,
 	})
 
@@ -151,6 +177,7 @@ func run() error {
 			RetryEvery:    time.Second,
 			Retention:     cfg.Outbox.Retention,
 			PruneInterval: cfg.Outbox.PruneInterval,
+			OnPublished:   m.ObserveEvents, // status counters: see package metrics
 		}, log)
 
 	// Status callbacks: one consumer group shared by all workers turns
@@ -171,13 +198,15 @@ func run() error {
 		Backoff:      retry.Policy{Base: cfg.Callback.RetryBaseDelay, Max: cfg.Callback.RetryMaxDelay},
 		Lease:        cfg.Callback.Lease,
 		PollInterval: cfg.Callback.PollInterval,
+		Metrics:      m,
 	}, log)
 
 	// The worker has no public API; this small "ops" server exposes probes
-	// (and, later, Prometheus metrics) for the orchestrator.
+	// and Prometheus metrics for the orchestrator and the scraper.
 	mux := http.NewServeMux()
 	mux.Handle("GET /health", health.LivenessHandler())
 	mux.Handle("GET /ready", checks.ReadinessHandler())
+	mux.Handle("GET /metrics", m.Handler())
 	srv := httpserver.New(cfg.HTTP, mux)
 
 	// If either part fails (e.g. the ops port is taken), stop the other too

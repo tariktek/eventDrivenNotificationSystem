@@ -24,6 +24,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
 )
@@ -34,6 +35,8 @@ type Config struct {
 	MaxClients int
 	// BufferSize is how many messages may wait for a slow client.
 	BufferSize int
+	// Clients, if set, tracks the number of connections.
+	Clients prometheus.Gauge
 }
 
 // Hub fans events out to subscribed clients.
@@ -60,12 +63,20 @@ func (h *Hub) add(c *client) error {
 		return ErrFull
 	}
 	h.clients[c] = struct{}{}
+	h.track()
 	return nil
+}
+
+func (h *Hub) track() {
+	if h.cfg.Clients != nil {
+		h.cfg.Clients.Set(float64(len(h.clients)))
+	}
 }
 
 func (h *Hub) remove(c *client) {
 	h.mu.Lock()
 	delete(h.clients, c)
+	h.track()
 	h.mu.Unlock()
 }
 

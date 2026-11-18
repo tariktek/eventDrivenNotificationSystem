@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
 )
 
@@ -49,7 +51,9 @@ func NewHTTPClient(cfg HTTPConfig) *HTTPClient {
 	return &HTTPClient{
 		cfg: cfg,
 		http: &http.Client{
-			Transport: transport,
+			// A client span per call, and the traceparent header, so the
+			// provider's side can join the trace.
+			Transport: otelhttp.NewTransport(transport),
 			Timeout:   cfg.Timeout,
 			// A redirect from a delivery endpoint means misconfiguration;
 			// following it could resend the message somewhere unexpected.

@@ -13,6 +13,7 @@ import (
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/handler"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/router"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/metrics"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/buildinfo"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/health"
@@ -22,12 +23,14 @@ import (
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/realtime"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/service"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/stats"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/validation"
 )
 
 const (
 	serviceName        = "api"
 	healthCheckTimeout = time.Second
+	statsInterval      = 5 * time.Second
 )
 
 func main() {
@@ -49,6 +52,19 @@ func run() error {
 	defer stop()
 
 	log.Info("starting", "env", cfg.Env, "commit", buildinfo.Commit)
+
+	shutdownTracing, err := observability.SetupTracing(ctx, cfg.Tracing, serviceName, buildinfo.Version)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// Flush buffered spans; ctx is already cancelled at this point.
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			log.Warn("flush traces", "error", err)
+		}
+	}()
 
 	pool, err := pgplatform.NewPool(ctx, cfg.Database)
 	if err != nil {
@@ -72,16 +88,23 @@ func run() error {
 	defer context.AfterFunc(ctx, checks.SetDraining)()
 
 	store := postgres.NewStore(pool)
+	m := metrics.New()
+	// System-wide statistics for GET /api/v1/metrics and the queue-depth
+	// and outbox gauges, sampled from the database in the background.
+	sampler := stats.New(store, m, statsInterval, log)
+	go sampler.Run(ctx)
 	svc := service.New(store, time.Now, validation.Options{
 		AllowInsecureCallbacks: cfg.Callback.AllowInsecure,
 		AllowPrivateCallbacks:  cfg.Callback.AllowPrivate,
-	})
+	}).WithStats(sampler)
 	meta := func(ctx context.Context) service.RequestMeta {
-		return service.RequestMeta{CorrelationID: observability.CorrelationID(ctx)}
+		// The traceparent is stored with the notification, so its delivery
+		// (later, in a worker) can link back to this request's trace.
+		return service.RequestMeta{CorrelationID: observability.CorrelationID(ctx), TraceParent: observability.TraceParent(ctx)}
 	}
 	// Live events: this instance tails the event stream and pushes matching
 	// events to its WebSocket clients.
-	hub := realtime.NewHub(realtime.Config{MaxClients: cfg.WS.MaxClients, BufferSize: cfg.WS.BufferSize}, log)
+	hub := realtime.NewHub(realtime.Config{MaxClients: cfg.WS.MaxClients, BufferSize: cfg.WS.BufferSize, Clients: m.WebSocketClients}, log)
 	go hub.Run(ctx, func(ctx context.Context, publish func(events.Event)) {
 		events.Tail(ctx, rdb, events.TailConfig{
 			Stream: cfg.Events.Stream, Count: 500, Block: 5 * time.Second, RetryEvery: time.Second, Log: log,
@@ -96,6 +119,7 @@ func run() error {
 		Idempotency:    store.Idempotency(),
 		IdempotencyTTL: cfg.Auth.IdempotencyTTL,
 		Now:            time.Now,
+		Metrics:        m,
 		Realtime: &realtime.Handler{
 			Hub:            hub,
 			OriginPatterns: cfg.WS.AllowedOrigins,

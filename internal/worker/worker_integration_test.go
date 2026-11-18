@@ -353,7 +353,11 @@ func TestWorker_RespectsRateLimitEndToEnd(t *testing.T) {
 	// right before the next, on-time one. A provider enforcing its limit
 	// strictly on arrival should be configured with a little headroom
 	// (e.g. WORKER_RATE_LIMIT=95 for a hard 100/s).
-	assert.LessOrEqual(t, worst, rate+3, "allowance for network jitter between slot and arrival")
+	// Measured on the receiving side, a window that starts at a late
+	// arrival (a new connection, a scheduler hiccup) catches a few more on-
+	// time ones: 53-54 at rate 50 on a loaded Windows machine. 10% is
+	// generous for jitter yet still catches a limiter that bursts.
+	assert.LessOrEqual(t, worst, rate+rate/10, "allowance for network jitter between slot and arrival")
 	assert.GreaterOrEqual(t, elapsed, 2*time.Second, "125 at 50/s cannot finish faster")
 }
 

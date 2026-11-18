@@ -20,7 +20,8 @@ func NewLogger(w io.Writer, cfg config.LogConfig, service, version string) *slog
 	// zero value (info) is a safe fallback.
 	_ = level.UnmarshalText([]byte(cfg.Level))
 
-	opts := &slog.HandlerOptions{Level: level}
+	// Personal data is masked in every record (see pii.go).
+	opts := &slog.HandlerOptions{Level: level, ReplaceAttr: maskAttr}
 
 	var handler slog.Handler
 	if cfg.Format == "text" {

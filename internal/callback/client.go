@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/validation"
 )
 
@@ -59,7 +61,7 @@ func NewHTTPClient(cfg ClientConfig) *http.Client {
 	}
 	return &http.Client{
 		Timeout: cfg.Timeout,
-		Transport: &http.Transport{
+		Transport: otelhttp.NewTransport(&http.Transport{
 			Proxy:                 nil,
 			DialContext:           dialer.DialContext,
 			TLSHandshakeTimeout:   5 * time.Second,
@@ -67,7 +69,7 @@ func NewHTTPClient(cfg ClientConfig) *http.Client {
 			MaxIdleConnsPerHost:   4,
 			IdleConnTimeout:       90 * time.Second,
 			ForceAttemptHTTP2:     true,
-		},
+		}),
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 }

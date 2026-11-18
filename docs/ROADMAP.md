@@ -592,10 +592,10 @@ Commit'ler **Conventional Commits** formatında atılır (`feat:`, `fix:`, `test
     - **DoD:** Bir batch gönderildiğinde WebSocket client'ı tüm durum değişikliklerini sırayla görüyor; callback alıcısı imzayı doğrulayabiliyor.
 
 ### Faz 5: Gözlemlenebilirlik
-- [ ] 18. **Prometheus metrikleri** ve `/api/v1/metrics` JSON özeti, queue depth sampler.
-- [ ] 19. **OpenTelemetry + Jaeger:** Span link'leri, log'larda `trace_id`.
-- [ ] 20. **Grafana dashboard'u ve alert kuralları:** Provisioning dahil.
-- [ ] 21. **Log'larda PII maskeleme.**
+- [x] 18. **Prometheus metrikleri** ve `/api/v1/metrics` JSON özeti, queue depth sampler.
+- [x] 19. **OpenTelemetry + Jaeger:** Span link'leri, log'larda `trace_id`.
+- [x] 20. **Grafana dashboard'u ve alert kuralları:** Provisioning dahil.
+- [x] 21. **Log'larda PII maskeleme.**
     - **DoD:** Tek bir bildirim, correlation ID ile loglardan ve trace ID ile Jaeger'dan uçtan uca takip edilebiliyor; dashboard canlı veri gösteriyor.
 
 ### Faz 6: Kalite ve kanıt

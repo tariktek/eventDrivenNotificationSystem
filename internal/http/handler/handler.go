@@ -6,6 +6,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -167,6 +168,26 @@ func (h *Handler) RetryFailedNotifications(ctx context.Context, req api.RetryFai
 		return nil, err
 	}
 	return api.RetryFailedNotifications200JSONResponse{Requeued: int(res.Requeued), Remaining: int(res.Remaining)}, nil
+}
+
+// GetMetrics implements GET /api/v1/metrics.
+func (h *Handler) GetMetrics(ctx context.Context, _ api.GetMetricsRequestObject) (api.GetMetricsResponseObject, error) {
+	snap, err := h.svc.Metrics(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// The snapshot's JSON shape is the schema's; convert through JSON
+	// rather than copy a dozen nested maps field by field. The contract
+	// tests check the result against the spec.
+	b, err := json.Marshal(snap)
+	if err != nil {
+		return nil, err
+	}
+	var out api.MetricsSummary
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return api.GetMetrics200JSONResponse(out), nil
 }
 
 // ---- batches ---------------------------------------------------------------

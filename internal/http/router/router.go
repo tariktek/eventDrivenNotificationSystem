@@ -14,6 +14,7 @@ import (
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/handler"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/middleware"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/idempotency"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/metrics"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/platform/health"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/realtime"
@@ -31,6 +32,8 @@ type Deps struct {
 	Now            func() time.Time
 	// Realtime serves the WebSocket endpoint; optional.
 	Realtime *realtime.Handler
+	// Metrics records HTTP metrics and serves GET /metrics; optional.
+	Metrics *metrics.Metrics
 }
 
 // idempotentRoutes are the operations whose spec declares the
@@ -48,15 +51,20 @@ func New(d Deps) http.Handler {
 		CorrelationID: func(req *http.Request) string { return observability.CorrelationID(req.Context()) },
 	}
 
-	// Order matters: the correlation ID first so every log line carries it;
+	// Order matters: the trace span outermost so it covers everything; the
+	// correlation ID next so every log line carries it;
 	// the request log outside recovery so requests that panic are logged too
 	// (as the 500 that recovery turns them into).
 	r.Use(
+		middleware.Tracing,
 		middleware.CorrelationID,
 		middleware.RequestLog(d.Log),
 		middleware.Recovery(d.Log, errs.Write),
 		middleware.SecureHeaders,
 	)
+	if d.Metrics != nil {
+		r.Use(middleware.Metrics(d.Metrics))
+	}
 
 	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
 		errs.Write(w, req, apierror.New(http.StatusNotFound, api.ErrorCodeNotFound, "No route matches "+req.Method+" "+req.URL.Path+"."))
@@ -70,6 +78,11 @@ func New(d Deps) http.Handler {
 	r.Get("/ready", d.Health.ReadinessHandler())
 	r.Get("/openapi.yaml", docs.SpecHandler())
 	r.Get("/docs", docs.UIHandler())
+	if d.Metrics != nil {
+		// Prometheus scrape endpoint. Unauthenticated like the probes:
+		// expose it on an internal network only.
+		r.Method(http.MethodGet, "/metrics", d.Metrics.Handler())
+	}
 
 	// The WebSocket endpoint: authenticated, but no body buffering or
 	// idempotency (it is a long-lived GET).

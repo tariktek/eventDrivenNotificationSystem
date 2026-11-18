@@ -1,0 +1,52 @@
+# Alert rules (visible at http://localhost:9090/alerts). Thresholds follow
+# docs/ROADMAP.md §10.2; tune them to the real traffic.
+groups:
+  - name: notifications
+    rules:
+      - alert: QueueBacklogStale
+        # Due work waiting this long means workers are down, stuck or far
+        # behind (or the breaker has paused a channel: see below).
+        expr: max by (channel) (notification_queue_oldest_age_seconds) > 300
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.channel }}: oldest due notification has waited {{ $value | humanizeDuration }}"
+          runbook: docs/runbook.md
+
+      - alert: HighFailureRate
+        expr: |
+          sum by (channel) (rate(notifications_failed_total[5m]))
+            / (sum by (channel) (rate(notifications_sent_total[5m])) + sum by (channel) (rate(notifications_failed_total[5m])))
+          > 0.10
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.channel }}: {{ $value | humanizePercentage }} of deliveries failing"
+          runbook: docs/runbook.md
+
+      - alert: CircuitBreakerOpen
+        # 2 = open. Notifications wait without spending attempts, but nothing
+        # goes out on this channel.
+        expr: max by (channel) (circuit_breaker_state) == 2
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.channel }}: provider failing, deliveries paused for over 2 minutes"
+          runbook: docs/runbook.md
+
+      - alert: OutboxLagging
+        # Events not reaching the stream: WebSocket clients and callbacks
+        # are behind. Usually Redis is down or no worker is running.
+        expr: max(outbox_lag_seconds) > 30
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Outbox events are {{ $value | humanizeDuration }} behind"
+          runbook: docs/runbook.md
+
+      - alert: RateLimiterFallback
+        expr: max(rate_limiter_fallback_active) == 1
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Redis unreachable: workers use the local rate limiter (rate / expected instances)"

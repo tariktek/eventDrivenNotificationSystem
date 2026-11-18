@@ -29,9 +29,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/breaker"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/metrics"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/provider"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/queue"
@@ -73,7 +78,8 @@ type Deps struct {
 	Limiter  ratelimit.Limiter
 	Sender   provider.Sender
 	Policy   retry.Policy
-	Notifier Notifier // optional
+	Notifier Notifier         // optional
+	Metrics  *metrics.Metrics // optional
 	Log      *slog.Logger
 	Now      func() time.Time
 }
@@ -94,6 +100,9 @@ func New(cfg Config, d Deps) *Worker {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
+	if d.Metrics == nil {
+		d.Metrics = metrics.New() // a private registry nobody scrapes: no nil checks below
+	}
 	if cfg.Breaker == (breaker.Config{}) {
 		cfg.Breaker = breaker.DefaultConfig()
 	}
@@ -105,8 +114,10 @@ func New(cfg Config, d Deps) *Worker {
 	}
 	for _, ch := range cfg.Channels {
 		w.wake[ch] = make(chan struct{}, 1)
+		w.Metrics.BreakerState.WithLabelValues(string(ch)).Set(0)
 		w.breakers[ch] = breaker.New(string(ch), cfg.Breaker, func(from, to breaker.State) {
 			w.Log.Warn("circuit breaker state changed", "channel", ch, "from", from, "to", to)
+			w.Metrics.BreakerState.WithLabelValues(string(ch)).Set(breakerValue(to))
 		})
 	}
 	return w
@@ -275,13 +286,29 @@ func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, a
 
 	// Not sent yet when shutdown begins or the breaker opens while this
 	// delivery waited for its slot: give it back untouched.
+	w.Metrics.RateLimitWait.WithLabelValues(string(n.Channel)).Observe(max(0, time.Until(at)).Seconds())
 	if !sleep(ctx, time.Until(at)) || ticket.Open() {
 		ticket.Skip()
 		w.release(logCtx, []uuid.UUID{n.ID})
 		return
 	}
 
-	res := w.Sender.Send(sendCtx, &provider.Message{
+	// One trace per delivery attempt. It links to the API request that
+	// created the notification rather than joining its trace: the delivery
+	// happens later, maybe many times, as separate work.
+	logCtx, span := tracer.Start(logCtx, "deliver notification",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithLinks(observability.LinkFrom(logCtx, n.TraceParent)...),
+		trace.WithAttributes(
+			attribute.String("notification.id", n.ID.String()),
+			attribute.String("notification.channel", string(n.Channel)),
+			attribute.String("notification.priority", string(n.Priority)),
+			attribute.Int("notification.attempt", n.Attempts),
+			attribute.String("correlation_id", n.CorrelationID),
+		))
+	defer span.End()
+
+	res := w.Sender.Send(logCtx, &provider.Message{
 		NotificationID: n.ID,
 		Channel:        n.Channel,
 		To:             n.Recipient,
@@ -289,6 +316,7 @@ func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, a
 		Content:        n.Content,
 		CorrelationID:  n.CorrelationID,
 	})
+	w.Metrics.ProviderDuration.WithLabelValues(string(n.Channel), metrics.StatusClass(res.StatusCode)).Observe(res.Duration.Seconds())
 	switch {
 	case sendCtx.Err() != nil:
 		ticket.Skip() // cut off by shutdown; says nothing about the provider
@@ -301,6 +329,14 @@ func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, a
 	}
 	now := w.Now()
 	verdict := w.Policy.Decide(n, &res, now)
+	span.SetAttributes(
+		attribute.String("delivery.outcome", string(res.Outcome)),
+		attribute.String("delivery.next_status", string(verdict.Status)),
+		attribute.Int("http.response.status_code", res.StatusCode),
+	)
+	if res.Outcome != domain.OutcomeSuccess {
+		span.SetStatus(codes.Error, res.ErrorCode)
+	}
 
 	applied, err := w.Queue.Complete(logCtx, &queue.Completion{
 		NotificationID: n.ID,
@@ -327,8 +363,14 @@ func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, a
 	case !applied:
 		log.WarnContext(logCtx, "lease lost before the outcome was recorded", "outcome", res.Outcome)
 	case verdict.Status == domain.StatusSent:
+		start := n.CreatedAt
+		if n.ScheduledAt != nil {
+			start = *n.ScheduledAt
+		}
+		w.Metrics.DeliveryLatency.WithLabelValues(string(n.Channel), string(n.Priority)).Observe(now.Sub(start).Seconds())
 		log.DebugContext(logCtx, "notification sent", "provider_message_id", res.MessageID, "duration_ms", res.Duration.Milliseconds())
 	case verdict.Status == domain.StatusPending:
+		w.Metrics.Retries.WithLabelValues(string(n.Channel)).Inc()
 		log.InfoContext(logCtx, "delivery failed, will retry",
 			"error_code", res.ErrorCode, "retry_at", verdict.NextAttemptAt)
 	default:
@@ -374,9 +416,23 @@ func (w *Worker) reap(ctx context.Context) {
 		case err != nil && ctx.Err() == nil:
 			w.Log.ErrorContext(ctx, "reap expired leases", "error", err)
 		case res.Requeued > 0 || res.Failed > 0:
+			w.Metrics.LeaseExpired.Add(float64(res.Requeued + res.Failed))
 			w.Log.WarnContext(ctx, "recovered notifications from expired leases",
 				"requeued", res.Requeued, "failed_no_attempts_left", res.Failed)
 		}
+	}
+}
+
+var tracer = otel.Tracer("github.com/tariktek/eventDrivenNotificationSystem/internal/worker")
+
+func breakerValue(s breaker.State) float64 {
+	switch s {
+	case breaker.StateHalfOpen:
+		return 1
+	case breaker.StateOpen:
+		return 2
+	default:
+		return 0
 	}
 }
 

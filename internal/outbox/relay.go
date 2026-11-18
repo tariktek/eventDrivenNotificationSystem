@@ -39,6 +39,9 @@ type Config struct {
 	// Retention is how long published events are kept in the table.
 	Retention     time.Duration
 	PruneInterval time.Duration
+	// OnPublished, if set, sees every batch after it is committed as
+	// published (e.g. to count status transitions).
+	OnPublished func([]events.Event)
 }
 
 // Relay publishes outbox events.
@@ -81,7 +84,7 @@ func (r *Relay) Run(ctx context.Context) {
 // RelayOnce runs one round and returns how many events it published
 // (0 also when another relay holds the lock).
 func (r *Relay) RelayOnce(ctx context.Context) (int, error) {
-	published := 0
+	var published []events.Event
 	err := r.store.InTx(ctx, func(repo *postgres.Repo) error {
 		leader, err := repo.TryOutboxLock(ctx)
 		if err != nil || !leader {
@@ -101,10 +104,13 @@ func (r *Relay) RelayOnce(ctx context.Context) (int, error) {
 		if err := repo.MarkEventsPublished(ctx, ids, r.now()); err != nil {
 			return err
 		}
-		published = len(evs)
+		published = evs
 		return nil
 	})
-	return published, err
+	if err == nil && len(published) > 0 && r.cfg.OnPublished != nil {
+		r.cfg.OnPublished(published)
+	}
+	return len(published), err
 }
 
 // prune deletes published events past retention, in chunks.

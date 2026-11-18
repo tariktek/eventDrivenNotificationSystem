@@ -11,7 +11,13 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/metrics"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/retry"
 )
@@ -66,6 +72,7 @@ type DispatcherConfig struct {
 	// exceed the client timeout.
 	Lease        time.Duration
 	PollInterval time.Duration
+	Metrics      *metrics.Metrics // optional
 }
 
 // Dispatcher sends due callbacks.
@@ -79,6 +86,9 @@ type Dispatcher struct {
 
 // NewDispatcher returns a Dispatcher.
 func NewDispatcher(store *postgres.Store, cfg DispatcherConfig, log *slog.Logger) *Dispatcher {
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.New()
+	}
 	return &Dispatcher{store: store, cfg: cfg, client: NewHTTPClient(cfg.Client), log: log, now: time.Now}
 }
 
@@ -145,6 +155,15 @@ func (d *Dispatcher) fail(ctx context.Context, what string, err error) {
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, cb *postgres.CallbackDelivery) {
+	ctx, span := tracer.Start(ctx, "deliver callback",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("notification.id", cb.NotificationID.String()),
+			attribute.Int64("event.id", cb.EventID),
+			attribute.String("event.type", cb.EventType),
+			attribute.Int("callback.attempt", cb.Attempts),
+		))
+	defer span.End()
 	log := d.log.With("notification_id", cb.NotificationID, "event_id", cb.EventID, "attempt", cb.Attempts)
 	res := Post(ctx, d.client, d.cfg.Client, d.cfg.Secret,
 		Request{URL: cb.URL, EventID: cb.EventID, EventType: cb.EventType, Body: cb.Payload}, d.now())
@@ -162,6 +181,13 @@ func (d *Dispatcher) deliver(ctx context.Context, cb *postgres.CallbackDelivery)
 		out.Status = postgres.CallbackFailed
 		out.Error = truncate(res.Err.Error())
 	}
+	if res.Err != nil {
+		span.SetStatus(codes.Error, truncate(res.Err.Error()))
+	}
+	result := map[string]string{
+		postgres.CallbackDelivered: "delivered", postgres.CallbackPending: "retry", postgres.CallbackFailed: "failed",
+	}[out.Status]
+	d.cfg.Metrics.CallbackDeliveries.WithLabelValues(result).Inc()
 	applied, err := d.store.FinishCallback(ctx, cb, out)
 	switch {
 	case err != nil:
@@ -176,6 +202,8 @@ func (d *Dispatcher) deliver(ctx context.Context, cb *postgres.CallbackDelivery)
 		log.WarnContext(ctx, "callback failed permanently", "error", out.Error, "status_code", res.StatusCode)
 	}
 }
+
+var tracer = otel.Tracer("github.com/tariktek/eventDrivenNotificationSystem/internal/callback")
 
 // truncate makes an error message safe to store: at most 500 bytes, cut
 // on a character boundary, valid UTF-8 and free of NUL. PostgreSQL rejects
