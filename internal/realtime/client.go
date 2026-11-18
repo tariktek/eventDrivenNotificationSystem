@@ -172,6 +172,10 @@ type client struct {
 
 	send   chan []byte
 	cancel context.CancelCauseFunc
+	// abortWrites cuts off a write in progress. Only for a client that is
+	// too slow: at shutdown the current write is let finish so the close
+	// handshake (1001) can follow it.
+	abortWrites context.CancelFunc
 }
 
 // errTooSlow and errShutdown are why a connection was closed by us.
@@ -192,6 +196,7 @@ func (c *client) enqueue(msg []byte) {
 	case c.send <- msg:
 	default:
 		c.cancel(errTooSlow)
+		c.abortWrites()
 	}
 }
 
@@ -224,10 +229,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stop := context.AfterFunc(h.Shutdown, func() { cancel(errShutdown) }) //nolint:contextcheck // server lifetime, deliberately not the request
 	defer stop()
 
+	writeCtx, abortWrites := context.WithCancel(context.WithoutCancel(ctx))
+	defer abortWrites()
 	c := &client{
-		sub:    subscription{Notifications: map[uuid.UUID]struct{}{}, Batches: map[uuid.UUID]struct{}{}, Channels: map[domain.Channel]struct{}{}},
-		send:   make(chan []byte, h.Hub.cfg.BufferSize),
-		cancel: cancel,
+		sub:         subscription{Notifications: map[uuid.UUID]struct{}{}, Batches: map[uuid.UUID]struct{}{}, Channels: map[domain.Channel]struct{}{}},
+		send:        make(chan []byte, h.Hub.cfg.BufferSize),
+		cancel:      cancel,
+		abortWrites: abortWrites,
 	}
 	if err := c.sub.apply(initial); err != nil {
 		h.Errors(w, r, apierror.New(http.StatusBadRequest, api.ErrorCodeBadRequest, err.Error()))
@@ -265,7 +273,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	c.reply()
 	go c.readLoop(ioCtx, conn)
-	reason := c.writeLoop(ctx, ioCtx, conn)
+	reason := c.writeLoop(ctx, writeCtx, ioCtx, conn)
 	h.Hub.remove(c) // stop routing events to it while the close handshake runs
 
 	switch {
@@ -282,7 +290,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // writeLoop sends queued messages and pings until the connection ends,
 // and returns why it ended.
-func (c *client) writeLoop(ctx, ioCtx context.Context, conn *websocket.Conn) error {
+func (c *client) writeLoop(ctx, writeCtx, ioCtx context.Context, conn *websocket.Conn) error {
 	ping := time.NewTicker(pingInterval)
 	defer ping.Stop()
 	for {
@@ -290,10 +298,13 @@ func (c *client) writeLoop(ctx, ioCtx context.Context, conn *websocket.Conn) err
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		case msg := <-c.send:
-			// Derived from ctx, not ioCtx: if the client is dropped while
-			// this write is blocked (its TCP buffer is full), abort at once.
-			// No close frame can get through to it anyway.
-			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+			// If the client is dropped as too slow while this write is
+			// blocked (its TCP buffer is full), abort at once: no close
+			// frame could get through anyway. Shutdown does not abort it:
+			// coder/websocket closes the connection when a write's context
+			// ends, even one that has just completed, which would replace
+			// the 1001 close handshake with a dropped connection.
+			wctx, cancel := context.WithTimeout(writeCtx, writeTimeout)
 			err := conn.Write(wctx, websocket.MessageText, msg)
 			cancel()
 			if err != nil {

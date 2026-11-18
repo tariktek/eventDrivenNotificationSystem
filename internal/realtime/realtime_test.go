@@ -242,7 +242,7 @@ func TestShutdownClosesWithGoingAway(t *testing.T) {
 	defer cancel()
 	_, _, err := c.Read(ctx)
 	require.Error(t, err)
-	assert.Equal(t, websocket.StatusGoingAway, websocket.CloseStatus(err))
+	assert.Equal(t, websocket.StatusGoingAway, websocket.CloseStatus(err), "err: %v", err)
 	waitClients(t, s, 0)
 }
 
