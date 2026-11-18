@@ -9,7 +9,7 @@ info:
     Creating a notification only stores it and returns immediately (`201`).
     Workers deliver it asynchronously, at most **100 messages per second per
     channel**, highest priority first. Track progress with `GET` requests,
-    the WebSocket stream (`GET /ws`) or a per-notification `callback_url`.
+    the WebSocket stream (`GET /api/v1/ws`) or a per-notification `callback_url`.
 
     ## Authentication
     Every `/api/v1` endpoint requires an `X-API-Key` header. With the local
@@ -37,9 +37,11 @@ info:
     the provider call; one is generated if absent and is always echoed back.
 
     ## Real-time updates (WebSocket)
-    `GET /ws` upgrades to a WebSocket. After connecting, send
-    `{"action":"subscribe","notification_ids":[...],"batch_ids":[...]}` to
-    receive `notification.status_changed` and `batch.completed` events.
+    `GET /api/v1/ws` upgrades to a WebSocket. Choose notifications, batches
+    or channels in the query string, or later with
+    `{"action":"subscribe","notification_ids":[...],"batch_ids":[...],"channels":[...]}`,
+    to receive `notification.created`, `notification.status_changed` and
+    `batch.completed` events. See that operation for the full protocol.
   contact:
     name: Tarık Tek
 
