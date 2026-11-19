@@ -34,10 +34,16 @@ wait in the worker (leases kept alive) for the next reservation.
 
 ## Consequences
 
-- Sends leave exactly 10 ms apart. At the receiver, network jitter can
-  shift arrivals by a few milliseconds: the busiest calendar second
-  measured 101–103 at a limit of 100. A provider that enforces its limit
-  strictly on arrival should get headroom (`WORKER_RATE_LIMIT=95`).
+- Sends leave exactly 1/rate apart. At the receiver, network jitter can
+  shift arrivals by a few milliseconds: sending at 100/s, the busiest
+  calendar second measured 101–103. The requirement counts at the
+  provider, so the default rate is 95/s: 5% headroom for that jitter.
+  Checked with no tolerance by `TestWorker_ProviderNeverSeesMoreThan100PerSecond`
+  (busiest sliding second: 96) and by the k6 thresholds.
+- When a worker switches between the shared and the local limiter (Redis
+  lost or back), it first lets the slots it holds on the old timeline run
+  out, so the two timelines never overlap. The local share's horizon is
+  widened to fit at least one of its (longer) intervals.
 - Smooth pacing rather than bursts: GCRA does not allow saving up unused
   capacity.
 - A Redis outage degrades accuracy (the fallback assumes the configured

@@ -28,14 +28,19 @@ Measured on a laptop (12 cores, Docker Desktop on Windows, 7.7 GB VM).
 | Scenario | Result |
 |---|---|
 | Steady, 150/s | Create latency **p50 24 ms, p95 70 ms, p99 122 ms**; 17,984 delivered, 0 failed, 0 duplicates |
-| Flash sale, 50,000 | Batch create p99 **393 ms**; all delivered in **188 s** (~90/s per channel, limit 100); busiest second per channel **101–103**; 0 failed, 0 duplicates |
+| Flash sale, 50,000 | Batch create p99 **393 ms**; all delivered in **188 s** (~90/s per channel); busiest second per channel **101–103** while sending at 100/s (see below); 0 failed, 0 duplicates |
 | Provider failing 25% | 5,998 created, **5,993 delivered**, 1,879 retried calls; **5 dead-lettered** after 5 attempts (expected: 0.25⁵ × 6,000 ≈ 6); 0 duplicates |
 
-The busiest second can read slightly above 100: sends leave exactly 10 ms
-apart, but arrival times at the receiver carry network jitter, and the
-mock counts per calendar second. For a provider that enforces its limit
-strictly on arrival, run the workers a little below it
-(`WORKER_RATE_LIMIT=95`).
+Those runs sent at 100/s, and the busiest second at the provider read
+101–103: sends leave exactly 10 ms apart, but arrival times carry network
+jitter, and the mock counts per calendar second. The requirement is "at
+most 100", counted where the provider counts. So the workers now send at
+**95/s by default** (`WORKER_RATE_LIMIT`), and the threshold in
+[`lib.js`](lib.js) is the requirement itself: any second over 100 at the
+provider fails the run, with no tolerance. The same is checked in the Go
+suite on every run: `TestWorker_ProviderNeverSeesMoreThan100PerSecond`
+(two workers at the default rate, every sliding one-second window at the
+provider; busiest measured: 96).
 
 ## What the load tests found
 

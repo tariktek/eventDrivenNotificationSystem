@@ -7,7 +7,10 @@ import { Trend, Gauge } from 'k6/metrics';
 export const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
 export const MOCK_URL = __ENV.MOCK_URL || 'http://localhost:9000';
 const API_KEY = __ENV.API_KEY || 'dev-api-key-change-me';
-const RATE_LIMIT = Number(__ENV.RATE_LIMIT || 100); // WORKER_RATE_LIMIT
+const RATE_LIMIT = Number(__ENV.RATE_LIMIT || 95); // WORKER_RATE_LIMIT
+// The requirement: the provider never receives more than 100 messages in a
+// second on a channel. Checked as stated, with no tolerance.
+const PROVIDER_LIMIT = 100;
 
 export const headers = { 'Content-Type': 'application/json', 'X-API-Key': API_KEY };
 export const CHANNELS = ['sms', 'email', 'push'];
@@ -87,7 +90,7 @@ export function report(name, expected, startMs) {
   expected notifications : ${expected === null ? '-' : expected}
   provider accepted      : ${s.accepted} (received ${s.received}, so ${s.received - s.accepted} retried or rejected calls)
   duplicates             : ${s.duplicates}
-  busiest second/channel : ${JSON.stringify(s.max_per_second)} (limit ${RATE_LIMIT}/s)
+  busiest second/channel : ${JSON.stringify(s.max_per_second)} (provider limit ${PROVIDER_LIMIT}/s, sending at ${RATE_LIMIT}/s)
   failed (dead letter)   : ${nFailed}
   latency (last 15 min)  : p50 ${m.latency.all.p50_seconds.toFixed(2)}s  p95 ${m.latency.all.p95_seconds.toFixed(2)}s  p99 ${m.latency.all.p99_seconds.toFixed(2)}s
   everything delivered in: ${((Date.now() - startMs) / 1000).toFixed(1)}s\n`);
@@ -97,10 +100,10 @@ export function report(name, expected, startMs) {
 // Sends leave exactly 1/RATE_LIMIT apart (the limiter's own tests prove
 // it), but arrival times at the receiver carry network jitter: under heavy
 // load a few requests from one second's edge land in the next, and the
-// mock counts per calendar second. Measured: 101-103 at a limit of 100.
-// A provider that enforces its limit strictly on arrival should get a
-// little headroom (WORKER_RATE_LIMIT=95).
+// mock counts per calendar second. Sending at 100/s, the busiest second
+// measured 101-103; the default of 95/s leaves room for that jitter, and
+// the threshold is the provider's limit itself.
 export const providerThresholds = {
-  provider_max_per_second: [`value<=${Math.ceil(RATE_LIMIT * 1.05)}`],
+  provider_max_per_second: [`value<=${PROVIDER_LIMIT}`],
   provider_duplicates: ['value==0'],
 };
