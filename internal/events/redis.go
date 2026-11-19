@@ -27,7 +27,9 @@ func NewPublisher(rdb redis.UniversalClient, stream string, maxLen int64) *Publi
 
 // Publish appends events in order, in one round trip. On error some of
 // them may have been appended; the relay then publishes them all again
-// and consumers deduplicate by Event.ID.
+// and consumers deduplicate by Event.ID: the callback enqueuer through a
+// unique key on it, the WebSocket hub per aggregate (realtime.dedup).
+// Tail itself passes on whatever is in the stream.
 func (p *Publisher) Publish(ctx context.Context, evs []Event) error {
 	_, err := p.rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		for i := range evs {
@@ -137,10 +139,28 @@ func NewGroup(rdb redis.UniversalClient, cfg GroupConfig) *Group {
 // Ensure creates the consumer group if it does not exist. A new group
 // starts at the end of the stream: deploying a new consumer must not act on
 // history (a new callback group would otherwise call clients back about
-// notifications that finished days ago). Call Ensure before publishing
-// starts, so the first events after a deployment are not missed.
+// notifications that finished days ago). Publishing must wait until Ensure
+// succeeded, or the first events after a deployment are missed for good;
+// WaitEnsured does that.
 func (g *Group) Ensure(ctx context.Context) error {
-	err := g.rdb.XGroupCreateMkStream(ctx, g.cfg.Stream, g.cfg.Group, "$").Err()
+	return g.ensure(ctx, "$")
+}
+
+// WaitEnsured retries Ensure until it succeeds or ctx is done, and reports
+// whether it succeeded.
+func (g *Group) WaitEnsured(ctx context.Context) bool {
+	for ctx.Err() == nil {
+		err := g.Ensure(ctx)
+		if err == nil {
+			return true
+		}
+		g.fail(ctx, "create consumer group; publishing waits for it", err)
+	}
+	return false
+}
+
+func (g *Group) ensure(ctx context.Context, start string) error {
+	err := g.rdb.XGroupCreateMkStream(ctx, g.cfg.Stream, g.cfg.Group, start).Err()
 	if err != nil && !strings.HasPrefix(err.Error(), "BUSYGROUP") {
 		return fmt.Errorf("create consumer group %s: %w", g.cfg.Group, err)
 	}
@@ -151,18 +171,25 @@ func (g *Group) Ensure(ctx context.Context) error {
 // nil. An event whose handle failed stays pending and is retried after
 // MinIdle, by this or another consumer, as is one whose consumer died.
 // Run returns when ctx is done.
+//
+// If Redis loses the group while Run is running (a restart without
+// persistence, a deleted stream), Run recreates it at the start of the
+// stream, not the end: whatever the stream holds then was published after
+// the loss and was never consumed. Handlers must tolerate seeing an event
+// again (they do: at-least-once), not missing one.
 func (g *Group) Run(ctx context.Context, handle func(context.Context, Event) error) {
 	var (
 		nextClaim time.Time
 		ensured   bool
+		start     = "$" // first creation: skip history; recreation: see above
 	)
 	for ctx.Err() == nil {
 		if !ensured {
-			if err := g.Ensure(ctx); err != nil {
+			if err := g.ensure(ctx, start); err != nil {
 				g.fail(ctx, "ensure consumer group", err)
 				continue
 			}
-			ensured = true
+			ensured, start = true, "0"
 		}
 		if time.Now().After(nextClaim) {
 			if err := g.claimStale(ctx, handle); err != nil {

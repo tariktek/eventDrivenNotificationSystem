@@ -212,14 +212,17 @@ func run() error {
 	// If either part fails (e.g. the ops port is taken), stop the other too
 	// rather than run half alive.
 	g, gctx := errgroup.WithContext(ctx)
-	// Create the callback group before this worker's relay publishes, so a
-	// first deployment does not skip the first events. If Redis is down,
-	// the consumer retries on its own.
-	if err := callbackEvents.Ensure(ctx); err != nil {
-		log.Warn("create callback consumer group; will retry", "error", err)
-	}
+	// The relay publishes only once the callback group exists: a group
+	// created later starts at the end of the stream and would never see the
+	// events published before it, so their callbacks would be lost. If
+	// Redis is down at startup, events simply wait in the outbox meanwhile.
 	g.Go(func() error { return w.Run(gctx) })
-	g.Go(func() error { relay.Run(gctx); return nil })
+	g.Go(func() error {
+		if callbackEvents.WaitEnsured(gctx) {
+			relay.Run(gctx)
+		}
+		return nil
+	})
 	g.Go(func() error { callbackEvents.Run(gctx, enqueuer.Handle); return nil })
 	g.Go(func() error { callbacks.Run(gctx); return nil })
 	g.Go(func() error {
