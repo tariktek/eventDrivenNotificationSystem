@@ -188,7 +188,12 @@ func (d *Dispatcher) deliver(ctx context.Context, cb *postgres.CallbackDelivery)
 		postgres.CallbackDelivered: "delivered", postgres.CallbackPending: "retry", postgres.CallbackFailed: "failed",
 	}[out.Status]
 	d.cfg.Metrics.CallbackDeliveries.WithLabelValues(result).Inc()
-	applied, err := d.store.FinishCallback(ctx, cb, out)
+	// ctx is detached from shutdown (an attempt that reached the receiver
+	// must be recorded), so bound the write itself: a stuck database must
+	// not keep the worker from shutting down.
+	recCtx, cancel := context.WithTimeout(ctx, recordTimeout)
+	defer cancel()
+	applied, err := d.store.FinishCallback(recCtx, cb, out)
 	switch {
 	case err != nil:
 		log.ErrorContext(ctx, "record callback outcome; it will be retried after the lease", "error", err)
@@ -204,6 +209,10 @@ func (d *Dispatcher) deliver(ctx context.Context, cb *postgres.CallbackDelivery)
 }
 
 var tracer = otel.Tracer("github.com/tariktek/eventDrivenNotificationSystem/internal/callback")
+
+// recordTimeout bounds recording one callback outcome. If it runs out, the
+// claim's lease expires and the callback is sent again (at least once).
+const recordTimeout = 5 * time.Second
 
 // truncate makes an error message safe to store: at most 500 bytes, cut
 // on a character boundary, valid UTF-8 and free of NUL. PostgreSQL rejects

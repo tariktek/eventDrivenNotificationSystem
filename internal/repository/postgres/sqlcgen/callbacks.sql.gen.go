@@ -18,6 +18,9 @@ SET attempts = c.attempts + 1, next_attempt_at = $1
 WHERE c.id IN (
     SELECT d.id FROM callback_deliveries d
     WHERE d.status = 'pending' AND d.next_attempt_at <= $2 AND d.attempts < $3
+      AND NOT EXISTS (
+          SELECT 1 FROM callback_deliveries e
+          WHERE e.notification_id = d.notification_id AND e.status = 'pending' AND e.event_id < d.event_id)
     ORDER BY d.next_attempt_at
     LIMIT $4
     FOR UPDATE SKIP LOCKED
@@ -45,6 +48,13 @@ type ClaimCallbacksRow struct {
 // Claim due callbacks. Pushing next_attempt_at forward by the lease hides
 // them from other dispatchers; if this one dies, they become due again
 // when the lease runs out. attempts doubles as the fencing token.
+//
+// One notification's callbacks go out in event order: a callback is not
+// claimed while an earlier one of the same notification is still pending
+// (being sent or waiting for a retry). Otherwise a failed callback waiting
+// for its retry could reach the client after the sent callback of a
+// successful redrive, and the client would move the notification back to
+// failed. A callback that gave up (failed) no longer holds the next one.
 func (q *Queries) ClaimCallbacks(ctx context.Context, arg ClaimCallbacksParams) ([]ClaimCallbacksRow, error) {
 	rows, err := q.db.Query(ctx, claimCallbacks,
 		arg.LeaseUntil,
