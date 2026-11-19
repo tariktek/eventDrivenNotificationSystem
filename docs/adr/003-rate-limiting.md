@@ -19,7 +19,10 @@ share the key per channel, so the spacing holds across instances.
 
 If Redis is unreachable, each worker falls back to a local limiter at
 `rate / WORKER_EXPECTED_INSTANCES` and reports itself degraded; it retries
-Redis every few seconds.
+Redis every few seconds. Each Redis call is bounded at 250 ms: an outage
+does not fail fast (with Redis stopped, the client retried its dials for
+79 s, and the channel sent nothing meanwhile). Bounded, 30 SMS went out
+in under 2 s with Redis down.
 
 **Order of operations: claim, then reserve.** The first version reserved
 slots and then claimed that many notifications. Under load a claim took

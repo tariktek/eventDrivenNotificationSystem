@@ -163,6 +163,30 @@ func TestFallback(t *testing.T) {
 	assert.False(t, f.Degraded())
 }
 
+// hangingLimiter is Redis as an outage really looks: the client retries its
+// dials and answers only when the context gives up, not at once like
+// flakyLimiter. Measured with go-redis defaults and Redis stopped: 79 s.
+type hangingLimiter struct{}
+
+func (hangingLimiter) Reserve(ctx context.Context, _ string, _ int) (ratelimit.Reservation, error) {
+	<-ctx.Done()
+	return ratelimit.Reservation{}, ctx.Err()
+}
+
+func TestFallback_SlowOutageFallsBackWithinTimeout(t *testing.T) {
+	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
+		Primary: hangingLimiter{}, Rate: cfg, Instances: 1, RetryEvery: time.Second,
+		Timeout: 50 * time.Millisecond,
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	start := time.Now()
+	r, err := f.Reserve(t.Context(), "sms", 1)
+	require.NoError(t, err, "a hanging Redis must not stop deliveries")
+	assert.Less(t, time.Since(start), time.Second, "falls back after the timeout, not after the client gives up")
+	assert.Equal(t, 1, r.Count)
+	assert.True(t, f.Degraded())
+}
+
 func TestFallback_CancelledContextIsNotAnOutage(t *testing.T) {
 	primary := &cancelledLimiter{}
 	f := ratelimit.NewFallback(ratelimit.FallbackConfig{

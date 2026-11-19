@@ -13,12 +13,17 @@ import (
 // exceeding the provider's limit. After a failure, the shared limiter is
 // retried only every RetryEvery, so an outage does not add a connection
 // timeout to every reservation.
+//
+// Each call to the shared limiter is bounded by Timeout. An outage rarely
+// fails fast: with Redis stopped, the client retried its dials for 79 s
+// before returning an error, and the channel sent nothing meanwhile.
 type Fallback struct {
 	primary    Limiter
 	local      Limiter
 	log        *slog.Logger
 	now        func() time.Time
 	retryEvery time.Duration
+	timeout    time.Duration
 
 	mu        sync.Mutex
 	downUntil time.Time
@@ -34,13 +39,23 @@ type FallbackConfig struct {
 	Log       *slog.Logger
 	// RetryEvery is how long to stay on the local limiter after a failure.
 	RetryEvery time.Duration
-	Now        func() time.Time
+	// Timeout bounds each call to the shared limiter (default
+	// DefaultFallbackTimeout); a slower answer counts as a failure.
+	Timeout time.Duration
+	Now     func() time.Time
 }
+
+// DefaultFallbackTimeout is far above a healthy Redis round trip (about a
+// millisecond) and short enough that an outage barely pauses deliveries.
+const DefaultFallbackTimeout = 250 * time.Millisecond
 
 // NewFallback wraps a shared limiter with a local safety net.
 func NewFallback(c FallbackConfig) *Fallback {
 	if c.Now == nil {
 		c.Now = time.Now
+	}
+	if c.Timeout <= 0 {
+		c.Timeout = DefaultFallbackTimeout
 	}
 	share := c.Rate
 	share.Rate = max(c.Rate.Rate/max(c.Instances, 1), 1)
@@ -50,13 +65,16 @@ func NewFallback(c FallbackConfig) *Fallback {
 		log:        c.Log,
 		now:        c.Now,
 		retryEvery: c.RetryEvery,
+		timeout:    c.Timeout,
 	}
 }
 
 // Reserve implements Limiter. It only fails if ctx is done.
 func (f *Fallback) Reserve(ctx context.Context, key string, n int) (Reservation, error) {
 	if !f.useLocal() {
-		res, err := f.primary.Reserve(ctx, key, n)
+		pctx, cancel := context.WithTimeout(ctx, f.timeout)
+		res, err := f.primary.Reserve(pctx, key, n)
+		cancel()
 		if err == nil {
 			f.recovered()
 			return res, nil
