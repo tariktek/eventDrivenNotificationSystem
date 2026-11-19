@@ -205,3 +205,80 @@ type cancelledLimiter struct{}
 func (cancelledLimiter) Reserve(ctx context.Context, _ string, _ int) (ratelimit.Reservation, error) {
 	return ratelimit.Reservation{}, ctx.Err()
 }
+
+// TestFallback_SwitchWaitsForTheOtherTimeline: slots handed out on one
+// timeline are still to be used when the other limiter takes over.
+// Reserving on the new timeline at once would put both sets of sends in
+// the same second, over the rate.
+func TestFallback_SwitchWaitsForTheOtherTimeline(t *testing.T) {
+	clk := newClock()
+	primary := &stubLimiter{}
+	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
+		Primary: primary, Rate: cfg, Instances: 1, RetryEvery: 5 * time.Second, Now: clk.now,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	// A full second of shared slots, then Redis goes down.
+	r, err := f.Reserve(t.Context(), "sms", 100)
+	require.NoError(t, err)
+	require.Equal(t, 100, r.Count)
+	primary.down = true
+
+	r, err = f.Reserve(t.Context(), "sms", 100)
+	require.NoError(t, err)
+	assert.Zero(t, r.Count, "the shared slots have not run out: no local ones yet")
+	assert.Equal(t, time.Second, r.First, "wait until they have")
+	assert.True(t, f.Degraded())
+
+	clk.advance(time.Second)
+	r, err = f.Reserve(t.Context(), "sms", 100)
+	require.NoError(t, err)
+	assert.Equal(t, 100, r.Count, "now the local timeline takes over")
+
+	// Redis is back: the local slots run out first, then shared ones.
+	primary.down = false
+	clk.advance(5 * time.Second)
+	r, err = f.Reserve(t.Context(), "sms", 50)
+	require.NoError(t, err)
+	assert.Equal(t, 50, r.Count, "local slots long passed: straight back to the shared limiter")
+	assert.False(t, f.Degraded())
+
+	primary.down = true
+	clk.advance(10 * time.Millisecond)
+	r, err = f.Reserve(t.Context(), "sms", 1)
+	require.NoError(t, err)
+	assert.Zero(t, r.Count)
+	assert.Equal(t, 490*time.Millisecond, r.First, "the rest of the 50 shared slots, then local")
+
+	r, err = f.Reserve(t.Context(), "email", 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, r.Count, "a key with nothing on the other timeline is not held up")
+}
+
+func TestLocalShare_HorizonFitsALocalSlot(t *testing.T) {
+	// 100/s with a 10 ms horizon fits one slot; split across two
+	// instances, 50/s needs 20 ms. Without widening, the fallback would
+	// grant nothing and the channel would stop during a Redis outage.
+	share := ratelimit.LocalShare(ratelimit.Config{Rate: 100, Horizon: 10 * time.Millisecond}, 2)
+	assert.Equal(t, 50, share.Rate)
+	assert.Equal(t, 20*time.Millisecond, share.Horizon)
+
+	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
+		Primary: &stubLimiter{down: true}, Rate: ratelimit.Config{Rate: 100, Horizon: 10 * time.Millisecond},
+		Instances: 2, RetryEvery: time.Second, Now: newClock().now,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	r, err := f.Reserve(t.Context(), "sms", 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, r.Count, "deliveries continue during the outage")
+}
+
+// stubLimiter grants every slot requested, 10 ms apart, while up.
+type stubLimiter struct{ down bool }
+
+func (s *stubLimiter) Reserve(_ context.Context, _ string, n int) (ratelimit.Reservation, error) {
+	if s.down {
+		return ratelimit.Reservation{}, errors.New("connection refused")
+	}
+	return ratelimit.Reservation{Count: n, Interval: 10 * time.Millisecond}, nil
+}

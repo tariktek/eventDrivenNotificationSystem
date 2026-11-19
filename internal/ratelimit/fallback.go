@@ -17,6 +17,13 @@ import (
 // Each call to the shared limiter is bounded by Timeout. An outage rarely
 // fails fast: with Redis stopped, the client retried its dials for 79 s
 // before returning an error, and the channel sent nothing meanwhile.
+//
+// The two limiters keep separate timelines, and slots already handed out
+// on one are still to be used when the other takes over. Granting slots on
+// the new timeline at once would let both sets of sends overlap and exceed
+// the rate. So when a key switches timelines, Fallback first lets the
+// slots it reserved on the previous one run out (it returns no slots and
+// says how long to wait), then reserves on the new one.
 type Fallback struct {
 	primary    Limiter
 	local      Limiter
@@ -28,6 +35,14 @@ type Fallback struct {
 	mu        sync.Mutex
 	downUntil time.Time
 	degraded  bool
+	// reserved tracks, per key, which timeline its latest slots are on and
+	// when the last of them has passed.
+	reserved map[string]timeline
+}
+
+type timeline struct {
+	local bool
+	until time.Time
 }
 
 // FallbackConfig configures NewFallback.
@@ -57,26 +72,41 @@ func NewFallback(c FallbackConfig) *Fallback {
 	if c.Timeout <= 0 {
 		c.Timeout = DefaultFallbackTimeout
 	}
-	share := c.Rate
-	share.Rate = max(c.Rate.Rate/max(c.Instances, 1), 1)
 	return &Fallback{
 		primary:    c.Primary,
-		local:      NewLocal(share, c.Now),
+		local:      NewLocal(LocalShare(c.Rate, c.Instances), c.Now),
 		log:        c.Log,
 		now:        c.Now,
 		retryEvery: c.RetryEvery,
 		timeout:    c.Timeout,
+		reserved:   map[string]timeline{},
 	}
+}
+
+// LocalShare is the rate each of instances gets when they cannot share a
+// timeline: Rate / instances (at least 1/s). Its horizon is widened to fit
+// at least one of its slots: the horizon is sized for the full rate (10 ms
+// fits one slot at 100/s), and at 50/s a 20 ms slot would never fit, so the
+// fallback would grant nothing and the channel would stop.
+func LocalShare(full Config, instances int) Config {
+	share := full
+	share.Rate = max(full.Rate/max(instances, 1), 1)
+	share.Horizon = max(full.Horizon, share.interval())
+	return share
 }
 
 // Reserve implements Limiter. It only fails if ctx is done.
 func (f *Fallback) Reserve(ctx context.Context, key string, n int) (Reservation, error) {
 	if !f.useLocal() {
+		if wait := f.drain(key, false); wait > 0 {
+			return Reservation{First: wait}, nil
+		}
 		pctx, cancel := context.WithTimeout(ctx, f.timeout)
 		res, err := f.primary.Reserve(pctx, key, n)
 		cancel()
 		if err == nil {
 			f.recovered()
+			f.note(key, false, res)
 			return res, nil
 		}
 		if ctx.Err() != nil {
@@ -84,7 +114,41 @@ func (f *Fallback) Reserve(ctx context.Context, key string, n int) (Reservation,
 		}
 		f.failed(ctx, err)
 	}
-	return f.local.Reserve(ctx, key, n)
+	if wait := f.drain(key, true); wait > 0 {
+		return Reservation{First: wait}, nil
+	}
+	res, err := f.local.Reserve(ctx, key, n)
+	if err == nil {
+		f.note(key, true, res)
+	}
+	return res, err
+}
+
+// drain returns how long to wait before reserving on the local (or shared)
+// timeline, because slots this process got on the other one have not all
+// passed yet.
+func (f *Fallback) drain(key string, local bool) time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.reserved[key]
+	if !ok || t.local == local {
+		return 0
+	}
+	return max(t.until.Sub(f.now()), 0)
+}
+
+// note records slots just reserved on a timeline.
+func (f *Fallback) note(key string, local bool, res Reservation) {
+	if res.Count == 0 {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	until := f.now().Add(res.Delay(res.Count)) // one interval past the last slot
+	if t, ok := f.reserved[key]; ok && t.local == local && t.until.After(until) {
+		until = t.until
+	}
+	f.reserved[key] = timeline{local: local, until: until}
 }
 
 // Degraded reports whether the local fallback is in use.
