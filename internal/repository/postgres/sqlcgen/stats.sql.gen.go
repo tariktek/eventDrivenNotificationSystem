@@ -126,7 +126,7 @@ const queueDepth = `-- name: QueueDepth :many
 
 SELECT channel, priority, status, count(*)::bigint AS total,
        -- now when nothing is due: zero wait.
-       coalesce(min(next_attempt_at) FILTER (WHERE status = 'pending' AND next_attempt_at <= $1::timestamptz),
+       coalesce(min(next_attempt_at) FILTER (WHERE status IN ('pending', 'scheduled') AND next_attempt_at <= $1::timestamptz),
                 $1::timestamptz)::timestamptz AS oldest_due
 FROM notifications
 WHERE status IN ('pending', 'scheduled', 'processing')
@@ -143,9 +143,11 @@ type QueueDepthRow struct {
 
 // Aggregates for the metrics sampler. Run every few seconds, not per
 // request; each is an index range scan.
-// oldest_due is the earliest next_attempt_at among pending rows that are
-// already due: how long due work has been waiting. Future (backed-off or
-// scheduled) work is not "waiting".
+// oldest_due is the earliest next_attempt_at among queued rows that are
+// already due: how long due work has been waiting. That includes
+// scheduled rows whose time has come (they stay "scheduled" until a worker
+// claims them, so with the workers down they would otherwise never look
+// late). Future (backed-off or scheduled) work is not "waiting".
 func (q *Queries) QueueDepth(ctx context.Context, now time.Time) ([]QueueDepthRow, error) {
 	rows, err := q.db.Query(ctx, queueDepth, now)
 	if err != nil {

@@ -148,6 +148,9 @@ func (s *Sampler) Sample(ctx context.Context) (*Snapshot, error) {
 			q.OldestPendingAgeSeconds = max(q.OldestPendingAgeSeconds, now.Sub(r.OldestDue).Seconds())
 		case "scheduled":
 			q.Scheduled += r.Total
+			// A scheduled notification whose time has come waits like a
+			// pending one: it stays "scheduled" until a worker claims it.
+			q.OldestPendingAgeSeconds = max(q.OldestPendingAgeSeconds, now.Sub(r.OldestDue).Seconds())
 		case "processing":
 			q.Processing += r.Total
 		}
