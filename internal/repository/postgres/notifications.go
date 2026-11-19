@@ -18,7 +18,8 @@ import (
 type InsertResult struct {
 	Notification *domain.Notification
 	// Duplicate is true when a notification with the same idempotency key
-	// already existed; Notification is then the existing one.
+	// already existed for the same request; Notification is then the
+	// existing one.
 	Duplicate bool
 }
 
@@ -26,33 +27,39 @@ type InsertResult struct {
 // array per column and expanding them with unnest. Unlike COPY, it supports
 // ON CONFLICT, so a concurrent request with the same idempotency key makes
 // that row a no-op instead of failing the whole batch.
+//
+// Arrays are positional; the columns appended by later migrations
+// (request_hash) are listed with the rest, by name.
 const insertNotificationsSQL = `
 INSERT INTO notifications (
     id, batch_id, channel, priority, recipient, subject, content, segments,
     template_id, template_version, template_vars, status, idempotency_key,
     max_attempts, next_attempt_at, scheduled_at, callback_url, metadata,
-    correlation_id, trace_parent, created_at, updated_at)
+    correlation_id, trace_parent, created_at, updated_at, request_hash)
 SELECT
     t.id, t.batch_id, t.channel, t.priority, t.recipient, t.subject, t.content, t.segments,
     t.template_id, t.template_version, t.template_vars::jsonb, t.status, t.idempotency_key,
     t.max_attempts, t.next_attempt_at, t.scheduled_at, t.callback_url, t.metadata::jsonb,
-    t.correlation_id, t.trace_parent, t.created_at, t.created_at
+    t.correlation_id, t.trace_parent, t.created_at, t.created_at, t.request_hash
 FROM unnest(
     $1::uuid[], $2::uuid[], $3::text[], $4::smallint[], $5::text[], $6::text[], $7::text[], $8::smallint[],
     $9::uuid[], $10::int[], $11::text[], $12::text[], $13::text[],
     $14::int[], $15::timestamptz[], $16::timestamptz[], $17::text[], $18::text[],
-    $19::text[], $20::text[], $21::timestamptz[]
+    $19::text[], $20::text[], $21::timestamptz[], $22::text[]
 ) AS t(id, batch_id, channel, priority, recipient, subject, content, segments,
        template_id, template_version, template_vars, status, idempotency_key,
        max_attempts, next_attempt_at, scheduled_at, callback_url, metadata,
-       correlation_id, trace_parent, created_at)
+       correlation_id, trace_parent, created_at, request_hash)
 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 RETURNING *`
 
 // InsertNotifications stores notifications in one statement and reports,
 // in input order, whether each was created or already existed (same
-// idempotency key). Call it inside InTx together with InsertBatch so a
-// batch is all-or-nothing.
+// idempotency key, same request). A key that exists for a different
+// request (another RequestHash) is an *domain.IdempotencyKeyReusedError:
+// returning the other notification would silently drop this one. Call it
+// inside InTx, so that error leaves nothing behind and a batch is
+// all-or-nothing.
 func (r *Repo) InsertNotifications(ctx context.Context, ns []*domain.Notification) ([]InsertResult, error) {
 	if len(ns) == 0 {
 		return nil, nil
@@ -64,6 +71,7 @@ func (r *Repo) InsertNotifications(ctx context.Context, ns []*domain.Notificatio
 		channels, recipients, bodies = make([]string, n), make([]string, n), make([]string, n)
 		statuses, metadata           = make([]string, n), make([]string, n)
 		subjects, templateVars, keys = make([]*string, n), make([]*string, n), make([]*string, n)
+		requestHashes                = make([]*string, n)
 		callbacks, corrIDs, traces   = make([]*string, n), make([]*string, n), make([]*string, n)
 		priorities                   = make([]int16, n)
 		segments                     = make([]*int16, n)
@@ -103,7 +111,7 @@ func (r *Repo) InsertNotifications(ctx context.Context, ns []*domain.Notificatio
 		ids[i], batchIDs[i], templateIDs[i] = x.ID, x.BatchID, x.TemplateID
 		channels[i], recipients[i], bodies[i] = string(x.Channel), x.Recipient, x.Content
 		statuses[i], metadata[i] = string(x.Status), string(md)
-		subjects[i], keys[i] = nilIfZero(x.Subject), nilIfZero(x.IdempotencyKey)
+		subjects[i], keys[i], requestHashes[i] = nilIfZero(x.Subject), nilIfZero(x.IdempotencyKey), nilIfZero(x.RequestHash)
 		callbacks[i], corrIDs[i], traces[i] = nilIfZero(x.CallbackURL), nilIfZero(x.CorrelationID), nilIfZero(x.TraceParent)
 		priorities[i] = x.Priority.Rank()
 		segments[i] = nilIfZero(seg)
@@ -115,7 +123,7 @@ func (r *Repo) InsertNotifications(ctx context.Context, ns []*domain.Notificatio
 		ids, batchIDs, channels, priorities, recipients, subjects, bodies, segments,
 		templateIDs, templateVersions, templateVars, statuses, keys,
 		maxAttempts, nextAttempts, scheduled, callbacks, metadata,
-		corrIDs, traces, created)
+		corrIDs, traces, created, requestHashes)
 	if err != nil {
 		return nil, fmt.Errorf("insert notifications: %w", err)
 	}
@@ -156,6 +164,10 @@ func (r *Repo) InsertNotifications(ctx context.Context, ns []*domain.Notificatio
 		}
 		if row == nil {
 			return nil, fmt.Errorf("notification %s was neither inserted nor found", x.ID)
+		}
+		// Rows from before request hashes existed cannot be compared.
+		if dup && row.RequestHash != nil && x.RequestHash != "" && *row.RequestHash != x.RequestHash {
+			return nil, &domain.IdempotencyKeyReusedError{Index: i, Key: x.IdempotencyKey}
 		}
 		dn, err := toNotification(row)
 		if err != nil {

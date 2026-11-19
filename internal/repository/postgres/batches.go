@@ -2,12 +2,16 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/domain"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres/sqlcgen"
 )
 
@@ -85,4 +89,27 @@ func (r *Repo) BatchExists(ctx context.Context, id uuid.UUID) (bool, error) {
 		return false, fmt.Errorf("check batch: %w", err)
 	}
 	return ok, nil
+}
+
+// CompleteEmptyBatch marks a batch that created no notification (all its
+// items were duplicates) as completed, and queues its batch.completed
+// event. Nothing else would: completion is driven by item status changes.
+// Call it inside InTx, after the batch's notifications were inserted. It
+// is a no-op for a batch that created anything.
+func (r *Repo) CompleteEmptyBatch(ctx context.Context, id uuid.UUID, now time.Time) error {
+	row, err := r.q.CompleteEmptyBatch(ctx, sqlcgen.CompleteEmptyBatchParams{ID: id, Now: &now})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("complete empty batch: %w", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"batch_id": row.ID, "total": row.Total, "created": row.CreatedCount,
+		"counts": map[string]int{}, "completed_at": row.CompletedAt, "occurred_at": now,
+	})
+	if err != nil {
+		return fmt.Errorf("encode batch.completed: %w", err)
+	}
+	return r.InsertOutboxEvent(ctx, "batch", row.ID, events.TypeBatchCompleted, payload)
 }

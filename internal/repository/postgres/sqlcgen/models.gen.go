@@ -80,6 +80,8 @@ type Notification struct {
 	TraceParent       *string
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+	TotalAttempts     int32
+	RequestHash       *string
 }
 
 type NotificationAttempt struct {

@@ -15,12 +15,14 @@ import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/apierror"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/http/middleware"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/idempotency"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/metrics"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/observability"
 )
 
@@ -192,13 +194,27 @@ func TestRequestLog(t *testing.T) {
 // ---- idempotency ------------------------------------------------------------
 
 // memStore is an in-memory idempotency.Store with the same semantics as the
-// PostgreSQL implementation, including lease fencing.
+// PostgreSQL implementation, including lease fencing and the unit of work:
+// what the handler records (see record) becomes visible in created only
+// when Execute stores the response.
 type memStore struct {
-	mu           sync.Mutex
-	rows         map[string]*memRow
-	released     []string
-	tokens       int
-	failComplete int // number of Complete calls that fail before one succeeds
+	mu         sync.Mutex
+	rows       map[string]*memRow
+	released   []string
+	tokens     int
+	failCommit int      // number of Execute commits that fail before one succeeds
+	created    []string // committed work
+}
+
+type unitKey struct{}
+
+type unitWork struct{ items []string }
+
+// record notes work the handler did inside the request's unit of work.
+func record(ctx context.Context, item string) {
+	if u, ok := ctx.Value(unitKey{}).(*unitWork); ok {
+		u.items = append(u.items, item)
+	}
 }
 
 type memRow struct {
@@ -226,19 +242,33 @@ func (s *memStore) Acquire(_ context.Context, key, hash string, now time.Time, t
 	return idempotency.Lease{}, idempotency.Record{RequestHash: row.hash, Status: row.status, Body: row.body}, false, nil
 }
 
-func (s *memStore) Complete(_ context.Context, l idempotency.Lease, status int, body []byte) error {
+func (s *memStore) Execute(ctx context.Context, l idempotency.Lease,
+	fn func(context.Context) (idempotency.Response, bool),
+) (bool, error) {
+	work := &unitWork{}
+	resp, keep := fn(context.WithValue(ctx, unitKey{}, work))
+	if !keep {
+		return false, nil // rolled back: work is dropped
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.failComplete > 0 {
-		s.failComplete--
-		return errors.New("db blip")
+	if s.failCommit > 0 {
+		s.failCommit--
+		return false, errors.New("db blip")
 	}
 	row, ok := s.rows[l.Key]
 	if !ok || row.token != l.Token || row.status != 0 {
-		return idempotency.ErrLeaseLost
+		return false, idempotency.ErrLeaseLost
 	}
-	row.status, row.body = status, append([]byte(nil), body...)
-	return nil
+	row.status, row.body = resp.Status, append([]byte(nil), resp.Body...)
+	s.created = append(s.created, work.items...)
+	return true, nil
+}
+
+func (s *memStore) committed() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.created...)
 }
 
 func (s *memStore) Release(_ context.Context, l idempotency.Lease) error {
@@ -268,11 +298,12 @@ func newIdemHarness() *idemHarness {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, `{"call":`+string(rune('0'+call))+`}`)
 	}
-	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		x.mu.Lock()
 		x.calls++
 		n := x.calls
 		x.mu.Unlock()
+		record(r.Context(), fmt.Sprint("call ", n))
 		x.respond(w, n)
 	})
 	x.h = middleware.BufferBody(1<<20, writeErr)(middleware.Idempotency(middleware.IdempotencyConfig{
@@ -464,26 +495,81 @@ func TestIdempotency_TakenOverLeaseCannotReleaseNewOwner(t *testing.T) {
 	assert.Equal(t, 2, x.calls)
 }
 
-// TestIdempotency_CompleteFailureKeepsKeyLocked: the client already got its
-// 201; if storing it fails, releasing the key would let a retry create a
-// duplicate. The key stays locked instead.
-func TestIdempotency_CompleteFailureKeepsKeyLocked(t *testing.T) {
+// TestIdempotency_StoreFailureRollsBackAndReleases: if the response cannot
+// be stored, nothing the request did is kept either, the client gets a 500
+// (never the 201 it would otherwise have no record of), and its retry runs
+// for real, creating exactly once.
+func TestIdempotency_StoreFailureRollsBackAndReleases(t *testing.T) {
 	x := newIdemHarness()
-	x.store.failComplete = 100
+	x.store.failCommit = 1
+
+	assert.Equal(t, http.StatusInternalServerError, x.post(t, "k1", `{}`).Code)
+	assert.Empty(t, x.store.committed(), "the failed request left nothing behind")
+	assert.Contains(t, x.store.released, ":k1")
 
 	assert.Equal(t, http.StatusCreated, x.post(t, "k1", `{}`).Code)
-	assert.Empty(t, x.store.released, "a sent response must never release the key")
-	assert.Equal(t, http.StatusConflict, x.post(t, "k1", `{}`).Code)
-	assert.Equal(t, 1, x.calls, "the retry did not run the request again")
-}
-
-func TestIdempotency_CompleteRetriesTransientFailure(t *testing.T) {
-	x := newIdemHarness()
-	x.store.failComplete = 2 // fewer than the attempts allowed
-
-	x.post(t, "k1", `{}`)
+	assert.Equal(t, []string{"call 2"}, x.store.committed(), "created once, by the retry")
 	rec := x.post(t, "k1", `{}`)
 	assert.Equal(t, "true", rec.Header().Get(middleware.HeaderIdempotentReplayed))
+}
+
+// TestIdempotency_TakenOverRequestRollsBack: request A runs past the stale
+// timeout, its client retries (B), B takes the key over and completes. When
+// A finishes, its work must not commit, or the batch would exist twice.
+func TestIdempotency_TakenOverRequestRollsBack(t *testing.T) {
+	x := newIdemHarness()
+	aStarted, aFinish := make(chan struct{}), make(chan struct{})
+	x.respond = func(w http.ResponseWriter, call int) {
+		if call == 1 {
+			close(aStarted)
+			<-aFinish
+		}
+		w.WriteHeader(http.StatusCreated)
+	}
+
+	var aCode int
+	aDone := make(chan struct{})
+	go func() { aCode = x.post(t, "k1", `{}`).Code; close(aDone) }()
+	<-aStarted
+	x.now = x.now.Add(2 * time.Minute)
+	assert.Equal(t, http.StatusCreated, x.post(t, "k1", `{}`).Code, "B took over and completed")
+
+	close(aFinish)
+	<-aDone
+	assert.Equal(t, http.StatusConflict, aCode, "A learns a retry took over")
+	assert.Equal(t, []string{"call 2"}, x.store.committed(), "only B's work committed")
+}
+
+func TestIdempotency_StaleAfterIsConfigurable(t *testing.T) {
+	x := newIdemHarness()
+	x.h = middleware.BufferBody(1<<20, writeErr)(middleware.Idempotency(middleware.IdempotencyConfig{
+		Store: x.store, TTL: 24 * time.Hour, StaleAfter: 5 * time.Minute,
+		Now: func() time.Time { return x.now }, Log: discard,
+		Applies: func(*http.Request) bool { return true },
+	}, writeErr)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		x.mu.Lock()
+		x.calls++
+		n := x.calls
+		x.mu.Unlock()
+		x.respond(w, n)
+	})))
+	started, hang := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	x.respond = func(w http.ResponseWriter, call int) {
+		if call == 1 { // a request that never finishes
+			close(started)
+			<-hang
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}
+	go x.post(t, "k1", `{}`)
+	<-started
+
+	x.now = x.now.Add(2 * time.Minute) // past the default minute, within the configured five
+	assert.Equal(t, http.StatusConflict, x.post(t, "k1", `{}`).Code)
+	x.now = x.now.Add(4 * time.Minute)
+	assert.Equal(t, http.StatusCreated, x.post(t, "k1", `{}`).Code)
 }
 
 func TestIdempotency_ReplayIsByteIdentical(t *testing.T) {
@@ -526,5 +612,33 @@ type failingStore struct{}
 func (failingStore) Acquire(context.Context, string, string, time.Time, time.Duration, time.Duration) (idempotency.Lease, idempotency.Record, bool, error) {
 	return idempotency.Lease{}, idempotency.Record{}, false, errors.New("db down")
 }
-func (failingStore) Complete(context.Context, idempotency.Lease, int, []byte) error { return nil }
-func (failingStore) Release(context.Context, idempotency.Lease) error               { return nil }
+
+func (failingStore) Execute(context.Context, idempotency.Lease, func(context.Context) (idempotency.Response, bool)) (bool, error) {
+	return false, nil
+}
+func (failingStore) Release(context.Context, idempotency.Lease) error { return nil }
+
+// ---- metrics ----------------------------------------------------------------
+
+func TestMetrics_CountsPanicsAsServerErrors(t *testing.T) {
+	m := metrics.New()
+	// The router's order: metrics outside recovery.
+	h := middleware.Metrics(m)(middleware.Recovery(discard, writeErr)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	})))
+	h.ServeHTTP(httptest.NewRecorder(), request(t, http.MethodGet, "/", ""))
+	assert.InDelta(t, 1, promtestutil.ToFloat64(m.HTTPRequests.WithLabelValues("unmatched", "GET", "500")), 0)
+}
+
+func TestMetrics_UnknownMethodsShareOneLabel(t *testing.T) {
+	m := metrics.New()
+	h := middleware.Metrics(m)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	for _, method := range []string{"BREW", "X-RANDOM-1", "X-RANDOM-2", http.MethodDelete} {
+		h.ServeHTTP(httptest.NewRecorder(), request(t, method, "/", ""))
+	}
+	assert.InDelta(t, 3, promtestutil.ToFloat64(m.HTTPRequests.WithLabelValues("unmatched", "other", "405")), 0)
+	assert.InDelta(t, 1, promtestutil.ToFloat64(m.HTTPRequests.WithLabelValues("unmatched", "DELETE", "405")), 0)
+	assert.Equal(t, 2, promtestutil.CollectAndCount(m.HTTPRequests), "no series per invented method")
+}

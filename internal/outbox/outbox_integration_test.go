@@ -157,16 +157,16 @@ func complete(t *testing.T, n *domain.Notification, status domain.Status) {
 	t.Helper()
 	c := &queue.Completion{
 		NotificationID: n.ID, WorkerID: "w1", Now: time.Now(), Status: status,
-		Attempt: domain.Attempt{NotificationID: n.ID, AttemptNo: n.Attempts, Outcome: domain.OutcomeSuccess, Duration: time.Millisecond},
+		Attempt: domain.Attempt{NotificationID: n.ID, AttemptNo: n.TotalAttempts, Outcome: domain.OutcomeSuccess, Duration: time.Millisecond},
 	}
 	if status == domain.StatusFailed {
 		c.Attempt.Outcome, c.Attempt.ErrorCode, c.Attempt.Error = domain.OutcomePermanentError, "http_400", "bad recipient"
 	} else {
 		c.Attempt.ProviderMessageID = "msg-1"
 	}
-	applied, err := store.Queue().Complete(t.Context(), c)
+	done, err := store.Queue().Complete(t.Context(), c)
 	require.NoError(t, err)
-	require.True(t, applied)
+	require.True(t, done.Applied)
 }
 
 // relayAll runs relay rounds until nothing is left to publish. Batch
@@ -402,6 +402,35 @@ func TestRelay_PrunesOldPublishedEvents(t *testing.T) {
 	assert.Len(t, outboxRows(t), 2)
 }
 
+// TestRelay_PrunesUnderSustainedLoad: with a backlog that keeps every
+// round full, the relay never reaches an idle round. Pruning used to run
+// only there, so under a long campaign the table grew without bound.
+func TestRelay_PrunesUnderSustainedLoad(t *testing.T) {
+	reset(t)
+	newBatch(t, 3)
+	_, err := outbox.New(store, events.NewPublisher(rdb, events.DefaultStream, 100000), relayConfig(), quiet).RelayOnce(t.Context())
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `UPDATE outbox_events SET published_at = now() - interval '2 hours'`)
+	require.NoError(t, err)
+	newBatch(t, 1000) // far more than one round
+
+	cfg := relayConfig()
+	cfg.BatchSize, cfg.PruneInterval = 1, 20*time.Millisecond // every round is full
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go outbox.New(store, events.NewPublisher(rdb, events.DefaultStream, 100000), cfg, quiet).Run(ctx)
+
+	require.Eventually(t, func() bool {
+		var old int
+		require.NoError(t, pool.QueryRow(t.Context(),
+			`SELECT count(*) FROM outbox_events WHERE published_at < now() - interval '1 hour'`).Scan(&old))
+		return old == 0
+	}, 5*time.Second, 20*time.Millisecond, "old events pruned while the backlog is still draining")
+	var waiting int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM outbox_events WHERE published_at IS NULL`).Scan(&waiting))
+	assert.Positive(t, waiting, "the backlog was not drained first")
+}
+
 // ---- consumers -------------------------------------------------------------
 
 func publish(t *testing.T, n int) {
@@ -499,6 +528,42 @@ func TestGroup_ConsumerCrashIsTakenOver(t *testing.T) {
 		defer mu.Unlock()
 		return len(got) == 5
 	}, 5*time.Second, 20*time.Millisecond)
+}
+
+// TestGroup_LostGroupIsRecreatedFromTheStart: if Redis loses the group
+// (a restart without persistence) while the relay keeps publishing, the
+// events published before the group is back must still be consumed.
+func TestGroup_LostGroupIsRecreatedFromTheStart(t *testing.T) {
+	reset(t)
+	g := events.NewGroup(rdb, events.GroupConfig{
+		Stream: events.DefaultStream, Group: "callbacks", Consumer: "c1", Count: 10,
+		Block: 50 * time.Millisecond, MinIdle: time.Minute, RetryEvery: 50 * time.Millisecond, Log: quiet,
+	})
+	require.True(t, g.WaitEnsured(t.Context()))
+
+	var mu sync.Mutex
+	got := map[int64]bool{}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go g.Run(ctx, func(_ context.Context, e events.Event) error {
+		mu.Lock()
+		got[e.ID] = true
+		mu.Unlock()
+		return nil
+	})
+	seen := func(n int) func() bool {
+		return func() bool { mu.Lock(); defer mu.Unlock(); return len(got) == n }
+	}
+	publish(t, 3)
+	require.Eventually(t, seen(3), 5*time.Second, 10*time.Millisecond)
+
+	// Redis loses the stream and its group; the relay publishes on.
+	require.NoError(t, rdb.Del(t.Context(), events.DefaultStream).Err())
+	mu.Lock()
+	clear(got)
+	mu.Unlock()
+	publish(t, 5)
+	require.Eventually(t, seen(5), 5*time.Second, 10*time.Millisecond, "nothing published meanwhile is skipped")
 }
 
 func TestTail_FansOutToEveryReader(t *testing.T) {

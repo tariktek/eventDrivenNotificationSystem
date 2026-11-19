@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/idempotency"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres/sqlcgen"
@@ -19,12 +20,13 @@ import (
 // or release the key.
 type IdempotencyStore struct {
 	repo *Repo
+	pool *pgxpool.Pool
 }
 
 var _ idempotency.Store = IdempotencyStore{}
 
 // Idempotency returns the store's idempotency-key implementation.
-func (s *Store) Idempotency() IdempotencyStore { return IdempotencyStore{repo: s.Repo} }
+func (s *Store) Idempotency() IdempotencyStore { return IdempotencyStore{repo: s.Repo, pool: s.pool} }
 
 // Acquire implements idempotency.Store.
 func (s IdempotencyStore) Acquire(ctx context.Context, key, hash string, now time.Time, ttl, staleAfter time.Duration,
@@ -76,30 +78,67 @@ func (s IdempotencyStore) Acquire(ctx context.Context, key, hash string, now tim
 	return idempotency.Lease{}, idempotency.Record{}, false, errors.New("idempotency key changed hands repeatedly")
 }
 
-// Complete implements idempotency.Store.
-func (s IdempotencyStore) Complete(ctx context.Context, lease idempotency.Lease, status int, body []byte) error {
+// Execute implements idempotency.Store. The writes fn makes through InTx
+// join one transaction (a unit), which then stores the response under the
+// lease's token: if another request took the key over meanwhile, the token
+// no longer matches and everything rolls back.
+//
+// Storing the response takes the key's row lock, so a takeover that runs
+// concurrently either happens first (this request then rolls back) or
+// waits and finds the key completed (it then replays this response).
+func (s IdempotencyStore) Execute(ctx context.Context, lease idempotency.Lease,
+	fn func(ctx context.Context) (idempotency.Response, bool),
+) (bool, error) {
 	token, err := uuid.Parse(lease.Token)
 	if err != nil {
-		return fmt.Errorf("complete idempotency key: %w", err)
+		return false, fmt.Errorf("execute idempotent request: %w", err)
 	}
-	st, err := narrow[int32](status, "response_status")
+	u := &unit{pool: s.pool}
+	committed := false
+	defer func() { // also runs when fn panics
+		if u.tx != nil && !committed {
+			rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), CleanupTimeout)
+			defer cancel()
+			_ = u.tx.Rollback(rbCtx)
+		}
+	}()
+
+	resp, keep := fn(withUnit(ctx, u))
+	if !keep {
+		return false, nil
+	}
+	st, err := narrow[int32](resp.Status, "response_status")
 	if err != nil {
-		return err
+		return false, err
 	}
+	body := resp.Body
 	if body == nil {
 		body = []byte{} // NULL means "in progress"; an empty body (204) is not
 	}
-	n, err := s.repo.q.CompleteIdempotencyKey(ctx, sqlcgen.CompleteIdempotencyKeyParams{
+	tx, err := u.begin(ctx) // fn may not have written anything (a 4xx)
+	if err != nil {
+		return false, err
+	}
+	n, err := sqlcgen.New(tx).CompleteIdempotencyKey(ctx, sqlcgen.CompleteIdempotencyKeyParams{
 		Key: lease.Key, LockToken: token, ResponseStatus: &st, ResponseBody: body,
 	})
 	if err != nil {
-		return fmt.Errorf("complete idempotency key: %w", err)
+		return false, fmt.Errorf("store idempotent response: %w", err)
 	}
 	if n == 0 {
-		return idempotency.ErrLeaseLost
+		return false, idempotency.ErrLeaseLost
 	}
-	return nil
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit idempotent request: %w", err)
+	}
+	committed = true
+	return true, nil
 }
+
+// CleanupTimeout bounds database work that must outlive a cancelled
+// request (rolling back, releasing a key), so a stuck database cannot hold
+// a request, or a shutdown, forever.
+const CleanupTimeout = 5 * time.Second
 
 // Release implements idempotency.Store.
 func (s IdempotencyStore) Release(ctx context.Context, lease idempotency.Lease) error {

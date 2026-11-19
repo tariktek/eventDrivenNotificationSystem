@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,18 +17,20 @@ import (
 
 // Idempotency headers.
 const (
-	HeaderIdempotencyKey      = "Idempotency-Key"
-	HeaderIdempotentReplayed  = "Idempotent-Replayed"
-	idempotencyKeyMaxLen      = 255
-	idempotencyStaleAfterTime = time.Minute
+	HeaderIdempotencyKey     = "Idempotency-Key"
+	HeaderIdempotentReplayed = "Idempotent-Replayed"
+	idempotencyKeyMaxLen     = 255
 )
 
 // IdempotencyConfig configures the Idempotency middleware.
 type IdempotencyConfig struct {
 	Store idempotency.Store
 	TTL   time.Duration
-	Now   func() time.Time
-	Log   *slog.Logger
+	// StaleAfter is how long a key may stay in progress before a retry
+	// can take it over (default DefaultIdempotencyStaleAfter).
+	StaleAfter time.Duration
+	Now        func() time.Time
+	Log        *slog.Logger
 	// Applies selects the requests the middleware handles; others pass through.
 	Applies func(r *http.Request) bool
 }
@@ -42,6 +43,12 @@ type IdempotencyConfig struct {
 //   - same key, first still running → 409 request_in_progress
 //   - first request failed with 5xx or panicked → the key is released, so the
 //     retry runs for real
+//
+// The request's database writes and its stored response commit in one
+// transaction (idempotency.Store.Execute), and the client gets the response
+// only after that commit. Whatever happens in between (a crash, a failed
+// write, a dropped connection), either both exist or neither does, so a
+// retry replays exactly what was created or creates it exactly once.
 //
 // It needs the buffered body (BufferBody) and the client identity
 // (APIKeyAuth): keys are scoped per client, so two clients cannot collide.
@@ -63,7 +70,7 @@ func Idempotency(cfg IdempotencyConfig, writeErr ErrorWriter) func(http.Handler)
 			body, _ := Body(ctx)
 			hash := requestHash(r, body)
 
-			lease, rec, acquired, err := cfg.Store.Acquire(ctx, scoped, hash, cfg.Now(), cfg.TTL, idempotencyStaleAfterTime)
+			lease, rec, acquired, err := cfg.Store.Acquire(ctx, scoped, hash, cfg.Now(), cfg.TTL, cfg.staleAfter())
 			if err != nil {
 				writeErr(w, r, fmt.Errorf("acquire idempotency key: %w", err))
 				return
@@ -73,58 +80,63 @@ func Idempotency(cfg IdempotencyConfig, writeErr ErrorWriter) func(http.Handler)
 				return
 			}
 
-			// We own the key. Release it unless the request ran to a stored
-			// (or deliberately kept) outcome, so a panic or 5xx never blocks
-			// the client's retry. Cleanup must outlive a cancelled request.
-			cleanupCtx := context.WithoutCancel(ctx)
-			keep := false
+			// We own the key. Release it unless its response was stored, so
+			// a panic or 5xx never blocks the client's retry. (Release is a
+			// no-op once the response is stored.) Cleanup must outlive a
+			// cancelled request, but not wait forever on the database.
+			kept := false
 			defer func() {
-				if keep {
+				if kept {
 					return
 				}
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+				defer cancel()
 				if err := cfg.Store.Release(cleanupCtx, lease); err != nil {
 					cfg.Log.ErrorContext(cleanupCtx, "release idempotency key", "error", err)
 				}
 			}()
 
-			sw := &statusWriter{ResponseWriter: w, capture: &bytes.Buffer{}}
-			next.ServeHTTP(sw, r)
-
-			if sw.Status() >= http.StatusInternalServerError {
-				return
+			// The response is buffered and reaches the client only after
+			// it was stored, in the same transaction as whatever the
+			// request created: the client never holds a response the key
+			// does not, and a dropped connection cannot truncate the
+			// stored copy.
+			buf := newResponseBuffer()
+			kept, err = cfg.Store.Execute(ctx, lease, func(txCtx context.Context) (idempotency.Response, bool) {
+				next.ServeHTTP(buf, r.WithContext(txCtx))
+				return idempotency.Response{Status: buf.Status(), Body: buf.body.Bytes()}, buf.Status() < http.StatusInternalServerError
+			})
+			switch {
+			case errors.Is(err, idempotency.ErrLeaseLost):
+				// A retry with the same key took over while this request ran
+				// past the stale timeout; this one's work was rolled back,
+				// so exactly one of them creates anything.
+				cfg.Log.WarnContext(ctx, "idempotency key was taken over while the request ran; rolled back", "key", lease.Key)
+				writeErr(w, r, apierror.New(http.StatusConflict, api.ErrorCodeRequestInProgress,
+					"A retry with this Idempotency-Key took over this request; use the retry's response."))
+			case err != nil:
+				writeErr(w, r, fmt.Errorf("idempotent request: %w", err))
+			default:
+				buf.writeTo(w)
 			}
-			// The client already has its response, so from here on the key
-			// must never be released: a retry would execute the request a
-			// second time. Store the response, retrying briefly on failure.
-			keep = true
-			complete(cleanupCtx, cfg, lease, sw.Status(), sw.capture.Bytes())
 		})
 	}
 }
 
-// completeAttempts and completeBackoff bound how hard we try to store a
-// response before giving up and leaving the key locked (a retry then gets
-// 409 until the stale timeout, which is safer than running twice).
-const completeAttempts = 3
+// DefaultIdempotencyStaleAfter is how long a key may stay "in progress"
+// before a retry with the same request may take it over (its first owner
+// presumably died). It must exceed the longest a request can take: a
+// takeover is safe even then (the slow request rolls back), but the slow
+// request's client gets a 409 for nothing.
+const DefaultIdempotencyStaleAfter = time.Minute
 
-var completeBackoff = 50 * time.Millisecond
+const cleanupTimeout = 5 * time.Second
 
-func complete(ctx context.Context, cfg IdempotencyConfig, lease idempotency.Lease, status int, body []byte) {
-	var err error
-	for attempt := range completeAttempts {
-		if attempt > 0 {
-			time.Sleep(completeBackoff << (attempt - 1))
-		}
-		err = cfg.Store.Complete(ctx, lease, status, body)
-		if err == nil {
-			return
-		}
-		if errors.Is(err, idempotency.ErrLeaseLost) {
-			cfg.Log.WarnContext(ctx, "idempotency key was taken over while the request ran", "key", lease.Key)
-			return
-		}
+func (cfg IdempotencyConfig) staleAfter() time.Duration {
+	if cfg.StaleAfter > 0 {
+		return cfg.StaleAfter
 	}
-	cfg.Log.ErrorContext(ctx, "could not store idempotent response; key stays locked", "key", lease.Key, "error", err)
+	return DefaultIdempotencyStaleAfter
 }
 
 func replayOrReject(w http.ResponseWriter, r *http.Request, rec idempotency.Record, hash string, writeErr ErrorWriter) {

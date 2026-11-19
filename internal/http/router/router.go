@@ -29,7 +29,9 @@ type Deps struct {
 	APIKeys        []string
 	Idempotency    idempotency.Store
 	IdempotencyTTL time.Duration
-	Now            func() time.Time
+	// IdempotencyStaleAfter: see middleware.IdempotencyConfig.StaleAfter.
+	IdempotencyStaleAfter time.Duration
+	Now                   func() time.Time
 	// Realtime serves the WebSocket endpoint; optional.
 	Realtime *realtime.Handler
 	// Metrics records HTTP metrics and serves GET /metrics; optional.
@@ -52,19 +54,22 @@ func New(d Deps) http.Handler {
 	}
 
 	// Order matters: the trace span outermost so it covers everything; the
-	// correlation ID next so every log line carries it;
-	// the request log outside recovery so requests that panic are logged too
-	// (as the 500 that recovery turns them into).
+	// correlation ID next so every log line carries it; the request log and
+	// the metrics outside recovery, so requests that panic are logged and
+	// counted too (as the 500 that recovery turns them into: inside it, a
+	// panic would unwind past them before they record anything).
 	r.Use(
 		middleware.Tracing,
 		middleware.CorrelationID,
 		middleware.RequestLog(d.Log),
-		middleware.Recovery(d.Log, errs.Write),
-		middleware.SecureHeaders,
 	)
 	if d.Metrics != nil {
 		r.Use(middleware.Metrics(d.Metrics))
 	}
+	r.Use(
+		middleware.Recovery(d.Log, errs.Write),
+		middleware.SecureHeaders,
+	)
 
 	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
 		errs.Write(w, req, apierror.New(http.StatusNotFound, api.ErrorCodeNotFound, "No route matches "+req.Method+" "+req.URL.Path+"."))
@@ -98,10 +103,11 @@ func New(d Deps) http.Handler {
 		middleware.APIKeyAuth(d.APIKeys, errs.Write),
 		middleware.BufferBody(d.MaxBodyBytes, errs.Write),
 		middleware.Idempotency(middleware.IdempotencyConfig{
-			Store: d.Idempotency,
-			TTL:   d.IdempotencyTTL,
-			Now:   d.Now,
-			Log:   d.Log,
+			Store:      d.Idempotency,
+			TTL:        d.IdempotencyTTL,
+			StaleAfter: d.IdempotencyStaleAfter,
+			Now:        d.Now,
+			Log:        d.Log,
 			Applies: func(req *http.Request) bool {
 				return req.Method == http.MethodPost && idempotentRoutes[req.URL.Path]
 			},

@@ -51,6 +51,21 @@ type Completion struct {
 	Attempt domain.Attempt
 }
 
+// CompleteResult reports what Complete wrote.
+type CompleteResult struct {
+	// Applied is true if the notification's state was updated.
+	Applied bool
+	// RecoveredFrom is set when a send was recorded although the worker
+	// had lost its lease: the reaper had requeued or failed the
+	// notification, or it was cancelled after that, and no other worker
+	// held it. The provider accepted the message, so it is sent; the field
+	// names the status that was corrected.
+	RecoveredFrom domain.Status
+	// DuplicateAttempt is true if an attempt with the same number was
+	// already recorded, so this one was not written again.
+	DuplicateAttempt bool
+}
+
 // Queue is the worker's view of pending work.
 type Queue interface {
 	// Claim atomically moves due notifications to processing under a
@@ -64,9 +79,9 @@ type Queue interface {
 	// heartbeating (crashed, killed, network-partitioned).
 	ReapExpiredLeases(ctx context.Context, now time.Time) (ReapResult, error)
 	// Complete atomically stores the attempt and the notification's new
-	// state. applied is false if the worker no longer held the lease, in
-	// which case only the attempt history is written.
-	Complete(ctx context.Context, c *Completion) (applied bool, err error)
+	// state. If the worker no longer held the lease, only the attempt
+	// history is written, except for a send (see CompleteResult).
+	Complete(ctx context.Context, c *Completion) (CompleteResult, error)
 	// Release returns claimed but unsent notifications to the queue without
 	// counting an attempt (used on graceful shutdown).
 	Release(ctx context.Context, workerID string, ids []uuid.UUID) (int64, error)

@@ -25,7 +25,8 @@ SET status = 'cancelled', cancelled_at = @now
 WHERE batch_id = @batch_id AND status IN ('pending', 'scheduled');
 
 -- Manual retry from the dead-letter state with a fresh attempt budget.
--- last_error is kept for context; the attempts table holds the full history.
+-- last_error is kept for context; the attempts table holds the full history
+-- (its rows are numbered by total_attempts, which a retry does not reset).
 -- name: RetryNotification :one
 UPDATE notifications
 SET status = 'pending', attempts = 0, next_attempt_at = @now, failed_at = NULL
@@ -35,7 +36,8 @@ RETURNING *;
 -- Bulk dead-letter redrive, e.g. after a provider outage. The filters are
 -- optional; LIMIT keeps one call's write bounded (callers repeat until
 -- nothing matches). SKIP LOCKED lets two concurrent redrives split the work
--- instead of blocking each other. Oldest first, via the status index.
+-- instead of blocking each other. Oldest first, via the status index. Like
+-- a single retry, it resets the attempt budget but not total_attempts.
 -- name: RetryFailedNotifications :execrows
 WITH picked AS (
     SELECT id FROM notifications
@@ -66,4 +68,4 @@ WHERE status = 'failed'
 -- name: ListAttempts :many
 SELECT * FROM notification_attempts
 WHERE notification_id = $1
-ORDER BY attempt_no;
+ORDER BY attempt_no, id;

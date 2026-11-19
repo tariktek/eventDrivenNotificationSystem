@@ -525,10 +525,10 @@ func TestIdempotencyStore_LeaseFencing(t *testing.T) {
 
 	// The old owner finishes late: it can neither release nor complete.
 	require.NoError(t, idem.Release(t.Context(), a))
-	assert.ErrorIs(t, idem.Complete(t.Context(), a, 201, []byte("stale")), idempotency.ErrLeaseLost)
+	assert.ErrorIs(t, complete(t, a, 201, []byte("stale")), idempotency.ErrLeaseLost)
 
 	body := []byte("{\"z\":1,\"a\":2}\n")
-	require.NoError(t, idem.Complete(t.Context(), b, 201, body))
+	require.NoError(t, complete(t, b, 201, body))
 	_, rec, ok, err = idem.Acquire(t.Context(), "c:k", "hash", now.Add(3*time.Minute), time.Hour, time.Minute)
 	require.NoError(t, err)
 	assert.False(t, ok)
@@ -545,7 +545,7 @@ func TestIdempotencyStore_ExpiredKeyIsReusable(t *testing.T) {
 	idem := store.Idempotency()
 	l, _, _, err := idem.Acquire(t.Context(), "c:e", "h1", baseTime, time.Hour, time.Minute)
 	require.NoError(t, err)
-	require.NoError(t, idem.Complete(t.Context(), l, 201, []byte("{}")))
+	require.NoError(t, complete(t, l, 201, []byte("{}")))
 
 	_, _, ok, err := idem.Acquire(t.Context(), "c:e", "h2", baseTime.Add(2*time.Hour), time.Hour, time.Minute)
 	require.NoError(t, err)

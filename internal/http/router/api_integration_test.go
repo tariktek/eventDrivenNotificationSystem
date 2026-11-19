@@ -240,6 +240,21 @@ func TestCreateNotification_IdempotencyKeyInBody(t *testing.T) {
 	first := call(t, http.MethodPost, "/api/v1/notifications", body).json(t)
 	second := call(t, http.MethodPost, "/api/v1/notifications", body).json(t)
 	assert.Equal(t, first["id"], second["id"])
+
+	// The same key for a different message is an error, not the first
+	// notification silently returned in place of the new one.
+	other := call(t, http.MethodPost, "/api/v1/notifications",
+		sms(map[string]any{"idempotency_key": "otp-42", "recipient": "+905559876543"}))
+	require.Equal(t, http.StatusUnprocessableEntity, other.Code, "%s", other.Body)
+	assert.Equal(t, "idempotency_key_reused", errorCode(t, other))
+	assert.Equal(t, []string{"idempotency_key"}, errorFields(t, other))
+
+	batch := call(t, http.MethodPost, "/api/v1/notifications/batch", map[string]any{
+		"items": []any{sms(), sms(map[string]any{"idempotency_key": "otp-42", "content": "something else"})},
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, batch.Code, "%s", batch.Body)
+	assert.Equal(t, []string{"items[1].idempotency_key"}, errorFields(t, batch))
+	assert.Equal(t, 1, countStatus(t, "pending"), "the batch was rolled back as a whole")
 }
 
 func TestCreateNotification_ValidationErrors(t *testing.T) {
@@ -259,6 +274,9 @@ func TestCreateNotification_BadRequests(t *testing.T) {
 		"unknown field":  `{"channel":"sms","recipent":"+905551234567","content":"hi"}`,
 		"wrong type":     `{"channel":"sms","recipient":12345,"content":"hi"}`,
 		"trailing data":  `{"channel":"sms","recipient":"+905551234567","content":"hi"} {}`,
+		"stray bracket":  `{"channel":"sms","recipient":"+905551234567","content":"hi"}]`,
+		"null":           `null`,
+		"array":          `[]`,
 		"empty body":     ``,
 		// "Ş-code" encoded as Windows-1254, not UTF-8: must be refused, not
 		// silently stored as "�-code".
@@ -382,6 +400,16 @@ func TestRetryFailed_BulkRedrive(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, res.Code, "unknown fields are rejected")
 }
 
+// TestRetryFailed_NullBodyIsRejected: null decodes into an empty filter
+// without dry_run, which would redrive every failed notification.
+func TestRetryFailed_NullBodyIsRejected(t *testing.T) {
+	reset(t)
+	for _, body := range []string{`null`, `{}]`, `[]`} {
+		res := call(t, http.MethodPost, "/api/v1/notifications/retry-failed", body)
+		assert.Equal(t, http.StatusBadRequest, res.Code, "%s: %s", body, res.Body)
+	}
+}
+
 func countStatus(t *testing.T, status string) int {
 	t.Helper()
 	var n int
@@ -464,6 +492,11 @@ func TestBatch_Lifecycle(t *testing.T) {
 	})
 	require.Equal(t, http.StatusCreated, res.Code)
 	assert.Equal(t, true, res.json(t)["notifications"].([]any)[0].(map[string]any)["duplicate"])
+
+	// It created nothing, so no status change will ever complete it: it is
+	// complete from the start.
+	dupBatch := call(t, http.MethodGet, "/api/v1/batches/"+res.json(t)["batch_id"].(string), nil).json(t)
+	assert.NotNil(t, dupBatch["completed_at"], "a batch of duplicates must not stay open forever")
 }
 
 func TestBatch_AllOrNothing(t *testing.T) {

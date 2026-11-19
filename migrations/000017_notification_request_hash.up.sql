@@ -1,0 +1,13 @@
+-- Fingerprint of the request that created a notification with an
+-- idempotency_key: channel, recipient, content (or template and its
+-- variables), priority, schedule, attempts, callback and metadata.
+--
+-- A second request with the same key used to get the first notification
+-- back as a "duplicate" even when it asked for something else: a
+-- different recipient or message was silently dropped. Now the same key
+-- with the same request is a duplicate, and with a different request it is
+-- rejected (422 idempotency_key_reused), like the Idempotency-Key header.
+--
+-- NULL for rows created before this migration: they cannot be compared,
+-- so a repeat of their key is still treated as a duplicate.
+ALTER TABLE notifications ADD COLUMN request_hash text;

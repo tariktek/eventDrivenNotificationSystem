@@ -19,7 +19,7 @@ import (
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/testutil/pgtest"
 )
 
-const latestVersion = 15
+const latestVersion = 17
 
 var dsn string
 
@@ -225,6 +225,55 @@ func TestBatches_TotalWithinLimits(t *testing.T) {
 		require.True(t, errors.As(err, &pgErr), "total=%d must be rejected", total)
 		assert.Equal(t, "23514", pgErr.Code)
 	}
+}
+
+// TestMigration15_HandsOverBatchCountsWithoutDoubleCounting: version 14
+// counted finished batch items in a trigger; from 15 the relay counts them
+// as it publishes their events. Changes counted under 14 whose events were
+// not yet published when 15 ran must not be counted a second time.
+func TestMigration15_HandsOverBatchCountsWithoutDoubleCounting(t *testing.T) {
+	m, err := pgtest.NewMigrator(dsn)
+	require.NoError(t, err)
+	defer m.Close()
+	require.NoError(t, ignoreNoChange(m.Down()))
+	require.NoError(t, m.Migrate(14))
+	conn, err := pgx.Connect(t.Context(), dsn)
+	require.NoError(t, err)
+	defer conn.Close(context.Background())
+
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		_, err := conn.Exec(t.Context(), sql, args...)
+		require.NoError(t, err)
+	}
+	newBatch := func(items int) string {
+		t.Helper()
+		var id string
+		require.NoError(t, conn.QueryRow(t.Context(), `INSERT INTO batches (id, total) VALUES (gen_random_uuid(), $1) RETURNING id`, items).Scan(&id))
+		exec(`INSERT INTO notifications (id, batch_id, channel, recipient, content, status, max_attempts)
+		      SELECT gen_random_uuid(), $1, 'sms', 'x', 'hi', 'pending', 5 FROM generate_series(1, $2)`, id, items)
+		return id
+	}
+	half, done := newBatch(2), newBatch(2)
+	// Under 14, the trigger counts these as they commit; their events wait
+	// in the outbox for the relay.
+	exec(`UPDATE notifications SET status = 'sent', sent_at = now()
+	      WHERE id = (SELECT id FROM notifications WHERE batch_id = $1 LIMIT 1)`, half)
+	exec(`UPDATE notifications SET status = 'sent', sent_at = now() WHERE batch_id = $1`, done)
+
+	require.NoError(t, m.Migrate(15))
+
+	var finished int
+	var completed *time.Time
+	require.NoError(t, conn.QueryRow(t.Context(), `SELECT finished_count, completed_at FROM batches WHERE id = $1`, half).Scan(&finished, &completed))
+	assert.Zero(t, finished, "the relay will count the waiting change; it must start below it")
+	assert.Nil(t, completed)
+
+	require.NoError(t, conn.QueryRow(t.Context(), `SELECT finished_count, completed_at FROM batches WHERE id = $1`, done).Scan(&finished, &completed))
+	assert.Zero(t, finished)
+	assert.NotNil(t, completed, "completion is kept: it was already announced under 14")
+
+	require.NoError(t, m.Up())
 }
 
 func ignoreNoChange(err error) error {

@@ -43,7 +43,10 @@ func (s *Store) Queue() QueueStore { return QueueStore{repo: s.Repo, pool: s.poo
 //     The bound is: nothing waits longer than 2 × $aging behind newer work.
 //     Within each priority the oldest rows rank first under this order, so
 //     taking the top of each branch cannot miss a row that would sort first.
-//  3. The UPDATE moves the picked rows to processing under our lease.
+//  3. The UPDATE moves the picked rows to processing under our lease and
+//     counts the attempt twice over: against the budget (attempts, reset by
+//     a manual retry) and in total (total_attempts, never reset, which
+//     numbers the attempt history).
 //
 // SKIP LOCKED is what lets many workers claim concurrently: rows another
 // worker is claiming are skipped instead of waited on, and no row can be
@@ -73,7 +76,8 @@ picked AS (
     FOR UPDATE SKIP LOCKED
 )
 UPDATE notifications n
-SET status = 'processing', locked_by = $3, locked_until = $7, attempts = n.attempts + 1
+SET status = 'processing', locked_by = $3, locked_until = $7,
+    attempts = n.attempts + 1, total_attempts = n.total_attempts + 1
 FROM picked
 WHERE n.id = picked.id
 RETURNING n.*`
@@ -125,33 +129,35 @@ func sortByClaimOrder(ns []*domain.Notification, now time.Time, aging time.Durat
 }
 
 // Complete implements queue.Queue.
-func (q QueueStore) Complete(ctx context.Context, c *queue.Completion) (bool, error) {
+func (q QueueStore) Complete(ctx context.Context, c *queue.Completion) (queue.CompleteResult, error) {
 	a := &c.Attempt
+	var res queue.CompleteResult
 	durationMS, err := narrow[int32](int(a.Duration.Milliseconds()), "duration_ms")
 	if err != nil {
-		return false, err
+		return res, err
 	}
 	attemptNo, err := narrow[int32](a.AttemptNo, "attempt_no")
 	if err != nil {
-		return false, err
+		return res, err
 	}
 	var statusCode *int32
 	if a.StatusCode != 0 {
 		sc, err := narrow[int32](a.StatusCode, "status_code")
 		if err != nil {
-			return false, err
+			return res, err
 		}
 		statusCode = &sc
 	}
 
 	var rows int64
 	err = pgx.BeginFunc(ctx, q.pool, func(tx pgx.Tx) error {
+		res = queue.CompleteResult{} // a retried transaction starts over
 		qq := sqlcgen.New(tx)
 		// The attempt goes first. The status update fires the outbox
 		// trigger, which locks the notification's batch row until commit;
 		// updating last keeps that lock to one round trip, so completions
 		// of the same batch barely wait for each other.
-		err := qq.InsertAttempt(ctx, sqlcgen.InsertAttemptParams{
+		inserted, err := qq.InsertAttempt(ctx, sqlcgen.InsertAttemptParams{
 			NotificationID:    c.NotificationID,
 			AttemptNo:         attemptNo,
 			Outcome:           string(a.Outcome),
@@ -165,11 +171,22 @@ func (q QueueStore) Complete(ctx context.Context, c *queue.Completion) (bool, er
 		if err != nil {
 			return fmt.Errorf("insert attempt: %w", err)
 		}
+		res.DuplicateAttempt = inserted == 0
 		switch c.Status {
 		case domain.StatusSent:
-			rows, err = qq.CompleteSent(ctx, sqlcgen.CompleteSentParams{
+			var previous string
+			previous, err = qq.CompleteSent(ctx, sqlcgen.CompleteSentParams{
 				ID: c.NotificationID, WorkerID: &c.WorkerID, Now: &c.Now, ProviderMessageID: nilIfZero(a.ProviderMessageID),
 			})
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				err = nil
+			case err == nil:
+				rows = 1
+				if previous != string(domain.StatusProcessing) {
+					res.RecoveredFrom = domain.Status(previous)
+				}
+			}
 		case domain.StatusPending:
 			rows, err = qq.CompleteRetry(ctx, sqlcgen.CompleteRetryParams{
 				ID: c.NotificationID, WorkerID: &c.WorkerID, NextAttemptAt: c.NextAttemptAt,
@@ -189,9 +206,10 @@ func (q QueueStore) Complete(ctx context.Context, c *queue.Completion) (bool, er
 		return nil
 	})
 	if err != nil {
-		return false, fmt.Errorf("complete delivery: %w", err)
+		return queue.CompleteResult{}, fmt.Errorf("complete delivery: %w", err)
 	}
-	return rows == 1, nil
+	res.Applied = rows == 1
+	return res, nil
 }
 
 // Release implements queue.Queue.

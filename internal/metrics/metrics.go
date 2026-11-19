@@ -52,6 +52,7 @@ type Metrics struct {
 	RateLimitWait    *prometheus.HistogramVec
 	BreakerState     *prometheus.GaugeVec
 	LeaseExpired     prometheus.Counter
+	SendsRecovered   *prometheus.CounterVec
 
 	CallbackDeliveries *prometheus.CounterVec
 	WebSocketClients   prometheus.Gauge
@@ -85,7 +86,7 @@ func New() *Metrics {
 		QueueDepth: f.gaugeVec("notification_queue_depth", "Notifications waiting or in flight, sampled.",
 			"channel", "priority", "status"),
 		QueueOldestAge: f.gaugeVec("notification_queue_oldest_age_seconds",
-			"How long the oldest due pending notification has been waiting, sampled.", "channel"),
+			"How long the oldest due notification (pending, or scheduled and past its time) has been waiting, sampled.", "channel"),
 		OutboxLag:     f.gauge("outbox_lag_seconds", "Age of the oldest unpublished outbox event, sampled."),
 		OutboxBacklog: f.gauge("outbox_backlog_events", "Unpublished outbox events, sampled."),
 
@@ -97,6 +98,9 @@ func New() *Metrics {
 			[]float64{0, .001, .005, .01, .05, .1, .25, .5, 1}, "channel"),
 		BreakerState: f.gaugeVec("circuit_breaker_state", "0 closed, 1 half-open, 2 open.", "channel"),
 		LeaseExpired: f.counter("worker_lease_expired_total", "Claims recovered by the reaper after their worker stopped heartbeating."),
+		SendsRecovered: f.counterVec("delivery_recovered_after_lease_loss_total",
+			"Sends the provider accepted after the worker had lost its lease; recorded as sent, correcting the status the reaper left.",
+			"channel", "previous_status"),
 
 		CallbackDeliveries: f.counterVec("callback_deliveries_total", "Status callback attempts by result.", "result"),
 		WebSocketClients:   f.gauge("websocket_clients", "Connected WebSocket clients."),

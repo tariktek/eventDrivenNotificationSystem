@@ -111,15 +111,16 @@ func run() error {
 		}, publish)
 	})
 	routes := router.New(router.Deps{
-		Health:         checks,
-		API:            handler.New(svc, meta),
-		Log:            log,
-		MaxBodyBytes:   cfg.HTTP.MaxBodyBytes,
-		APIKeys:        cfg.Auth.APIKeys,
-		Idempotency:    store.Idempotency(),
-		IdempotencyTTL: cfg.Auth.IdempotencyTTL,
-		Now:            time.Now,
-		Metrics:        m,
+		Health:                checks,
+		API:                   handler.New(svc, meta),
+		Log:                   log,
+		MaxBodyBytes:          cfg.HTTP.MaxBodyBytes,
+		APIKeys:               cfg.Auth.APIKeys,
+		Idempotency:           store.Idempotency(),
+		IdempotencyTTL:        cfg.Auth.IdempotencyTTL,
+		IdempotencyStaleAfter: cfg.Auth.IdempotencyStaleAfter,
+		Now:                   time.Now,
+		Metrics:               m,
 		Realtime: &realtime.Handler{
 			Hub:            hub,
 			OriginPatterns: cfg.WS.AllowedOrigins,

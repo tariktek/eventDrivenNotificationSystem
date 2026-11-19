@@ -24,6 +24,10 @@ func TestLoadFrom_Defaults(t *testing.T) {
 	assert.Equal(t, "redis://localhost:6379/0", cfg.Redis.URL)
 	assert.Equal(t, []string{config.DevAPIKey}, cfg.Auth.APIKeys)
 	assert.Equal(t, 24*time.Hour, cfg.Auth.IdempotencyTTL)
+	assert.Equal(t, time.Minute, cfg.Auth.IdempotencyStaleAfter)
+	// The provider allows 100/s per channel; sending at 95 leaves room for
+	// network jitter bunching arrivals (see loadtest/README.md).
+	assert.Equal(t, 95, cfg.Worker.RateLimit)
 	assert.Equal(t, config.BreakerConfig{Window: 10 * time.Second, MinRequests: 20, FailureRatio: 0.5, OpenTimeout: 30 * time.Second, Probes: 5}, cfg.Breaker)
 }
 
@@ -88,6 +92,7 @@ func TestLoadFrom_Invalid(t *testing.T) {
 		{"dev key in production", map[string]string{"APP_ENV": "production"}, "API_KEYS"},
 		{"short key in production", map[string]string{"APP_ENV": "production", "API_KEYS": "short"}, "API_KEYS"},
 		{"zero idempotency ttl", map[string]string{"IDEMPOTENCY_TTL": "0s"}, "IDEMPOTENCY_TTL"},
+		{"stale takeover within a request", map[string]string{"IDEMPOTENCY_STALE_AFTER": "10s"}, "IDEMPOTENCY_STALE_AFTER"},
 		{"provider url not http", map[string]string{"PROVIDER_URL": "ftp://x/send"}, "PROVIDER_URL"},
 		{"bad channel provider url", map[string]string{"PROVIDER_URL_EMAIL": "not a url"}, "PROVIDER_URL_EMAIL"},
 		{"zero provider timeout", map[string]string{"PROVIDER_TIMEOUT": "0s"}, "PROVIDER_TIMEOUT"},

@@ -23,6 +23,41 @@ func (q *Queries) BatchExists(ctx context.Context, id uuid.UUID) (bool, error) {
 	return exists, err
 }
 
+const completeEmptyBatch = `-- name: CompleteEmptyBatch :one
+UPDATE batches
+SET completed_at = $1
+WHERE id = $2 AND created_count = 0 AND completed_at IS NULL
+RETURNING id, total, created_count, completed_at
+`
+
+type CompleteEmptyBatchParams struct {
+	Now *time.Time
+	ID  uuid.UUID
+}
+
+type CompleteEmptyBatchRow struct {
+	ID           uuid.UUID
+	Total        int32
+	CreatedCount int32
+	CompletedAt  *time.Time
+}
+
+// A batch whose items all existed already (every idempotency_key was a
+// duplicate) creates no notification, so no status change will ever
+// complete it: it is complete as soon as it is stored. Runs in the
+// batch's own transaction, after its notifications were inserted.
+func (q *Queries) CompleteEmptyBatch(ctx context.Context, arg CompleteEmptyBatchParams) (CompleteEmptyBatchRow, error) {
+	row := q.db.QueryRow(ctx, completeEmptyBatch, arg.Now, arg.ID)
+	var i CompleteEmptyBatchRow
+	err := row.Scan(
+		&i.ID,
+		&i.Total,
+		&i.CreatedCount,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
 const countBatchStatuses = `-- name: CountBatchStatuses :many
 SELECT status, count(*)::int AS count
 FROM notifications

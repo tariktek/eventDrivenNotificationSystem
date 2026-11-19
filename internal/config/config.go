@@ -96,7 +96,11 @@ type WorkerConfig struct {
 	// PriorityAging promotes waiting work one priority level per interval.
 	PriorityAging time.Duration `env:"PRIORITY_AGING" envDefault:"5m"`
 	// RateLimit is messages per second per channel, across all workers.
-	RateLimit   int           `env:"RATE_LIMIT"   envDefault:"100"`
+	// Sends leave exactly 1/RateLimit apart, but they reach the provider
+	// with network jitter, which can bunch a few into the next second. The
+	// default keeps 5% below the provider's limit of 100/s so that, counted
+	// on arrival, no second ever exceeds 100 (measured: see loadtest/).
+	RateLimit   int           `env:"RATE_LIMIT"   envDefault:"95"`
 	RateHorizon time.Duration `env:"RATE_HORIZON" envDefault:"1s"`
 	// ExpectedInstances sizes the local fallback limiter: if Redis is down,
 	// each worker sends at RateLimit / ExpectedInstances.
@@ -151,6 +155,11 @@ type AuthConfig struct {
 	APIKeys []string `env:"API_KEYS" envDefault:"dev-api-key-change-me" envSeparator:","`
 	// IdempotencyTTL is how long an Idempotency-Key response is replayable.
 	IdempotencyTTL time.Duration `env:"IDEMPOTENCY_TTL" envDefault:"24h"`
+	// IdempotencyStaleAfter is how long a key may stay "in progress" before
+	// a retry with the same request may take it over. It must exceed the
+	// longest request (see HTTP_WRITE_TIMEOUT); even when one runs longer,
+	// the takeover rolls the slow request back instead of creating twice.
+	IdempotencyStaleAfter time.Duration `env:"IDEMPOTENCY_STALE_AFTER" envDefault:"1m"`
 }
 
 // LogConfig controls structured logging output.
@@ -286,6 +295,9 @@ func (c Config) Validate() error {
 	}
 	if c.Auth.IdempotencyTTL <= 0 {
 		errs = append(errs, errors.New("IDEMPOTENCY_TTL: must be positive"))
+	}
+	if c.Auth.IdempotencyStaleAfter <= c.HTTP.WriteTimeout || c.Auth.IdempotencyStaleAfter > c.Auth.IdempotencyTTL {
+		errs = append(errs, errors.New("IDEMPOTENCY_STALE_AFTER: must exceed HTTP_WRITE_TIMEOUT and not exceed IDEMPOTENCY_TTL"))
 	}
 
 	errs = append(errs, c.Worker.validate()...)

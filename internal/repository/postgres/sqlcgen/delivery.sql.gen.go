@@ -72,42 +72,53 @@ func (q *Queries) CompleteRetry(ctx context.Context, arg CompleteRetryParams) (i
 	return result.RowsAffected(), nil
 }
 
-const completeSent = `-- name: CompleteSent :execrows
+const completeSent = `-- name: CompleteSent :one
 
-UPDATE notifications
+WITH cur AS (
+    SELECT c.id, c.status AS previous_status FROM notifications c WHERE c.id = $4 FOR UPDATE
+)
+UPDATE notifications n
 SET status = 'sent', sent_at = $1, provider_message_id = $2,
+    failed_at = NULL, cancelled_at = NULL,
     locked_by = NULL, locked_until = NULL, last_error = NULL, last_error_code = NULL
-WHERE id = $3
-  AND ((status = 'processing' AND locked_by = $4) OR (status = 'pending' AND locked_by IS NULL))
+FROM cur
+WHERE n.id = cur.id
+  AND ((n.status = 'processing' AND n.locked_by = $3)
+       OR (n.status IN ('pending', 'failed', 'cancelled') AND n.locked_by IS NULL))
+RETURNING cur.previous_status
 `
 
 type CompleteSentParams struct {
 	Now               *time.Time
 	ProviderMessageID *string
-	ID                uuid.UUID
 	WorkerID          *string
+	ID                uuid.UUID
 }
 
 // Delivery outcomes. Each update only applies while this worker still holds
 // the lease, so a worker whose lease expired cannot overwrite the state a
 // newer owner set.
-// A sent message is recorded even if our lease expired and the reaper put
-// the notification back to pending (not yet re-claimed): it did go out, and
-// leaving it pending would send it a second time.
-func (q *Queries) CompleteSent(ctx context.Context, arg CompleteSentParams) (int64, error) {
-	result, err := q.db.Exec(ctx, completeSent,
+// A sent message is recorded even if this worker lost its lease meanwhile,
+// as long as no other worker holds the notification now: the provider is
+// the source of truth, and the message did go out. That covers a lease that
+// expired during a slow provider call, after which the reaper put the
+// notification back to pending (leaving it would send it twice) or, on its
+// last attempt, failed it (leaving it would report a delivered message as
+// failed, and a redrive would send it again), and a cancel that came after
+// the reaper. Returns the status it replaced; no row if nothing changed.
+func (q *Queries) CompleteSent(ctx context.Context, arg CompleteSentParams) (string, error) {
+	row := q.db.QueryRow(ctx, completeSent,
 		arg.Now,
 		arg.ProviderMessageID,
-		arg.ID,
 		arg.WorkerID,
+		arg.ID,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	var previous_status string
+	err := row.Scan(&previous_status)
+	return previous_status, err
 }
 
-const insertAttempt = `-- name: InsertAttempt :exec
+const insertAttempt = `-- name: InsertAttempt :execrows
 INSERT INTO notification_attempts
     (notification_id, attempt_no, outcome, status_code, error_code, error, provider_message_id, duration_ms, created_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -127,8 +138,11 @@ type InsertAttemptParams struct {
 }
 
 // The attempt is recorded whatever happened to the lease: it is history.
-func (q *Queries) InsertAttempt(ctx context.Context, arg InsertAttemptParams) error {
-	_, err := q.db.Exec(ctx, insertAttempt,
+// attempt_no comes from total_attempts, which is never reset, so a
+// conflict means the same attempt was recorded twice; it is reported to
+// the caller (0 rows) rather than failing the whole outcome.
+func (q *Queries) InsertAttempt(ctx context.Context, arg InsertAttemptParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertAttempt,
 		arg.NotificationID,
 		arg.AttemptNo,
 		arg.Outcome,
@@ -139,12 +153,16 @@ func (q *Queries) InsertAttempt(ctx context.Context, arg InsertAttemptParams) er
 		arg.DurationMs,
 		arg.CreatedAt,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const releaseClaims = `-- name: ReleaseClaims :execrows
 UPDATE notifications
-SET status = 'pending', attempts = attempts - 1, locked_by = NULL, locked_until = NULL
+SET status = 'pending', attempts = attempts - 1, total_attempts = total_attempts - 1,
+    locked_by = NULL, locked_until = NULL
 WHERE id = ANY($1::uuid[]) AND status = 'processing' AND locked_by = $2
 `
 
@@ -154,7 +172,8 @@ type ReleaseClaimsParams struct {
 }
 
 // Graceful shutdown: hand back work that was claimed but never sent. The
-// attempt counted at claim time is given back, since nothing was tried.
+// attempt counted at claim time is given back, since nothing was tried
+// (its number was never used for an attempt row).
 func (q *Queries) ReleaseClaims(ctx context.Context, arg ReleaseClaimsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, releaseClaims, arg.Ids, arg.WorkerID)
 	if err != nil {

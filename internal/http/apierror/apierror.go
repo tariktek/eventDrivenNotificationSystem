@@ -53,6 +53,7 @@ func From(err error) *Error {
 		badReq   *BadRequestError
 		verrs    validation.Errors
 		trans    *domain.TransitionError
+		reused   *domain.IdempotencyKeyReusedError
 		tooLarge *http.MaxBytesError
 	)
 	switch {
@@ -74,6 +75,17 @@ func From(err error) *Error {
 	case errors.Is(err, domain.ErrInvalidCursor):
 		e := New(http.StatusUnprocessableEntity, api.ErrorCodeValidationFailed, "The request contains invalid fields.")
 		e.Body.Error.Details = &[]api.FieldError{{Field: "cursor", Reason: "is not a cursor returned by this API"}}
+		return e
+	case errors.As(err, &reused):
+		// Same code as a reused Idempotency-Key header: one rule, whichever
+		// key the client used.
+		e := New(http.StatusUnprocessableEntity, api.ErrorCodeIdempotencyKeyReused,
+			"This idempotency_key was already used for a different notification.")
+		field := reused.Field
+		if field == "" {
+			field = "idempotency_key"
+		}
+		e.Body.Error.Details = &[]api.FieldError{{Field: field, Reason: reused.Error()}}
 		return e
 	case errors.As(err, &trans):
 		return New(http.StatusConflict, api.ErrorCodeInvalidStatusTransition, transitionMessage(trans))

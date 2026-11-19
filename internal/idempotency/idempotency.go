@@ -27,6 +27,12 @@ type Lease struct {
 // this one ran past the stale timeout) and the lease no longer owns it.
 var ErrLeaseLost = errors.New("idempotency lease lost to another request")
 
+// Response is what a request produced, as stored for replay.
+type Response struct {
+	Status int
+	Body   []byte
+}
+
 // Store persists idempotency keys.
 type Store interface {
 	// Acquire claims key for a request with the given hash. It returns
@@ -35,10 +41,20 @@ type Store interface {
 	// for longer than staleAfter (its process presumably died). Otherwise it
 	// returns the existing record.
 	Acquire(ctx context.Context, key, hash string, now time.Time, ttl, staleAfter time.Duration) (lease Lease, rec Record, acquired bool, err error)
-	// Complete stores the response for replay. It returns ErrLeaseLost if
-	// the lease no longer owns the key.
-	Complete(ctx context.Context, lease Lease, status int, body []byte) error
+	// Execute runs the request (fn) and stores its response for replay as
+	// one atomic unit: whatever fn writes to the database through the
+	// context it is given commits in the same transaction as the stored
+	// response, or not at all. So a key can never be left without its
+	// response while what its request created exists (a crash or a failed
+	// write in between would let a retry create it a second time), and a
+	// request whose key was taken over cannot commit anything.
+	//
+	// fn reports whether its response should be kept; if not (a 5xx), its
+	// writes are rolled back and the key stays unfinished, for Release.
+	// Execute returns ErrLeaseLost, with fn's writes rolled back, if the
+	// lease no longer owns the key.
+	Execute(ctx context.Context, lease Lease, fn func(ctx context.Context) (resp Response, keep bool)) (kept bool, err error)
 	// Release frees an unfinished key so the request can be retried. It is a
-	// no-op if the lease no longer owns the key.
+	// no-op if the lease no longer owns the key or its response was stored.
 	Release(ctx context.Context, lease Lease) error
 }

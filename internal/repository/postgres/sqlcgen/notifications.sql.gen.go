@@ -35,7 +35,7 @@ const cancelNotification = `-- name: CancelNotification :one
 UPDATE notifications
 SET status = 'cancelled', cancelled_at = $1
 WHERE id = $2 AND status IN ('pending', 'scheduled')
-RETURNING id, batch_id, channel, priority, recipient, subject, content, segments, template_id, template_version, template_vars, status, idempotency_key, attempts, max_attempts, next_attempt_at, locked_by, locked_until, scheduled_at, sent_at, failed_at, cancelled_at, provider_message_id, last_error, last_error_code, callback_url, metadata, correlation_id, trace_parent, created_at, updated_at
+RETURNING id, batch_id, channel, priority, recipient, subject, content, segments, template_id, template_version, template_vars, status, idempotency_key, attempts, max_attempts, next_attempt_at, locked_by, locked_until, scheduled_at, sent_at, failed_at, cancelled_at, provider_message_id, last_error, last_error_code, callback_url, metadata, correlation_id, trace_parent, created_at, updated_at, total_attempts, request_hash
 `
 
 type CancelNotificationParams struct {
@@ -80,6 +80,8 @@ func (q *Queries) CancelNotification(ctx context.Context, arg CancelNotification
 		&i.TraceParent,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TotalAttempts,
+		&i.RequestHash,
 	)
 	return i, err
 }
@@ -117,7 +119,7 @@ func (q *Queries) CountFailedNotifications(ctx context.Context, arg CountFailedN
 
 const getNotification = `-- name: GetNotification :one
 
-SELECT id, batch_id, channel, priority, recipient, subject, content, segments, template_id, template_version, template_vars, status, idempotency_key, attempts, max_attempts, next_attempt_at, locked_by, locked_until, scheduled_at, sent_at, failed_at, cancelled_at, provider_message_id, last_error, last_error_code, callback_url, metadata, correlation_id, trace_parent, created_at, updated_at FROM notifications WHERE id = $1
+SELECT id, batch_id, channel, priority, recipient, subject, content, segments, template_id, template_version, template_vars, status, idempotency_key, attempts, max_attempts, next_attempt_at, locked_by, locked_until, scheduled_at, sent_at, failed_at, cancelled_at, provider_message_id, last_error, last_error_code, callback_url, metadata, correlation_id, trace_parent, created_at, updated_at, total_attempts, request_hash FROM notifications WHERE id = $1
 `
 
 // Bulk insert and filtered listing are hand-written in notifications.go:
@@ -158,6 +160,8 @@ func (q *Queries) GetNotification(ctx context.Context, id uuid.UUID) (Notificati
 		&i.TraceParent,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TotalAttempts,
+		&i.RequestHash,
 	)
 	return i, err
 }
@@ -174,7 +178,7 @@ func (q *Queries) GetNotificationStatus(ctx context.Context, id uuid.UUID) (stri
 }
 
 const getNotificationsByIdempotencyKeys = `-- name: GetNotificationsByIdempotencyKeys :many
-SELECT id, batch_id, channel, priority, recipient, subject, content, segments, template_id, template_version, template_vars, status, idempotency_key, attempts, max_attempts, next_attempt_at, locked_by, locked_until, scheduled_at, sent_at, failed_at, cancelled_at, provider_message_id, last_error, last_error_code, callback_url, metadata, correlation_id, trace_parent, created_at, updated_at FROM notifications WHERE idempotency_key = ANY($1::text[])
+SELECT id, batch_id, channel, priority, recipient, subject, content, segments, template_id, template_version, template_vars, status, idempotency_key, attempts, max_attempts, next_attempt_at, locked_by, locked_until, scheduled_at, sent_at, failed_at, cancelled_at, provider_message_id, last_error, last_error_code, callback_url, metadata, correlation_id, trace_parent, created_at, updated_at, total_attempts, request_hash FROM notifications WHERE idempotency_key = ANY($1::text[])
 `
 
 func (q *Queries) GetNotificationsByIdempotencyKeys(ctx context.Context, keys []string) ([]Notification, error) {
@@ -218,6 +222,8 @@ func (q *Queries) GetNotificationsByIdempotencyKeys(ctx context.Context, keys []
 			&i.TraceParent,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.TotalAttempts,
+			&i.RequestHash,
 		); err != nil {
 			return nil, err
 		}
@@ -232,7 +238,7 @@ func (q *Queries) GetNotificationsByIdempotencyKeys(ctx context.Context, keys []
 const listAttempts = `-- name: ListAttempts :many
 SELECT id, notification_id, attempt_no, outcome, status_code, error_code, error, provider_message_id, duration_ms, created_at FROM notification_attempts
 WHERE notification_id = $1
-ORDER BY attempt_no
+ORDER BY attempt_no, id
 `
 
 func (q *Queries) ListAttempts(ctx context.Context, notificationID uuid.UUID) ([]NotificationAttempt, error) {
@@ -298,7 +304,8 @@ type RetryFailedNotificationsParams struct {
 // Bulk dead-letter redrive, e.g. after a provider outage. The filters are
 // optional; LIMIT keeps one call's write bounded (callers repeat until
 // nothing matches). SKIP LOCKED lets two concurrent redrives split the work
-// instead of blocking each other. Oldest first, via the status index.
+// instead of blocking each other. Oldest first, via the status index. Like
+// a single retry, it resets the attempt budget but not total_attempts.
 func (q *Queries) RetryFailedNotifications(ctx context.Context, arg RetryFailedNotificationsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, retryFailedNotifications,
 		arg.Now,
@@ -319,7 +326,7 @@ const retryNotification = `-- name: RetryNotification :one
 UPDATE notifications
 SET status = 'pending', attempts = 0, next_attempt_at = $1, failed_at = NULL
 WHERE id = $2 AND status = 'failed'
-RETURNING id, batch_id, channel, priority, recipient, subject, content, segments, template_id, template_version, template_vars, status, idempotency_key, attempts, max_attempts, next_attempt_at, locked_by, locked_until, scheduled_at, sent_at, failed_at, cancelled_at, provider_message_id, last_error, last_error_code, callback_url, metadata, correlation_id, trace_parent, created_at, updated_at
+RETURNING id, batch_id, channel, priority, recipient, subject, content, segments, template_id, template_version, template_vars, status, idempotency_key, attempts, max_attempts, next_attempt_at, locked_by, locked_until, scheduled_at, sent_at, failed_at, cancelled_at, provider_message_id, last_error, last_error_code, callback_url, metadata, correlation_id, trace_parent, created_at, updated_at, total_attempts, request_hash
 `
 
 type RetryNotificationParams struct {
@@ -328,7 +335,8 @@ type RetryNotificationParams struct {
 }
 
 // Manual retry from the dead-letter state with a fresh attempt budget.
-// last_error is kept for context; the attempts table holds the full history.
+// last_error is kept for context; the attempts table holds the full history
+// (its rows are numbered by total_attempts, which a retry does not reset).
 func (q *Queries) RetryNotification(ctx context.Context, arg RetryNotificationParams) (Notification, error) {
 	row := q.db.QueryRow(ctx, retryNotification, arg.Now, arg.ID)
 	var i Notification
@@ -364,6 +372,8 @@ func (q *Queries) RetryNotification(ctx context.Context, arg RetryNotificationPa
 		&i.TraceParent,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TotalAttempts,
+		&i.RequestHash,
 	)
 	return i, err
 }

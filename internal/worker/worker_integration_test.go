@@ -117,6 +117,20 @@ type opts struct {
 	breaker     breaker.Config
 	claimDelay  time.Duration // makes every claim this much slower
 	log         *slog.Logger  // default: discarded
+	limiter     *countingLimiter
+	shared      ratelimit.Limiter // one timeline for several workers, as Redis gives them
+}
+
+// countingLimiter counts the send slots a limiter grants.
+type countingLimiter struct {
+	ratelimit.Limiter
+	granted atomic.Int64
+}
+
+func (l *countingLimiter) Reserve(ctx context.Context, key string, n int) (ratelimit.Reservation, error) {
+	r, err := l.Limiter.Reserve(ctx, key, n)
+	l.granted.Add(int64(r.Count))
+	return r, err
 }
 
 // logBuffer collects a worker's log output; the worker writes from many
@@ -178,6 +192,14 @@ func startWorker(t *testing.T, p *fakeProvider, o opts) (w *worker.Worker, stop 
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	var limiter ratelimit.Limiter = ratelimit.NewLocal(ratelimit.Config{Rate: o.rate, Horizon: 500 * time.Millisecond}, nil)
+	if o.shared != nil {
+		limiter = o.shared
+	}
+	if o.limiter != nil {
+		o.limiter.Limiter = limiter
+		limiter = o.limiter
+	}
 	w = worker.New(worker.Config{
 		ID:            "test-" + uuid.NewString()[:8],
 		Channels:      domain.Channels,
@@ -191,7 +213,7 @@ func startWorker(t *testing.T, p *fakeProvider, o opts) (w *worker.Worker, stop 
 		Breaker:       o.breaker,
 	}, worker.Deps{
 		Queue:    slowQueue{Queue: store.Queue(), delay: o.claimDelay},
-		Limiter:  ratelimit.NewLocal(ratelimit.Config{Rate: o.rate, Horizon: 500 * time.Millisecond}, nil),
+		Limiter:  limiter,
 		Sender:   provider.NewHTTPClient(provider.HTTPConfig{URLs: map[domain.Channel]string{domain.ChannelSMS: p.srv.URL, domain.ChannelEmail: p.srv.URL, domain.ChannelPush: p.srv.URL}, Timeout: 2 * time.Second}),
 		Policy:   retry.Policy{Base: 20 * time.Millisecond, Max: 100 * time.Millisecond},
 		Notifier: store.Queue(),
@@ -523,6 +545,33 @@ func TestWorker_CircuitBreakerPreservesAttempts(t *testing.T) {
 	assert.Zero(t, locked)
 }
 
+// TestWorker_OpenBreakerReservesNoSlots: notifications claimed before the
+// breaker opened must be handed back without taking send slots. Slots are
+// on the timeline all workers share: reserving them for deliveries the
+// breaker then refuses pushes every other worker's sends back.
+func TestWorker_OpenBreakerReservesNoSlots(t *testing.T) {
+	reset(t)
+	p := newFakeProvider(t, func(string, int) int { return http.StatusServiceUnavailable })
+	create(t, 100, func(_ int, p *domain.NewNotificationParams) { p.MaxAttempts = 10 })
+	counter := &countingLimiter{}
+	// A slow rate, so a claim of 25 gets its slots over several rounds and
+	// claimed notifications are still waiting when the breaker opens. The
+	// long open timeout keeps half-open probes out of the measurement.
+	w, _ := startWorker(t, p, opts{rate: 20, limiter: counter, breaker: breaker.Config{
+		Window: 10 * time.Second, MinRequests: 5, FailureRatio: 0.5, OpenTimeout: time.Minute, Probes: 2,
+	}})
+	waitFor(t, 5*time.Second, func() bool { return w.BreakerStates()[domain.ChannelSMS] == breaker.StateOpen })
+	atOpen := counter.granted.Load()
+
+	time.Sleep(time.Second) // several dispatch rounds with notifications still claimed
+	assert.Equal(t, atOpen, counter.granted.Load(), "no slots reserved while the breaker is open")
+	waitFor(t, 5*time.Second, func() bool {
+		var processing int
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM notifications WHERE status = 'processing'`).Scan(&processing))
+		return processing == 0
+	})
+}
+
 // TestWorker_PermanentErrorsDoNotTripTheBreaker: a stream of invalid
 // recipients is a problem with the messages, not with the provider.
 func TestWorker_PermanentErrorsDoNotTripTheBreaker(t *testing.T) {
@@ -639,6 +688,30 @@ func (p *fakeProvider) busiestSecond() int {
 // time the claim returned, all those deliveries went out at once on top of
 // the next reservation's, and the provider saw 175/s at a 100/s limit.
 // Slots are now reserved after the claim.
+// TestWorker_ProviderNeverSeesMoreThan100PerSecond checks the requirement
+// as stated, with the shipped default: two workers sharing one timeline at
+// 95/s, a backlog of several seconds, and the provider counting arrivals
+// in every sliding one-second window (stricter than per calendar second).
+// The limit is 100, with no tolerance.
+func TestWorker_ProviderNeverSeesMoreThan100PerSecond(t *testing.T) {
+	reset(t)
+	defaults, err := config.LoadFrom(map[string]string{})
+	require.NoError(t, err)
+	rate := defaults.Worker.RateLimit
+	const providerLimit = 100
+
+	p := newFakeProvider(t, alwaysAccept)
+	create(t, 4*rate, nil)
+	shared := ratelimit.NewLocal(ratelimit.Config{Rate: rate, Horizon: defaults.Worker.RateHorizon}, nil)
+	startWorker(t, p, opts{rate: rate, shared: shared})
+	startWorker(t, p, opts{rate: rate, shared: shared})
+
+	waitFor(t, 20*time.Second, func() bool { return statusCounts(t)[domain.StatusSent] == 4*rate })
+	worst := p.busiestSecond()
+	t.Logf("%d notifications at %d/s over two workers; busiest one-second window at the provider: %d", 4*rate, rate, worst)
+	assert.LessOrEqual(t, worst, providerLimit)
+}
+
 func TestWorker_SlowClaimsDoNotBurstPastTheLimit(t *testing.T) {
 	reset(t)
 	const rate = 50

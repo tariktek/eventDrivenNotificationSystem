@@ -39,11 +39,26 @@ func (s *Service) CreateNotification(ctx context.Context, req *validation.Notifi
 		return CreateResult{}, err
 	}
 
-	res, err := s.store.InsertNotifications(ctx, []*domain.Notification{n})
+	// InTx, not a bare insert: inside an idempotent request it joins the
+	// transaction that also stores the response.
+	var res []postgres.InsertResult
+	err = s.store.InTx(ctx, func(r *postgres.Repo) error {
+		res, err = r.InsertNotifications(ctx, []*domain.Notification{n})
+		return err
+	})
 	if err != nil {
-		return CreateResult{}, err
+		return CreateResult{}, keyReusedAt(err, func(int) string { return "idempotency_key" })
 	}
 	return CreateResult{Notification: res[0].Notification, Duplicate: res[0].Duplicate}, nil
+}
+
+// keyReusedAt fills in the request path of an idempotency key conflict.
+func keyReusedAt(err error, field func(index int) string) error {
+	var reused *domain.IdempotencyKeyReusedError
+	if errors.As(err, &reused) {
+		reused.Field = field(reused.Index)
+	}
+	return err
 }
 
 // CreateBatch validates every item, then stores the batch and all its
@@ -94,10 +109,15 @@ func (s *Service) CreateBatch(ctx context.Context, items []validation.Notificati
 			return err
 		}
 		inserted, err = r.InsertNotifications(ctx, ns)
-		return err
+		if err != nil {
+			return err
+		}
+		// Only duplicates: no item will ever change status and complete
+		// the batch, so it is complete now.
+		return r.CompleteEmptyBatch(ctx, batch.ID, now)
 	})
 	if err != nil {
-		return BatchResult{}, err
+		return BatchResult{}, keyReusedAt(err, func(i int) string { return fmt.Sprintf("items[%d].idempotency_key", i) })
 	}
 
 	out := BatchResult{Batch: batch, Items: make([]CreateResult, len(inserted))}
@@ -146,6 +166,9 @@ func (s *Service) build(ctx context.Context, p *validation.ParsedNotification, f
 		params.TemplateID, params.TemplateVersion, params.TemplateVars = &tpl.ID, tpl.Version, p.TemplateVars
 	}
 
+	if params.IdempotencyKey != "" {
+		params.RequestHash = domain.RequestFingerprint(&params)
+	}
 	return domain.NewNotification(params, now)
 }
 

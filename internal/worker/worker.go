@@ -9,9 +9,10 @@
 //     when closed, nothing when open, a few probes when half-open;
 //  3. claims up to that many due notifications, highest effective priority
 //     first;
-//  4. reserves send slots for them from the rate limiter (≤ Rate per
-//     second, shared by every worker instance), keeping any it got no slot
-//     for until the next reservation;
+//  4. asks the breaker to admit them, then reserves send slots for the
+//     admitted ones from the rate limiter (≤ Rate per second, shared by
+//     every worker instance), keeping any it got no slot for until the
+//     next reservation;
 //  5. hands each one a slot: a goroutine waits for the slot time, calls the
 //     provider, and records the outcome (sent / retry later / failed).
 //
@@ -238,6 +239,20 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 			claimed = ns
 		}
 
+		// Admit first, then reserve: the breaker decides which deliveries
+		// may go, and only those get send slots. A slot reserved for a
+		// delivery the breaker then refuses is not just wasted: the slots
+		// are on the timeline every worker shares, so it would push back
+		// every other worker's sends.
+		tickets := admit(cb, min(len(claimed), free))
+		if len(tickets) == 0 {
+			// The breaker opened (or ran out of half-open probes) while
+			// these waited: hand them back with their attempt refunded.
+			w.release(sendCtx, w.untrackAll(claimed))
+			claimed = nil
+			continue
+		}
+
 		// Reserve send slots only now, with the work in hand. Reserving
 		// before the claim looked cheaper, but under load a claim can take
 		// hundreds of milliseconds: the reserved slots would be in the past
@@ -246,27 +261,24 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 		// see well over the limit in that second (measured: 175/s at a
 		// 100/s limit in the flash-sale load test). Now a slot is at most a
 		// Redis round trip old when its delivery is scheduled.
-		res, err := w.Limiter.Reserve(ctx, string(ch), min(len(claimed), free))
+		res, err := w.Limiter.Reserve(ctx, string(ch), len(tickets))
 		if err != nil {
+			skipAll(tickets)
 			if ctx.Err() == nil {
 				w.Log.ErrorContext(ctx, "reserve send slots", "channel", ch, "error", err)
 				sleep(ctx, w.cfg.PollInterval)
 			}
 			continue
 		}
-		if res.Count == 0 { // the next second's slots are taken; wait for one
+		skipAll(tickets[res.Count:]) // admitted, but no slot this time
+		if res.Count == 0 {          // the next second's slots are taken; wait for one
 			sleep(ctx, res.First)
 			continue
 		}
 		base := w.Now()
 
-		var rejected []uuid.UUID
 		for i, n := range claimed[:res.Count] {
-			ticket := cb.Admit()
-			if ticket == nil { // the breaker opened while these waited
-				rejected = append(rejected, n.ID)
-				continue
-			}
+			ticket := tickets[i]
 			slots <- struct{}{}
 			at := base.Add(res.Delay(i))
 			deliveries.Go(func() {
@@ -282,10 +294,28 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 			})
 		}
 		claimed = claimed[res.Count:]
-		w.release(sendCtx, rejected)
-		for _, id := range rejected {
-			w.track(id, false)
+	}
+}
+
+// admit asks the breaker for up to n deliveries, stopping at the first
+// refusal.
+func admit(cb *breaker.Breaker, n int) []*breaker.Ticket {
+	tickets := make([]*breaker.Ticket, 0, n)
+	for range n {
+		t := cb.Admit()
+		if t == nil {
+			break
 		}
+		tickets = append(tickets, t)
+	}
+	return tickets
+}
+
+// skipAll returns tickets whose deliveries will not be attempted now, so
+// they count neither way (and a half-open probe can be reused).
+func skipAll(tickets []*breaker.Ticket) {
+	for _, t := range tickets {
+		t.Skip()
 	}
 }
 
@@ -316,7 +346,7 @@ func (w *Worker) release(ctx context.Context, ids []uuid.UUID) {
 // outcome.
 func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, at time.Time, ticket *breaker.Ticket) {
 	logCtx := observability.WithCorrelationID(sendCtx, n.CorrelationID)
-	log := w.Log.With("notification_id", n.ID, "channel", n.Channel, "attempt", n.Attempts)
+	log := w.Log.With("notification_id", n.ID, "channel", n.Channel, "attempt", n.TotalAttempts)
 
 	// Not sent yet when shutdown begins or the breaker opens while this
 	// delivery waited for its slot: give it back untouched.
@@ -337,7 +367,7 @@ func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, a
 			attribute.String("notification.id", n.ID.String()),
 			attribute.String("notification.channel", string(n.Channel)),
 			attribute.String("notification.priority", string(n.Priority)),
-			attribute.Int("notification.attempt", n.Attempts),
+			attribute.Int("notification.attempt", n.TotalAttempts),
 			attribute.String("correlation_id", n.CorrelationID),
 		))
 	defer span.End()
@@ -372,7 +402,15 @@ func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, a
 		span.SetStatus(codes.Error, res.ErrorCode)
 	}
 
-	applied, err := w.Queue.Complete(logCtx, &queue.Completion{
+	if res.Outcome == domain.OutcomeSuccess && res.ErrorCode != "" {
+		// Accepted, but not in the documented response format: recorded as
+		// sent (resending would duplicate the message), with the oddity
+		// kept on the attempt for whoever investigates.
+		log.WarnContext(logCtx, "provider accepted the message with an unexpected response",
+			"error_code", res.ErrorCode, "error", res.Error, "status_code", res.StatusCode)
+	}
+
+	done, err := w.Queue.Complete(logCtx, &queue.Completion{
 		NotificationID: n.ID,
 		WorkerID:       w.cfg.ID,
 		Now:            now,
@@ -380,7 +418,7 @@ func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, a
 		NextAttemptAt:  verdict.NextAttemptAt,
 		Attempt: domain.Attempt{
 			NotificationID:    n.ID,
-			AttemptNo:         n.Attempts,
+			AttemptNo:         n.TotalAttempts,
 			Outcome:           res.Outcome,
 			StatusCode:        res.StatusCode,
 			ErrorCode:         res.ErrorCode,
@@ -389,12 +427,22 @@ func (w *Worker) deliver(ctx, sendCtx context.Context, n *domain.Notification, a
 			Duration:          res.Duration,
 		},
 	})
+	if done.DuplicateAttempt {
+		log.WarnContext(logCtx, "attempt already recorded under this number; not written again")
+	}
+	if done.RecoveredFrom != "" {
+		// The reaper (or a cancel after it) had given up on this
+		// notification while the provider call was still running.
+		w.Metrics.SendsRecovered.WithLabelValues(string(n.Channel), string(done.RecoveredFrom)).Inc()
+		log.WarnContext(logCtx, "lease was lost during the provider call, but the send succeeded: recorded as sent",
+			"previous_status", done.RecoveredFrom)
+	}
 	switch {
 	case err != nil:
 		// The lease will expire and the reaper will requeue it: the message
 		// may be sent again (at-least-once), never lost.
 		log.ErrorContext(logCtx, "record delivery outcome", "error", err, "outcome", res.Outcome)
-	case !applied:
+	case !done.Applied:
 		log.WarnContext(logCtx, "lease lost before the outcome was recorded", "outcome", res.Outcome)
 	case verdict.Status == domain.StatusSent:
 		start := n.CreatedAt
