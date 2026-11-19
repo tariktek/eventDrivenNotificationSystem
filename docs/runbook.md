@@ -132,25 +132,38 @@ dashboard's "Oldest due pending" panel climbs.
 
 ## Redis unavailable
 
-**Symptoms.** Alert `RateLimiterFallback`; API and worker `/ready` report
-`degraded` (`redis` check failing); logs: "shared limiter unavailable" and
-"outbox relay round failed; events stay queued"; alert `OutboxLagging`
-after 30 seconds.
+**Symptoms.** Alert `RateLimiterUnavailable` (metric
+`rate_limiter_unavailable`); worker `/ready` reports `degraded` with
+"shared rate limiter unreachable; deliveries paused"; logs: "rate limiter
+unavailable: handing back claimed notifications and pausing the channel"
+and "outbox relay round failed; events stay queued"; alert `OutboxLagging`
+after 30 seconds; the backlog grows.
 
-**What keeps working:** creating notifications and delivering them.
-Each worker rate-limits itself at `WORKER_RATE_LIMIT` divided by the
-number of workers, which they count from their database connections
-every few seconds (metric `worker_instances`), so scaling during an
-outage keeps the total at the limit.
+**This is by design (fail closed).** The rate limit is global, and only
+the shared limiter in Redis knows what all workers send. A worker that
+cannot reach it sends nothing: it hands its claimed notifications back to
+the queue with their attempts refunded and claims nothing until Redis
+answers. A local share would exceed the limit as soon as only some
+workers lose Redis (one cut off at rate/2 plus one still at the full
+rate: 1.5x the limit). The cost: **if Redis is gone for every worker,
+deliveries stop** until it returns. Waiting is preferred to exceeding
+the provider's limit.
 
-**What pauses:** WebSocket events. They are safe in the `outbox_events`
-table and are published, in order, when Redis returns. Status callbacks
-keep going: they are queued in PostgreSQL with each status change, not
-read from Redis. Nothing needs replaying by hand.
+**What keeps working:** the API accepts and stores notifications (they
+queue up; nothing is lost), workers that still reach Redis keep
+delivering at the full rate, and status callbacks for the status changes
+that still happen (cancellations) are queued in PostgreSQL and sent.
 
-**Act:** restore Redis (`docker compose up -d redis`). Workers switch
-back to the shared limiter within seconds; the outbox backlog drains
-(watch `outbox_backlog_events` fall to zero).
+**What pauses:** deliveries on every worker cut off from Redis, and
+WebSocket events, which wait safely in `outbox_events` and are published
+in order when Redis returns. No attempt is spent while waiting; nothing
+needs replaying by hand.
+
+**Act:** restore Redis (`docker compose up -d redis`). Each worker
+probes the limiter every poll interval and resumes as soon as it
+answers; the queue then drains at the limit and the outbox backlog
+drains too (watch `outbox_backlog_events` fall to zero). A backlog of N
+on a channel takes at least N / `WORKER_RATE_LIMIT` seconds.
 
 **If Redis lost its data** (compose runs it with an append-only file, so
 a restart does not): no callback is affected. WebSocket clients may have

@@ -128,7 +128,7 @@ How each requirement of the assessment is met:
 | Cancel pending | `POST /notifications/{id}/cancel`, `POST /batches/{id}/cancel`; a race with a worker claiming it is resolved by the database (one of the two wins) |
 | List with filters and pagination | `GET /notifications?status=&channel=&priority=&batch_id=&created_from=&created_to=`, cursor pagination (stable under inserts, fast at any depth) |
 | Asynchronous processing with workers | PostgreSQL work queue (`FOR UPDATE SKIP LOCKED`), leases with heartbeats, a reaper for crashed workers; 2 worker replicas in compose |
-| 100 messages/second per channel | A shared GCRA limiter in Redis hands out evenly spaced send slots across all workers; local fallback if Redis is down. The default rate is **95/s**: sends leave exactly 1/95 s apart, and the 5% headroom absorbs the network jitter that bunches arrivals, so the provider never counts more than 100 in a second. Checked on the receiving side with no tolerance (a test and the load test, see [Testing](#testing)) |
+| 100 messages/second per channel | A shared GCRA limiter in Redis hands out evenly spaced send slots across all workers. Without it a worker sends nothing (fail closed): its claimed work goes back to the queue, so the limit holds even when only some workers lose Redis; if Redis is gone for all of them, deliveries wait. The default rate is **95/s**: sends leave exactly 1/95 s apart, and the 5% headroom absorbs the network jitter that bunches arrivals, so the provider never counts more than 100 in a second. Checked on the receiving side with no tolerance (a test and the load test, see [Testing](#testing)) |
 | Priority (high, normal, low) | Claimed highest effective priority first; waiting work ages one level every 5 minutes so low priority never starves |
 | Content validation | Per-channel rules above, plus strict JSON (unknown fields rejected), UTF-8 and NUL checks; every problem reported at once, by field path |
 | Idempotency | `Idempotency-Key` header (Stripe-style replay of the original response; what the request creates and the stored response commit in one transaction, so a crash or a failed write in between can never let a retry create twice) and a per-notification `idempotency_key` (a repeat of the same request is reported as a duplicate, not recreated; the same key with a different request is rejected with `422 idempotency_key_reused`) |
@@ -137,7 +137,7 @@ How each requirement of the assessment is met:
 | Structured logging with correlation IDs | JSON logs; `X-Correlation-ID` is accepted or generated, stored with the notification and carried into the worker, the provider call and callbacks; personal data masked |
 | Health check | `/health` (liveness) and `/ready` (dependencies, `degraded` when Redis is down or a breaker is open) |
 | webhook.site as provider | `PROVIDER_URL` (one per channel possible), with a step-by-step [demo](#demo-with-webhooksite-as-the-provider); a fault-injecting mock provider is the default |
-| **Bonus:** advanced failure handling | Circuit breaker, dead-letter queue, leases and reaper, graceful shutdown, Redis fallback, lossless event delivery through the outbox |
+| **Bonus:** advanced failure handling | Circuit breaker, dead-letter queue, leases and reaper, graceful shutdown, fail-closed rate limiting when Redis is unreachable, lossless callbacks through the outbox; best-effort live events over WebSocket |
 | **Bonus:** scheduled notifications | `scheduled_at`; cancellable until due |
 | **Bonus:** templates | `/api/v1/templates`: versioned, variables extracted and validated, preview endpoint, sandboxed functions |
 | **Bonus:** real-time status over WebSocket | `GET /api/v1/ws`: subscribe to notifications, batches, channels; ordered per notification; slow clients disconnected |
@@ -189,7 +189,7 @@ Each has a short decision record in [`docs/adr/`](docs/adr):
 | Decision | Why | Record |
 |---|---|---|
 | **PostgreSQL as the work queue**, not Kafka or RabbitMQ | The notification row and the queue entry are one thing: cancel, status queries, scheduling and retries are plain SQL, in transactions. `SKIP LOCKED` lets many workers claim without blocking each other. One less system to run | [001](docs/adr/001-postgres-work-queue.md) |
-| **Transactional outbox** to Redis Streams | An event exists if and only if its change committed. Redis down means events wait, never lost | [002](docs/adr/002-transactional-outbox.md) |
+| **Transactional outbox** to Redis Streams | An event exists if and only if its change committed. Events are never lost from the outbox table and are published once Redis is back; the stream is trimmed, so a WebSocket client can miss events and reloads the state over REST. Callbacks are queued in PostgreSQL with the change, so none is lost | [002](docs/adr/002-transactional-outbox.md) |
 | **GCRA rate limiter in Redis**, slots reserved after the claim | Exact spacing (10 ms) shared by all workers; reserving after the claim was a load-test finding (see below) | [003](docs/adr/003-rate-limiting.md) |
 | **Retry with full jitter, per-channel circuit breaker** | Retries spread out instead of stampeding a recovering provider; an outage delays notifications instead of failing them | [004](docs/adr/004-retry-and-circuit-breaker.md) |
 | **At-least-once delivery** | Exactly-once is impossible end to end without the provider's help; the duplicate window is narrowed and the provider gets an idempotency key | [005](docs/adr/005-at-least-once-delivery.md) |
@@ -301,7 +301,7 @@ stateDiagram-v2
 - **Dashboard and alerts:** the Grafana dashboard (provisioned) shows them
   live; Prometheus alerts on a stale backlog (overdue scheduled sends
   included), a failure rate over 10% (also on a channel that has never
-  succeeded), a breaker open over 2 minutes, outbox lag, limiter fallback
+  succeeded), a breaker open over 2 minutes, outbox lag, an unreachable rate limiter
   and sends that outlived their lease.
 - **Logs:** JSON with `correlation_id`, `trace_id`, `span_id`; phone
   numbers and emails masked in every record.
@@ -368,7 +368,7 @@ production refuses development secrets). Defaults suit local development;
 | Auth | `API_KEYS` (comma-separated; dev key), `IDEMPOTENCY_TTL` (24h), `IDEMPOTENCY_STALE_AFTER` (1m) |
 | Storage | `DATABASE_URL`, `DATABASE_MAX_CONNS` (20), `DATABASE_MIN_CONNS` (2), `REDIS_URL` |
 | Provider | `PROVIDER_URL` (mock), `PROVIDER_URL_SMS` / `_EMAIL` / `_PUSH` (per-channel overrides), `PROVIDER_TIMEOUT` (10s) |
-| Worker | `WORKER_RATE_LIMIT` (95/s per channel), `WORKER_RATE_HORIZON` (1s), `WORKER_CONCURRENCY` (100), `WORKER_BATCH_SIZE` (50), `WORKER_POLL_INTERVAL` (1s), `WORKER_LEASE` (30s), `WORKER_REAP_INTERVAL` (10s), `WORKER_PRIORITY_AGING` (5m), `WORKER_EXPECTED_INSTANCES` (1; starting value, workers count each other live), `WORKER_ID` |
+| Worker | `WORKER_RATE_LIMIT` (95/s per channel), `WORKER_RATE_HORIZON` (1s), `WORKER_CONCURRENCY` (100), `WORKER_BATCH_SIZE` (50), `WORKER_POLL_INTERVAL` (1s), `WORKER_LEASE` (30s), `WORKER_REAP_INTERVAL` (10s), `WORKER_PRIORITY_AGING` (5m), `WORKER_ID` |
 | Retry and breaker | `RETRY_BASE_DELAY` (2s), `RETRY_MAX_DELAY` (5m), `BREAKER_WINDOW` (10s), `BREAKER_MIN_REQUESTS` (20), `BREAKER_FAILURE_RATIO` (0.5), `BREAKER_OPEN_TIMEOUT` (30s), `BREAKER_PROBES` (5) |
 | Events | `EVENTS_STREAM`, `EVENTS_STREAM_MAX_LEN` (100,000), `OUTBOX_BATCH_SIZE` (500), `OUTBOX_POLL_INTERVAL` (100ms), `OUTBOX_RETENTION` (24h), `OUTBOX_PRUNE_INTERVAL` (10m) |
 | Retention | `RETENTION_NOTIFICATIONS` (720h = 30 days after a final status; 0 keeps them), `RETENTION_INTERVAL` (1h), `RETENTION_CHUNK_SIZE` (1000) |

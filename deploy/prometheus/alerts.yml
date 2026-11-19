@@ -63,9 +63,11 @@ groups:
           summary: "Outbox events are {{ $value | humanizeDuration }} behind"
           runbook: docs/runbook.md
 
-      - alert: RateLimiterFallback
-        expr: max(rate_limiter_fallback_active) == 1
+      - alert: RateLimiterUnavailable
+        # A worker that cannot reach the shared limiter sends nothing (fail
+        # closed): if every worker is cut off, deliveries are paused.
+        expr: max(rate_limiter_unavailable) == 1
         for: 1m
-        labels: { severity: warning }
+        labels: { severity: critical }
         annotations:
-          summary: "Redis unreachable: workers use the local rate limiter (rate / expected instances)"
+          summary: "Redis unreachable from a worker: its deliveries are paused until the shared rate limiter answers"

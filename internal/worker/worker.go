@@ -192,6 +192,9 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 		// in claim (priority) order. Their leases are kept alive by the
 		// heartbeat like those of in-flight deliveries.
 		claimed []*domain.Notification
+		// limiterDown: the shared rate limiter did not answer. Nothing is
+		// claimed until it does (see the claim below).
+		limiterDown bool
 	)
 	defer deliveries.Wait()
 	defer func() { w.release(sendCtx, w.untrackAll(claimed)) }() // runs first: hand back the unsent
@@ -199,7 +202,7 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 	for ctx.Err() == nil {
 		free := w.cfg.Concurrency - len(slots)
 		if free == 0 {
-			waitAny(ctx, freed, nil, w.cfg.PollInterval)
+			waitFor(ctx, freed, w.cfg.PollInterval)
 			continue
 		}
 
@@ -210,8 +213,19 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 				// so queued notifications keep their attempts. Re-check when
 				// a probe finishes or after a poll interval; the breaker
 				// moves to half-open on its own once its timeout passes.
-				waitAny(ctx, freed, nil, w.cfg.PollInterval)
+				waitFor(ctx, freed, w.cfg.PollInterval)
 				continue
+			}
+			// Rate limiter unreachable: claim nothing, like an open breaker,
+			// so queued notifications keep their attempts and workers that
+			// still reach the limiter send them. A reservation of 0 slots
+			// probes it without taking any; once it answers, resume.
+			if limiterDown {
+				if _, err := w.Limiter.Reserve(ctx, string(ch), 0); err != nil {
+					waitFor(ctx, freed, w.cfg.PollInterval)
+					continue
+				}
+				limiterDown = false
 			}
 			// The claim runs on sendCtx, not ctx: if shutdown cancelled the
 			// query mid-flight, PostgreSQL could still commit it while we
@@ -230,7 +244,7 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 				continue
 			}
 			if len(ns) == 0 { // nothing due
-				waitAny(ctx, w.wake[ch], nil, w.cfg.PollInterval)
+				waitFor(ctx, w.wake[ch], w.cfg.PollInterval)
 				continue
 			}
 			for _, n := range ns {
@@ -264,10 +278,19 @@ func (w *Worker) dispatch(ctx, sendCtx context.Context, ch domain.Channel) {
 		res, err := w.Limiter.Reserve(ctx, string(ch), len(tickets))
 		if err != nil {
 			skipAll(tickets)
-			if ctx.Err() == nil {
-				w.Log.ErrorContext(ctx, "reserve send slots", "channel", ch, "error", err)
-				sleep(ctx, w.cfg.PollInterval)
+			if ctx.Err() != nil {
+				continue // shutting down: the deferred release hands them back
 			}
+			// Fail closed. The limit is global and only the shared limiter
+			// knows what the other workers send, so without it nothing is
+			// sent. Hand the claimed notifications back with their attempt
+			// refunded, for workers that can still reach it, and pause.
+			w.Log.WarnContext(ctx, "rate limiter unavailable: handing back claimed notifications and pausing the channel",
+				"channel", ch, "handed_back", len(claimed), "error", err)
+			w.release(sendCtx, w.untrackAll(claimed))
+			claimed = nil
+			limiterDown = true
+			sleep(ctx, w.cfg.PollInterval)
 			continue
 		}
 		skipAll(tickets[res.Count:]) // admitted, but no slot this time
@@ -554,14 +577,13 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// waitAny waits for a signal on a or b, the timeout, or ctx.
-func waitAny(ctx context.Context, a, b <-chan struct{}, timeout time.Duration) {
+// waitFor waits for a signal on c, the timeout, or ctx.
+func waitFor(ctx context.Context, c <-chan struct{}, timeout time.Duration) {
 	t := time.NewTimer(timeout)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():
-	case <-a:
-	case <-b:
+	case <-c:
 	case <-t.C:
 	}
 }

@@ -5,8 +5,9 @@
 // worse. Readiness answers "should this instance receive work?" and checks
 // every dependency. Dependencies are either critical (the instance cannot do
 // its job without them, e.g. PostgreSQL) or non-critical (the instance keeps
-// working in a reduced mode, e.g. Redis with the local rate-limiter fallback),
-// which reports "degraded" instead of "down".
+// working in a reduced mode, e.g. without Redis the API still accepts work
+// while deliveries and live events wait), which reports "degraded" instead
+// of "down".
 package health
 
 import (

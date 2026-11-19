@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -665,6 +666,13 @@ func TestWorker_Chaos(t *testing.T) {
 	assert.Positive(t, outcomes[domain.OutcomeTransientError], "faults were injected and retried")
 }
 
+// count is how many requests the provider received.
+func (p *fakeProvider) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.times)
+}
+
 // busiestSecond is the most requests the provider received in any one
 // second (a sliding window over arrival times).
 func (p *fakeProvider) busiestSecond() int {
@@ -723,4 +731,66 @@ func TestWorker_SlowClaimsDoNotBurstPastTheLimit(t *testing.T) {
 	worst := p.busiestSecond()
 	t.Logf("busiest one-second window with 300 ms claims: %d (limit %d)", worst, rate)
 	assert.LessOrEqual(t, worst, rate+rate/10)
+}
+
+// switchLimiter is a worker's view of the shared limiter (Redis) that can
+// be cut off, as in a partial outage where only this worker loses Redis.
+type switchLimiter struct {
+	shared ratelimit.Limiter
+	down   atomic.Bool
+}
+
+func (s *switchLimiter) Reserve(ctx context.Context, key string, n int) (ratelimit.Reservation, error) {
+	if s.down.Load() {
+		return ratelimit.Reservation{}, errors.New("redis: connection refused")
+	}
+	return s.shared.Reserve(ctx, key, n)
+}
+
+// TestWorker_LimiterOutageFailsClosed: a worker that cannot reach the
+// shared rate limiter sends nothing. A local share would be wrong when
+// only some workers lose Redis: the cut-off one at rate/2 plus a healthy
+// one at the full rate would send 1.5× the limit. Instead it hands its
+// claimed work back with the attempts refunded and claims nothing more,
+// so its notifications wait (or go out through workers that still reach
+// the limiter) without spending attempts, and it resumes once the limiter
+// answers.
+func TestWorker_LimiterOutageFailsClosed(t *testing.T) {
+	reset(t)
+	defaults, err := config.LoadFrom(map[string]string{})
+	require.NoError(t, err)
+	rate := defaults.Worker.RateLimit
+	const providerLimit = 100
+	total := 3 * rate
+
+	p := newFakeProvider(t, alwaysAccept)
+	create(t, total, nil)
+	shared := ratelimit.NewLocal(ratelimit.Config{Rate: rate, Horizon: defaults.Worker.RateHorizon}, nil)
+	cutOff := &switchLimiter{shared: shared}
+	cutOff.down.Store(true)
+
+	// Only the cut-off worker runs: nothing goes out, nothing stays
+	// claimed, and no attempt is spent while it waits.
+	startWorker(t, p, opts{rate: rate, shared: cutOff})
+	time.Sleep(1500 * time.Millisecond)
+	assert.Zero(t, p.count(), "no slot, no send")
+	counts := statusCounts(t)
+	assert.Equal(t, total, counts[domain.StatusPending], "handed back to the queue: %v", counts)
+	var spent int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT coalesce(sum(total_attempts), 0) FROM notifications`).Scan(&spent))
+	assert.Zero(t, spent, "waiting costs no attempts")
+
+	// A healthy worker joins and sends at the full rate; then the cut-off
+	// one gets Redis back and both share the timeline.
+	startWorker(t, p, opts{rate: rate, shared: shared})
+	time.Sleep(time.Second)
+	cutOff.down.Store(false)
+
+	waitFor(t, 20*time.Second, func() bool { return statusCounts(t)[domain.StatusSent] == total })
+	worst := p.busiestSecond()
+	t.Logf("%d notifications, one worker cut off from the limiter then back; busiest one-second window at the provider: %d", total, worst)
+	assert.LessOrEqual(t, worst, providerLimit)
+	var maxAttempts int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT max(attempts) FROM notifications`).Scan(&maxAttempts))
+	assert.Equal(t, 1, maxAttempts, "each notification spent exactly the attempt that delivered it")
 }

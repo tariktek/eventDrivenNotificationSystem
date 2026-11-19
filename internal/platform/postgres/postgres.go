@@ -20,8 +20,7 @@ const connectTimeout = 10 * time.Second
 // request.
 //
 // appName names every connection (application_name), so pg_stat_activity
-// shows which process each one belongs to; workers also count each other
-// that way (see postgres.Store.CountLiveWorkers).
+// shows which process each one belongs to.
 func NewPool(ctx context.Context, cfg config.DatabaseConfig, appName string) (*pgxpool.Pool, error) {
 	pc, err := pgxpool.ParseConfig(cfg.URL)
 	if err != nil {

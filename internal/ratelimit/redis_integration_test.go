@@ -141,23 +141,17 @@ func TestRedis_KeyExpiresWhenIdle(t *testing.T) {
 	assert.LessOrEqual(t, ttl, 2*time.Second, "state lives only as long as the reserved timeline")
 }
 
-func TestFallback_RealRedisOutage(t *testing.T) {
+// TestGuard_RealRedisOutage: against an unreachable Redis the guard grants
+// nothing and reports the outage, within its timeout.
+func TestGuard_RealRedisOutage(t *testing.T) {
 	dead := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:1", DialTimeout: 200 * time.Millisecond, MaxRetries: -1})
 	defer dead.Close()
-	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary:    ratelimit.NewRedis(dead, cfg, "x:"),
-		Rate:       cfg,
-		Instances:  1,
-		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-		RetryEvery: time.Minute,
-	})
-
-	r, err := f.Reserve(t.Context(), "sms", 10)
-	require.NoError(t, err)
-	assert.Equal(t, 10, r.Count)
-	assert.True(t, f.Degraded())
+	g := ratelimit.NewGuard(ratelimit.NewRedis(dead, cfg, "x:"), 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	start := time.Now()
-	_, _ = f.Reserve(t.Context(), "sms", 10)
-	assert.Less(t, time.Since(start), 50*time.Millisecond, "no dial timeout while known to be down")
+	r, err := g.Reserve(t.Context(), "sms", 10)
+	require.Error(t, err)
+	assert.Zero(t, r.Count)
+	assert.True(t, g.Unavailable())
+	assert.Less(t, time.Since(start), time.Second)
 }

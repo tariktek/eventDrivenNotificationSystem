@@ -116,7 +116,7 @@ func TestLocal_NeverExceedsRate(t *testing.T) {
 	assertRate(t, slots, cfg)
 }
 
-// ---- fallback ---------------------------------------------------------------
+// ---- guard ------------------------------------------------------------------
 
 type flakyLimiter struct {
 	mu    sync.Mutex
@@ -134,33 +134,31 @@ func (f *flakyLimiter) Reserve(context.Context, string, int) (ratelimit.Reservat
 	return ratelimit.Reservation{Count: 1, Interval: time.Millisecond}, nil
 }
 
-func TestFallback(t *testing.T) {
-	clk := newClock()
-	primary := &flakyLimiter{down: true}
-	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary:    primary,
-		Rate:       cfg,
-		Instances:  2,
-		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-		RetryEvery: 5 * time.Second,
-		Now:        clk.now,
-	})
+func (f *flakyLimiter) setDown(down bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.down = down
+}
 
-	r, err := f.Reserve(t.Context(), "sms", 500)
-	require.NoError(t, err, "an outage must not stop deliveries")
-	assert.True(t, f.Degraded())
-	assert.Equal(t, 20*time.Millisecond, r.Interval, "local share: 100/s across 2 instances = 50/s each")
-	assert.Equal(t, 50, r.Count)
+var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	_, _ = f.Reserve(t.Context(), "sms", 1)
-	assert.Equal(t, 1, primary.calls, "Redis is not retried on every call during an outage")
+// TestGuard_FailsClosed: when the shared limiter is unreachable the guard
+// grants nothing (no local share: a worker cut off from Redis cannot know
+// what the others send), reports it, and recovers on the next success.
+func TestGuard_FailsClosed(t *testing.T) {
+	shared := &flakyLimiter{down: true}
+	g := ratelimit.NewGuard(shared, time.Second, quiet)
 
-	primary.down = false
-	clk.advance(5 * time.Second)
-	r, err = f.Reserve(t.Context(), "sms", 1)
+	r, err := g.Reserve(t.Context(), "sms", 50)
+	require.Error(t, err, "no slots without the shared limiter")
+	assert.Zero(t, r.Count)
+	assert.True(t, g.Unavailable())
+
+	shared.setDown(false)
+	r, err = g.Reserve(t.Context(), "sms", 1)
 	require.NoError(t, err)
-	assert.Equal(t, time.Millisecond, r.Interval, "back on the shared limiter")
-	assert.False(t, f.Degraded())
+	assert.Equal(t, 1, r.Count)
+	assert.False(t, g.Unavailable())
 }
 
 // hangingLimiter is Redis as an outage really looks: the client retries its
@@ -173,175 +171,33 @@ func (hangingLimiter) Reserve(ctx context.Context, _ string, _ int) (ratelimit.R
 	return ratelimit.Reservation{}, ctx.Err()
 }
 
-func TestFallback_SlowOutageFallsBackWithinTimeout(t *testing.T) {
-	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary: hangingLimiter{}, Rate: cfg, Instances: 1, RetryEvery: time.Second,
-		Timeout: 50 * time.Millisecond,
-		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+func TestGuard_SlowOutageFailsWithinTimeout(t *testing.T) {
+	g := ratelimit.NewGuard(hangingLimiter{}, 50*time.Millisecond, quiet)
 	start := time.Now()
-	r, err := f.Reserve(t.Context(), "sms", 1)
-	require.NoError(t, err, "a hanging Redis must not stop deliveries")
-	assert.Less(t, time.Since(start), time.Second, "falls back after the timeout, not after the client gives up")
-	assert.Equal(t, 1, r.Count)
-	assert.True(t, f.Degraded())
+	_, err := g.Reserve(t.Context(), "sms", 1)
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), time.Second, "the outage is noticed after the timeout, not after the client gives up")
+	assert.True(t, g.Unavailable())
 }
 
-func TestFallback_CancelledContextIsNotAnOutage(t *testing.T) {
-	primary := &cancelledLimiter{}
-	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary: primary, Rate: cfg, Instances: 1, RetryEvery: time.Second,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+func TestGuard_CancelledContextIsNotAnOutage(t *testing.T) {
+	g := ratelimit.NewGuard(hangingLimiter{}, time.Minute, quiet)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err := f.Reserve(ctx, "sms", 1)
+	_, err := g.Reserve(ctx, "sms", 1)
 	assert.ErrorIs(t, err, context.Canceled)
-	assert.False(t, f.Degraded(), "shutting down is not a Redis failure")
+	assert.False(t, g.Unavailable(), "shutting down is not a Redis failure")
 }
 
-type cancelledLimiter struct{}
-
-func (cancelledLimiter) Reserve(ctx context.Context, _ string, _ int) (ratelimit.Reservation, error) {
-	return ratelimit.Reservation{}, ctx.Err()
-}
-
-// TestFallback_SwitchWaitsForTheOtherTimeline: slots handed out on one
-// timeline are still to be used when the other limiter takes over.
-// Reserving on the new timeline at once would put both sets of sends in
-// the same second, over the rate.
-func TestFallback_SwitchWaitsForTheOtherTimeline(t *testing.T) {
+// TestLocal_ZeroReservationIsAProbe: workers probe the limiter with a
+// reservation of 0 slots before resuming; it must not take any.
+func TestLocal_ZeroReservationIsAProbe(t *testing.T) {
 	clk := newClock()
-	primary := &stubLimiter{}
-	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary: primary, Rate: cfg, Instances: 1, RetryEvery: 5 * time.Second, Now: clk.now,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
-
-	// A full second of shared slots, then Redis goes down.
-	r, err := f.Reserve(t.Context(), "sms", 100)
-	require.NoError(t, err)
-	require.Equal(t, 100, r.Count)
-	primary.down = true
-
-	r, err = f.Reserve(t.Context(), "sms", 100)
-	require.NoError(t, err)
-	assert.Zero(t, r.Count, "the shared slots have not run out: no local ones yet")
-	assert.Equal(t, time.Second, r.First, "wait until they have")
-	assert.True(t, f.Degraded())
-
-	clk.advance(time.Second)
-	r, err = f.Reserve(t.Context(), "sms", 100)
-	require.NoError(t, err)
-	assert.Equal(t, 100, r.Count, "now the local timeline takes over")
-
-	// Redis is back: the local slots run out first, then shared ones.
-	primary.down = false
-	clk.advance(5 * time.Second)
-	r, err = f.Reserve(t.Context(), "sms", 50)
-	require.NoError(t, err)
-	assert.Equal(t, 50, r.Count, "local slots long passed: straight back to the shared limiter")
-	assert.False(t, f.Degraded())
-
-	primary.down = true
-	clk.advance(10 * time.Millisecond)
-	r, err = f.Reserve(t.Context(), "sms", 1)
+	l := ratelimit.NewLocal(cfg, clk.now)
+	r, err := l.Reserve(t.Context(), "sms", 0)
 	require.NoError(t, err)
 	assert.Zero(t, r.Count)
-	assert.Equal(t, 490*time.Millisecond, r.First, "the rest of the 50 shared slots, then local")
-
-	r, err = f.Reserve(t.Context(), "email", 1)
-	require.NoError(t, err)
-	assert.Equal(t, 1, r.Count, "a key with nothing on the other timeline is not held up")
-}
-
-func TestLocalShare_HorizonFitsALocalSlot(t *testing.T) {
-	// 100/s with a 10 ms horizon fits one slot; split across two
-	// instances, 50/s needs 20 ms. Without widening, the fallback would
-	// grant nothing and the channel would stop during a Redis outage.
-	share := ratelimit.LocalShare(ratelimit.Config{Rate: 100, Horizon: 10 * time.Millisecond}, 2)
-	assert.Equal(t, 50, share.Rate)
-	assert.Equal(t, 20*time.Millisecond, share.Horizon)
-
-	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary: &stubLimiter{down: true}, Rate: ratelimit.Config{Rate: 100, Horizon: 10 * time.Millisecond},
-		Instances: 2, RetryEvery: time.Second, Now: newClock().now,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
-	r, err := f.Reserve(t.Context(), "sms", 10)
-	require.NoError(t, err)
-	assert.Equal(t, 1, r.Count, "deliveries continue during the outage")
-}
-
-// stubLimiter grants every slot requested, 10 ms apart, while up.
-type stubLimiter struct{ down bool }
-
-func (s *stubLimiter) Reserve(_ context.Context, _ string, n int) (ratelimit.Reservation, error) {
-	if s.down {
-		return ratelimit.Reservation{}, errors.New("connection refused")
-	}
-	return ratelimit.Reservation{Count: n, Interval: 10 * time.Millisecond}, nil
-}
-
-// TestFallback_LocalShareFollowsLiveInstances: with Redis down, each
-// worker's share is the full rate divided by the workers counted right
-// now, not by a configured number that scaling can leave stale. Three
-// workers configured as two would otherwise send 1.5× the limit together.
-func TestFallback_LocalShareFollowsLiveInstances(t *testing.T) {
-	clk := newClock()
-	live := 2
-	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary: &flakyLimiter{down: true}, Rate: cfg, RetryEvery: time.Hour,
-		LiveInstances: func() int { return live },
-		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Now:           clk.now,
-	})
-
-	r, err := f.Reserve(t.Context(), "sms", 1)
-	require.NoError(t, err)
-	assert.Equal(t, 20*time.Millisecond, r.Interval, "two workers: 50/s each")
-
-	live = 3 // a worker was added
-	clk.advance(time.Second)
-	r, err = f.Reserve(t.Context(), "sms", 1)
-	require.NoError(t, err)
-	assert.Equal(t, time.Second/33, r.Interval, "three workers: 33/s each")
-	assert.Equal(t, 33, int(time.Second/r.Interval), "together at most the full rate")
-}
-
-// TestLocal_RateChangeKeepsGrantedSlots: lowering the rate does not move
-// or overlap slots already granted; the next slot follows the last one.
-func TestLocal_RateChangeKeepsGrantedSlots(t *testing.T) {
-	clk := newClock()
-	l := ratelimit.NewLocal(ratelimit.Config{Rate: 50, Horizon: time.Second}, clk.now)
-	r, err := l.Reserve(t.Context(), "sms", 10) // 10 slots, 20 ms apart: the last at 180 ms
-	require.NoError(t, err)
-	require.Equal(t, 10, r.Count)
-
-	l.SetConfig(ratelimit.Config{Rate: 25, Horizon: time.Second})
 	r, err = l.Reserve(t.Context(), "sms", 1)
 	require.NoError(t, err)
-	assert.Equal(t, 200*time.Millisecond, r.First, "after the slots already granted")
-	assert.Equal(t, 40*time.Millisecond, r.Interval)
-}
-
-func TestInstances(t *testing.T) {
-	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
-	var (
-		n   = 3
-		err error
-	)
-	i := ratelimit.NewInstances(2, time.Hour, func(context.Context) (int, error) { return n, err }, quiet)
-	assert.Equal(t, 2, i.Get(), "the configured start until the first count")
-
-	i.Refresh(t.Context())
-	assert.Equal(t, 3, i.Get())
-
-	n, err = 0, errors.New("database unreachable")
-	i.Refresh(t.Context())
-	assert.Equal(t, 3, i.Get(), "a failed count keeps the last one")
-
-	err = nil // n is 0: the counting worker itself is running
-	i.Refresh(t.Context())
-	assert.Equal(t, 1, i.Get())
+	assert.Zero(t, r.First, "the probe left the timeline untouched")
 }

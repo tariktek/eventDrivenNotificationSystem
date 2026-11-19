@@ -76,10 +76,9 @@ func run() error {
 		}
 	}()
 
-	// The ID names this worker in leases, logs and its database connections
-	// (which is how the workers count each other: see Instances below).
+	// The ID names this worker in leases, logs and its database connections.
 	id := workerID(cfg.Worker.ID)
-	pool, err := pgplatform.NewPool(ctx, cfg.Database, postgres.WorkerAppName+id)
+	pool, err := pgplatform.NewPool(ctx, cfg.Database, "notification-worker:"+id)
 	if err != nil {
 		return err
 	}
@@ -102,34 +101,24 @@ func run() error {
 	store := postgres.NewStore(pool)
 	m := metrics.New()
 	rate := ratelimit.Config{Rate: cfg.Worker.RateLimit, Horizon: cfg.Worker.RateHorizon}
-	// How many workers share the rate, counted from their database
-	// connections: if Redis is down, each sends at rate / this. PostgreSQL
-	// stays reachable then (no worker delivers without it), and the count
-	// follows scaling; WORKER_EXPECTED_INSTANCES is only the starting value.
-	instances := ratelimit.NewInstances(cfg.Worker.ExpectedInstances, 5*time.Second, store.CountLiveWorkers, log)
-	limiter := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary:       ratelimit.NewRedis(rdb, rate, "ratelimit:"),
-		Rate:          rate,
-		LiveInstances: instances.Get,
-		Log:           log,
-		RetryEvery:    5 * time.Second,
-	})
+	// The limit is global, so only the shared limiter in Redis can enforce
+	// it. Without it this worker sends nothing (it fails closed): its claimed
+	// work goes back to the queue for workers that still reach Redis, and
+	// it resumes when Redis answers. If Redis is gone for every worker,
+	// deliveries pause: waiting beats exceeding the provider's limit.
+	limiter := ratelimit.NewGuard(ratelimit.NewRedis(rdb, rate, "ratelimit:"), ratelimit.DefaultTimeout, log)
 	m.Registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "worker_instances",
-		Help: "Workers sharing the rate limit, counted from their database connections.",
-	}, func() float64 { return float64(instances.Get()) }))
-	m.Registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "rate_limiter_fallback_active",
-		Help: "1 while Redis is unreachable and the local fallback limiter is in use.",
+		Name: "rate_limiter_unavailable",
+		Help: "1 while the shared rate limiter (Redis) is unreachable from this worker: it sends nothing until it answers.",
 	}, func() float64 {
-		if limiter.Degraded() {
+		if limiter.Unavailable() {
 			return 1
 		}
 		return 0
 	}))
 	checks.Register("rate_limiter", false, func(context.Context) error {
-		if limiter.Degraded() {
-			return errors.New("shared limiter unavailable; using local fallback")
+		if limiter.Unavailable() {
+			return errors.New("shared rate limiter unreachable; deliveries paused, notifications wait in the queue")
 		}
 		return nil
 	})
@@ -226,7 +215,6 @@ func run() error {
 	// rather than run half alive.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return w.Run(gctx) })
-	g.Go(func() error { instances.Run(gctx); return nil })
 	g.Go(func() error { relay.Run(gctx); return nil })
 	g.Go(func() error { callbacks.Run(gctx); return nil })
 	g.Go(func() error { cleaner.Run(gctx); return nil })

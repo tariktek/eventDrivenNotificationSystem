@@ -6,8 +6,9 @@ import (
 	"time"
 )
 
-// Local is an in-process Limiter. It is the fallback when Redis is
-// unreachable, and the reference implementation in tests.
+// Local is an in-process Limiter: the reference implementation, used in
+// tests. It is not a fallback for Redis: a limit shared by several workers
+// cannot be enforced from one process (see Guard).
 type Local struct {
 	cfg Config
 	now func() time.Time
@@ -22,15 +23,6 @@ func NewLocal(cfg Config, now func() time.Time) *Local {
 		now = time.Now
 	}
 	return &Local{cfg: cfg, now: now, tat: map[string]time.Time{}}
-}
-
-// SetConfig changes the rate for later reservations. Each key keeps its
-// timeline: slots already granted are not moved, and the next ones follow
-// them at the new interval, so a change of rate never lets sends bunch up.
-func (l *Local) SetConfig(cfg Config) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.cfg = cfg
 }
 
 // Reserve implements Limiter.

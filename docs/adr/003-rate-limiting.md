@@ -17,21 +17,20 @@ using Redis's clock, hands out **send slots**: `Reserve(n)` returns up to
 horizon of one second. Each delivery waits for its own slot. All workers
 share the key per channel, so the spacing holds across instances.
 
-If Redis is unreachable, each worker falls back to a local limiter at
-`rate / workers` and reports itself degraded; it retries Redis every few
-seconds. The workers count each other every 5 s from their PostgreSQL
-connections (each names its connections `notification-worker:<id>` and
-holds one open for LISTEN): PostgreSQL stays reachable when Redis does
-not, and no worker delivers without it anyway. A configured count goes
-stale as soon as the workers are scaled: three workers configured as two
-would each send at 95/2 and together at ~142/s, against a 95/s limit.
-Counted live, that scenario (three workers, setting left at two, Redis
-stopped, 300 SMS) peaked at 92 in any second. `WORKER_EXPECTED_INSTANCES`
-is only the value before the first count.
+If the shared limiter is unreachable, the worker **fails closed**: it
+gets no slots, hands the notifications it claimed back to the queue with
+their attempts refunded, and claims nothing on that channel until the
+limiter answers again (it probes with a reservation of zero slots every
+poll interval), the same way it behaves while a circuit breaker is open.
+Workers that still reach Redis go on sending and pick up what was handed
+back. Each Redis call is bounded at 250 ms: an outage does not fail fast
+(with Redis stopped, the client retried its dials for 79 s).
 
-Each Redis call is bounded at 250 ms: an outage does not fail fast (with Redis stopped, the client retried its dials for
-79 s, and the channel sent nothing meanwhile). Bounded, 30 SMS went out
-in under 2 s with Redis down.
+An earlier version fell back to a local limiter at `rate / workers`. It
+cannot be right when only some workers lose Redis: one cut off at 95/2
+while another still gets 95 through Redis send ~142/s together, against
+a 95/s limit. No local rule can know what the others send; only the
+shared timeline can. So without it, nothing is sent.
 
 **Order of operations: claim, then reserve.** The first version reserved
 slots and then claimed that many notifications. Under load a claim took
@@ -49,14 +48,15 @@ wait in the worker (leases kept alive) for the next reservation.
   provider, so the default rate is 95/s: 5% headroom for that jitter.
   Checked with no tolerance by `TestWorker_ProviderNeverSeesMoreThan100PerSecond`
   (busiest sliding second: 96) and by the k6 thresholds.
-- When a worker switches between the shared and the local limiter (Redis
-  lost or back), it first lets the slots it holds on the old timeline run
-  out, so the two timelines never overlap. The local share's horizon is
-  widened to fit at least one of its (longer) intervals.
-- Smooth pacing rather than bursts: GCRA does not allow saving up unused
-  capacity.
-- A Redis outage degrades accuracy (the fallback assumes the configured
-  instance count), never availability.
+- **Cost: if Redis is unreachable from every worker, deliveries stop**
+  until it returns. Notifications wait in the queue without spending
+  attempts; the API keeps accepting them. Waiting is preferred to
+  exceeding the provider's limit, which is a hard requirement.
+- A partial outage (some workers cut off) only lowers throughput: the
+  workers that reach Redis keep the full rate and take over the handed
+  back work. Test: `TestWorker_LimiterOutageFailsClosed` (one worker cut
+  off, then back: busiest second at the provider 96, the same as with
+  two healthy workers; no attempt spent while waiting).
 - Regression test: `TestWorker_SlowClaimsDoNotBurstPastTheLimit` (69/s at
   a 50/s limit with the old order).
 
