@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
@@ -120,22 +121,18 @@ func (c *HTTPClient) send(ctx context.Context, msg *Message) Result {
 	return classifyResponse(resp, raw, readErr)
 }
 
+// maxMessageIDBytes bounds a stored provider message id.
+const maxMessageIDBytes = 255
+
+// unexpectedResponse is the error code noted on a success whose response
+// did not follow the provider contract.
+const unexpectedResponse = "unexpected_provider_response"
+
 func classifyResponse(resp *http.Response, body []byte, readErr error) Result {
 	code := resp.StatusCode
 	switch {
 	case code >= 200 && code < 300:
-		if readErr != nil {
-			return transient(code, "invalid_provider_response", "reading response: "+readErr.Error(), 0)
-		}
-		var r sendResponse
-		if err := json.Unmarshal(body, &r); err != nil {
-			return transient(code, "invalid_provider_response", "response is not the expected JSON: "+err.Error(), 0)
-		}
-		if r.MessageID == "" || r.Status != "accepted" {
-			return transient(code, "invalid_provider_response",
-				fmt.Sprintf("expected status \"accepted\" and a messageId, got status %q", r.Status), 0)
-		}
-		return Result{Outcome: domain.OutcomeSuccess, StatusCode: code, MessageID: r.MessageID}
+		return accepted(code, body, readErr)
 
 	case code == http.StatusRequestTimeout, code == http.StatusTooManyRequests, code >= 500:
 		return transient(code, "http_"+strconv.Itoa(code), snippet(body), retryAfter(resp.Header.Get("Retry-After"), time.Now()))
@@ -146,6 +143,49 @@ func classifyResponse(resp *http.Response, body []byte, readErr error) Result {
 	default: // remaining 4xx: the request itself is wrong
 		return permanent(code, "http_"+strconv.Itoa(code), snippet(body))
 	}
+}
+
+// accepted classifies a 2xx response. The status code is what says the
+// provider took the message; the body only adds its message id. So a 2xx
+// is always a success: treating an unexpected body as an error would send
+// the message again on every retry (the recipient gets it several times)
+// and count a healthy provider against its circuit breaker. A body that is
+// not {"messageId": ..., "status": "accepted"} (unreadable, not JSON,
+// another status, an id that cannot be stored) is kept on the attempt as
+// a note in ErrorCode/Error; the worker logs it.
+func accepted(code int, body []byte, readErr error) Result {
+	res := Result{Outcome: domain.OutcomeSuccess, StatusCode: code}
+	note := func(msg string) Result {
+		res.ErrorCode, res.Error = unexpectedResponse, msg
+		return res
+	}
+	if readErr != nil {
+		return note("accepted, but reading the response failed: " + readErr.Error())
+	}
+	var r sendResponse
+	if err := json.Unmarshal(body, &r); err != nil {
+		return note("accepted, but the response is not the expected JSON: " + snippet(body))
+	}
+	switch id := r.MessageID; {
+	case id == "":
+		return note("accepted without a messageId")
+	case !storableID(id):
+		// PostgreSQL text rejects NUL and invalid UTF-8; storing such an
+		// id would roll back the whole outcome and the message would be
+		// sent again. Keep the delivery, drop the id.
+		return note(fmt.Sprintf("accepted, but the messageId cannot be stored (%d bytes, NUL, or invalid UTF-8): %s", len(id), snippet([]byte(id))))
+	default:
+		res.MessageID = id
+	}
+	if r.Status != "accepted" {
+		return note(fmt.Sprintf("accepted with status %q instead of \"accepted\"", snippet([]byte(r.Status))))
+	}
+	return res
+}
+
+// storableID reports whether a provider message id fits a text column.
+func storableID(id string) bool {
+	return len(id) <= maxMessageIDBytes && utf8.ValidString(id) && !strings.ContainsRune(id, 0)
 }
 
 func classifyTransportError(err error) Result {

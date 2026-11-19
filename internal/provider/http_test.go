@@ -80,9 +80,14 @@ func TestSend_Classification(t *testing.T) {
 		// timestamp is informational, so this must still count as sent.
 		{"unparsed timestamp", 202, `{"messageId":"m","status":"accepted","timestamp":"$time$"}`, nil, domain.OutcomeSuccess, "", 0},
 
-		{"2xx without messageId", 202, `{"status":"accepted"}`, nil, domain.OutcomeTransientError, "invalid_provider_response", 0},
-		{"2xx not accepted", 202, `{"messageId":"m","status":"queued?"}`, nil, domain.OutcomeTransientError, "invalid_provider_response", 0},
-		{"2xx html", 200, `<html>maintenance</html>`, nil, domain.OutcomeTransientError, "invalid_provider_response", 0},
+		// A 2xx means the provider took the message, whatever the body
+		// says: retrying would send it again. An unexpected body is kept
+		// as a note (error code), not treated as a failure.
+		{"2xx without messageId", 202, `{"status":"accepted"}`, nil, domain.OutcomeSuccess, "unexpected_provider_response", 0},
+		{"2xx other status", 202, `{"messageId":"m","status":"queued"}`, nil, domain.OutcomeSuccess, "unexpected_provider_response", 0},
+		{"2xx html", 200, `<html>maintenance</html>`, nil, domain.OutcomeSuccess, "unexpected_provider_response", 0},
+		{"2xx empty body (webhook.site not configured)", 200, ``, nil, domain.OutcomeSuccess, "unexpected_provider_response", 0},
+		{"2xx unstorable messageId", 202, "{\"messageId\":\"m\u0000x\",\"status\":\"accepted\"}", nil, domain.OutcomeSuccess, "unexpected_provider_response", 0},
 
 		{"429 with Retry-After", 429, `slow down`, map[string]string{"Retry-After": "7"}, domain.OutcomeTransientError, "http_429", 7 * time.Second},
 		{"503 with Retry-After", 503, ``, map[string]string{"Retry-After": "2"}, domain.OutcomeTransientError, "http_503", 2 * time.Second},
@@ -112,11 +117,37 @@ func TestSend_Classification(t *testing.T) {
 			assert.Equal(t, tt.status, res.StatusCode)
 			assert.Equal(t, tt.errCode, res.ErrorCode)
 			assert.Equal(t, tt.retryAfter, res.RetryAfter)
-			if tt.outcome == domain.OutcomeSuccess {
-				assert.Empty(t, res.Error)
-			} else {
+			switch {
+			case tt.outcome != domain.OutcomeSuccess:
 				assert.Empty(t, res.MessageID)
+			case tt.errCode == "":
+				assert.Empty(t, res.Error)
+			default:
+				assert.NotEmpty(t, res.Error, "the note says what was unexpected")
+				assert.NotContains(t, res.MessageID, "\x00", "an unstorable id is dropped")
 			}
+		})
+	}
+}
+
+func TestSend_MessageIDMustBeStorable(t *testing.T) {
+	for name, id := range map[string]string{
+		"NUL":      "a\x00b",
+		"too long": strings.Repeat("x", 256),
+	} {
+		t.Run(name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]string{"messageId": id, "status": "accepted"})
+			require.NoError(t, err)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write(body)
+			}))
+			defer srv.Close()
+			res := client(srv.URL, time.Second).Send(t.Context(), message())
+			assert.Equal(t, domain.OutcomeSuccess, res.Outcome)
+			assert.Empty(t, res.MessageID, "dropped rather than failing the write of the outcome")
+			assert.Equal(t, "unexpected_provider_response", res.ErrorCode)
+			assert.True(t, utf8.ValidString(res.Error) && !strings.ContainsRune(res.Error, 0), "the note itself is storable")
 		})
 	}
 }
@@ -206,7 +237,8 @@ func TestSend_HugeResponseIsCapped(t *testing.T) {
 	defer srv.Close()
 
 	res := client(srv.URL, 5*time.Second).Send(t.Context(), message())
-	assert.Equal(t, domain.OutcomeTransientError, res.Outcome, "a 3 MiB body is cut at 1 MiB and fails to parse")
+	assert.Equal(t, domain.OutcomeSuccess, res.Outcome, "accepted, even though the body is cut at 1 MiB")
+	assert.Equal(t, "unexpected_provider_response", res.ErrorCode, "and fails to parse")
 }
 
 // TestSend_LiveProvider checks the client against a real endpoint such as a
