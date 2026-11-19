@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"unicode/utf8"
 
@@ -28,8 +30,8 @@ var requestBodies = map[string]func() any{
 	"RetryFailedNotifications": func() any { return new(api.RetryFailedRequest) },
 }
 
-// strictJSON rejects request bodies that are not valid UTF-8 or that have
-// unknown fields or trailing data.
+// strictJSON rejects request bodies that are not valid UTF-8, are not a
+// JSON object, or have unknown fields or trailing data.
 // It needs the raw body buffered by middleware.BufferBody.
 func strictJSON(f api.StrictHandlerFunc, operationID string) api.StrictHandlerFunc {
 	newBody, ok := requestBodies[operationID]
@@ -43,12 +45,20 @@ func strictJSON(f api.StrictHandlerFunc, operationID string) api.StrictHandlerFu
 		if !utf8.Valid(raw) {
 			return nil, apierror.BadRequest("request body must be UTF-8 encoded")
 		}
+		// Every body is an object. A null decodes into a struct without
+		// complaint, as an empty one: on retry-failed that would mean "no
+		// filter, not a dry run" and redrive every failed notification.
+		if t := bytes.TrimLeft(raw, " \t\r\n"); len(t) == 0 || t[0] != '{' {
+			return nil, apierror.BadRequest("invalid JSON body: expected a JSON object")
+		}
 		dec := json.NewDecoder(bytes.NewReader(raw))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(newBody()); err != nil {
 			return nil, apierror.BadRequest("invalid JSON body: %v", err)
 		}
-		if dec.More() {
+		// The document must end here. Decoder.More is not enough: it
+		// reports false at a stray closing bracket, so "{}]" got through.
+		if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 			return nil, apierror.BadRequest("invalid JSON body: unexpected data after the JSON value")
 		}
 		return f(ctx, w, r, request)
