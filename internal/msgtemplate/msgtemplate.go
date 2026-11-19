@@ -7,9 +7,13 @@
 //     printf, call, index, slice, ... are rejected: printf alone can allocate
 //     gigabytes ({{printf "%0999999999d" 1}}) before any output limit applies;
 //   - {{define}} and {{template}} are rejected (no recursion);
-//   - {{range}} may not be nested and may not iterate over a literal number,
-//     so the work a template can do is bounded by the size of its variables
-//     (which the API caps), even when the loop body writes nothing;
+//   - {{range}} may not be nested, and may only iterate over a variable the
+//     client supplied (.items, $.items, or a field of one): never over a
+//     number, a function's result or a variable the template declared
+//     ({{$n := 1000000000}}{{range $n}} would loop a billion times while
+//     writing nothing). So the work a template can do is bounded by the
+//     size of its variables, which the API caps, whatever the loop body
+//     writes;
 //   - rendered output is capped in size;
 //   - a missing or null variable is an error, never a silent "<no value>".
 package msgtemplate
@@ -194,8 +198,8 @@ func (w walker) walk(node parse.Node, s scope) error {
 		if s.inRange {
 			return errors.New("nested {{range}} is not allowed")
 		}
-		if rangesOverLiteral(n.Pipe) {
-			return errors.New("{{range}} over a literal number is not allowed")
+		if !rangesOverData(n.Pipe) {
+			return errors.New("{{range}} may only iterate over a template variable, such as .items")
 		}
 		return w.branch(&n.BranchNode, s, scope{dotRebound: true, inRange: true})
 	}
@@ -213,18 +217,25 @@ func (w walker) branch(b *parse.BranchNode, outer, body scope) error {
 	return w.walk(b.ElseList, scope{dotRebound: outer.dotRebound, inRange: body.inRange})
 }
 
-func rangesOverLiteral(p *parse.PipeNode) bool {
-	if p == nil {
+// rangesOverData reports whether a range pipeline is a plain reference to
+// supplied data: one command with one argument that is a field (.items,
+// .order.lines) or a field of $ ($.items). Anything else could produce an
+// arbitrary number: a literal, a declared variable, a function call such as
+// len, or a parenthesised pipeline. (Inside {{with}}, "." may be rebound,
+// but only to supplied data or to a literal, and a field of a literal does
+// not resolve.)
+func rangesOverData(p *parse.PipeNode) bool {
+	if p == nil || len(p.Cmds) != 1 || len(p.Cmds[0].Args) != 1 {
 		return false
 	}
-	for _, cmd := range p.Cmds {
-		for _, arg := range cmd.Args {
-			if _, ok := arg.(*parse.NumberNode); ok {
-				return true
-			}
-		}
+	switch arg := p.Cmds[0].Args[0].(type) {
+	case *parse.FieldNode:
+		return true
+	case *parse.VariableNode:
+		return len(arg.Ident) > 1 && arg.Ident[0] == "$"
+	default:
+		return false
 	}
-	return false
 }
 
 // Render executes the template. Every variable in t.Variables must be

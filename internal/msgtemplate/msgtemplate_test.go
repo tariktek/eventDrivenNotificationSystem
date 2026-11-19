@@ -133,9 +133,14 @@ func TestParse_Rejects(t *testing.T) {
 		"nested range":           `{{range .a}}{{range .b}}{{end}}{{end}}`,
 		"range in with in range": `{{range .a}}{{with .b}}{{range .c}}{{end}}{{end}}{{end}}`,
 		"range over literal":     `{{range 1000000000}}{{end}}`,
-		"printf hidden in pipe":  `{{.a | printf "%v"}}`,
-		"printf in if condition": `{{if printf "x"}}y{{end}}`,
-		"printf in range else":   `{{range .a}}{{else}}{{printf "x"}}{{end}}`,
+		// The same billion iterations without a literal in the range.
+		"range over declared variable":   `{{$n := 1000000000}}{{range $n}}{{end}}ok`,
+		"range over function result":     `{{range len .a}}{{end}}`,
+		"range over dot rebound by with": `{{with 1000000000}}{{range .}}{{end}}{{end}}`,
+		"range over pipeline":            `{{range (.a)}}{{end}}`,
+		"printf hidden in pipe":          `{{.a | printf "%v"}}`,
+		"printf in if condition":         `{{if printf "x"}}y{{end}}`,
+		"printf in range else":           `{{range .a}}{{else}}{{printf "x"}}{{end}}`,
 	}
 	for name, body := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -190,4 +195,17 @@ func TestParse_ErrorNamesThePart(t *testing.T) {
 	_, err = msgtemplate.Parse("fine", "{{printf \"x\"}}")
 	require.True(t, errors.As(err, &pe))
 	assert.Equal(t, "body", pe.Part)
+}
+
+func TestParse_RangeOverSuppliedDataIsAllowed(t *testing.T) {
+	for _, body := range []string{
+		`{{range .items}}{{.}}{{end}}`,
+		`{{range $i, $v := .items}}{{$i}}={{$v}} {{end}}`,
+		`{{range $.items}}{{.}}{{end}}`,
+		`{{range .order.lines}}{{.}}{{end}}`,
+		`{{with .order}}{{range .lines}}{{.}}{{end}}{{end}}`,
+	} {
+		_, err := msgtemplate.Parse("", body)
+		assert.NoError(t, err, body)
+	}
 }
