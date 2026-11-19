@@ -17,9 +17,11 @@ UPDATE batches b
 SET finished_count = b.finished_count + d.delta,
     completed_at   = CASE WHEN b.finished_count + d.delta >= b.created_count
                           THEN coalesce(b.completed_at, $1::timestamptz) END
-FROM (SELECT unnest($2::uuid[]) AS id, unnest($3::int[]) AS delta) d
-WHERE b.id = d.id
-RETURNING b.id, b.total, b.created_count, b.finished_count, d.delta::int AS delta, b.completed_at
+FROM (SELECT unnest($2::uuid[]) AS id, unnest($3::int[]) AS delta) d,
+     batches old
+WHERE b.id = d.id AND old.id = d.id
+RETURNING b.id, b.total, b.created_count, b.finished_count, d.delta::int AS delta, b.completed_at,
+          (old.completed_at IS NULL)::boolean AS was_open
 `
 
 type AddBatchFinishedParams struct {
@@ -35,11 +37,14 @@ type AddBatchFinishedRow struct {
 	FinishedCount int32
 	Delta         int32
 	CompletedAt   *time.Time
+	WasOpen       bool
 }
 
 // Batch progress, maintained by the relay from the status changes it
 // publishes. delta is the change in finished (sent/failed/cancelled)
-// items; a redrive makes it negative and reopens the batch.
+// items; a redrive makes it negative and reopens the batch. was_open
+// reports whether the batch was incomplete before this update, so the
+// relay announces a completion exactly when completed_at gets set.
 func (q *Queries) AddBatchFinished(ctx context.Context, arg AddBatchFinishedParams) ([]AddBatchFinishedRow, error) {
 	rows, err := q.db.Query(ctx, addBatchFinished, arg.Now, arg.Ids, arg.Deltas)
 	if err != nil {
@@ -56,6 +61,7 @@ func (q *Queries) AddBatchFinished(ctx context.Context, arg AddBatchFinishedPara
 			&i.FinishedCount,
 			&i.Delta,
 			&i.CompletedAt,
+			&i.WasOpen,
 		); err != nil {
 			return nil, err
 		}

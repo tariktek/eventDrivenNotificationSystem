@@ -62,8 +62,19 @@ func New(store *postgres.Store, pub Publisher, cfg Config, log *slog.Logger) *Re
 }
 
 // Run publishes until ctx is done.
+//
+// Pruning runs on its own clock, beside publishing. It used to run only
+// between rounds that found no backlog, so under sustained load (a
+// campaign keeping every round full) it never ran and the table grew
+// without bound, until one huge delete at the end.
 func (r *Relay) Run(ctx context.Context) {
-	nextPrune := r.now().Add(r.cfg.PruneInterval)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.pruneLoop(ctx)
+	}()
+	defer func() { <-done }()
+
 	for ctx.Err() == nil {
 		n, err := r.RelayOnce(ctx)
 		switch {
@@ -76,11 +87,24 @@ func (r *Relay) Run(ctx context.Context) {
 		case n == r.cfg.BatchSize:
 			continue // more backlog: go again right away
 		}
-		if r.now().After(nextPrune) {
-			r.prune(ctx)
-			nextPrune = r.now().Add(r.cfg.PruneInterval)
-		}
 		sleep(ctx, r.cfg.PollInterval)
+	}
+}
+
+// pruneLoop prunes every PruneInterval until ctx is done.
+func (r *Relay) pruneLoop(ctx context.Context) {
+	if r.cfg.PruneInterval <= 0 {
+		return // pruning disabled
+	}
+	t := time.NewTicker(r.cfg.PruneInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.prune(ctx)
+		}
 	}
 }
 
@@ -140,7 +164,9 @@ var finalStatuses = map[string]bool{"sent": true, "failed": true, "cancelled": t
 //
 // Events of one notification arrive in order, and a batch's created events
 // (one insert, one transaction) all precede its items' later changes, so a
-// batch cannot look finished before all of its items are.
+// batch cannot look finished before all of its items are. A batch is
+// announced when its completed_at goes from empty to set, so it is
+// announced once per completion (again only after a redrive reopened it).
 func (r *Relay) trackBatches(ctx context.Context, repo *postgres.Repo, evs []events.Event) error {
 	deltas := map[uuid.UUID]int32{}
 	var order []uuid.UUID
@@ -174,8 +200,7 @@ func (r *Relay) trackBatches(ctx context.Context, repo *postgres.Repo, evs []eve
 		return err
 	}
 	for _, b := range rows {
-		justFinished := b.Delta > 0 && b.FinishedCount >= b.CreatedCount && b.FinishedCount-b.Delta < b.CreatedCount
-		if !justFinished {
+		if !b.WasOpen || b.CompletedAt == nil { // not just completed
 			continue
 		}
 		counts, err := repo.BatchStatusCounts(ctx, b.ID)
@@ -230,7 +255,8 @@ func dueChannels(evs []events.Event, now time.Time) []string {
 	return out
 }
 
-// prune deletes published events past retention, in chunks.
+// prune deletes published events past retention, in chunks, each its own
+// short statement.
 func (r *Relay) prune(ctx context.Context) {
 	const chunk = 10000
 	before := r.now().Add(-r.cfg.Retention)
