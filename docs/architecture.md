@@ -175,7 +175,7 @@ clients and logs. Callback bodies wrap the event: `{event_id, type
 | Worker stops (deploy) | Stops claiming, lets started deliveries finish within the grace period, hands back the rest with their attempt refunded |
 | Provider down | Breaker opens per channel after ≥50% failures over ≥20 deliveries; nothing is claimed; probes after 30 s |
 | Provider slow | Bounded by `PROVIDER_TIMEOUT`; slots keep pacing; leases are extended by the heartbeat |
-| Redis down | Rate limiting falls back to a local limiter (rate ÷ expected instances); events wait in the outbox and are published, in order, once Redis returns; callbacks keep going (they are queued in PostgreSQL); readiness reports `degraded` |
+| Redis down | Rate limiting falls back to a local limiter (rate ÷ workers, counted live from their database connections); events wait in the outbox and are published, in order, once Redis returns; callbacks keep going (they are queued in PostgreSQL); readiness reports `degraded` |
 | PostgreSQL down | API returns 500 and readiness reports `down`; workers retry claims; nothing is lost because nothing was accepted |
 | Relay crashes after publishing | The next round publishes the same events again; the WebSocket hub drops repeats by event id; batch progress is counted in the relay's transaction, so exactly once |
 | Callback receiver down | Retried with backoff up to `CALLBACK_MAX_ATTEMPTS`, then `failed` |

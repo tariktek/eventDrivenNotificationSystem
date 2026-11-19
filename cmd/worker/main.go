@@ -76,7 +76,10 @@ func run() error {
 		}
 	}()
 
-	pool, err := pgplatform.NewPool(ctx, cfg.Database)
+	// The ID names this worker in leases, logs and its database connections
+	// (which is how the workers count each other: see Instances below).
+	id := workerID(cfg.Worker.ID)
+	pool, err := pgplatform.NewPool(ctx, cfg.Database, postgres.WorkerAppName+id)
 	if err != nil {
 		return err
 	}
@@ -99,13 +102,22 @@ func run() error {
 	store := postgres.NewStore(pool)
 	m := metrics.New()
 	rate := ratelimit.Config{Rate: cfg.Worker.RateLimit, Horizon: cfg.Worker.RateHorizon}
+	// How many workers share the rate, counted from their database
+	// connections: if Redis is down, each sends at rate / this. PostgreSQL
+	// stays reachable then (no worker delivers without it), and the count
+	// follows scaling; WORKER_EXPECTED_INSTANCES is only the starting value.
+	instances := ratelimit.NewInstances(cfg.Worker.ExpectedInstances, 5*time.Second, store.CountLiveWorkers, log)
 	limiter := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary:    ratelimit.NewRedis(rdb, rate, "ratelimit:"),
-		Rate:       rate,
-		Instances:  cfg.Worker.ExpectedInstances,
-		Log:        log,
-		RetryEvery: 5 * time.Second,
+		Primary:       ratelimit.NewRedis(rdb, rate, "ratelimit:"),
+		Rate:          rate,
+		LiveInstances: instances.Get,
+		Log:           log,
+		RetryEvery:    5 * time.Second,
 	})
+	m.Registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "worker_instances",
+		Help: "Workers sharing the rate limit, counted from their database connections.",
+	}, func() float64 { return float64(instances.Get()) }))
 	m.Registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "rate_limiter_fallback_active",
 		Help: "1 while Redis is unreachable and the local fallback limiter is in use.",
@@ -122,7 +134,6 @@ func run() error {
 		return nil
 	})
 
-	id := workerID(cfg.Worker.ID)
 	urls := map[domain.Channel]string{}
 	for _, ch := range domain.Channels {
 		urls[ch] = cfg.Provider.URLFor(string(ch))
@@ -215,6 +226,7 @@ func run() error {
 	// rather than run half alive.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return w.Run(gctx) })
+	g.Go(func() error { instances.Run(gctx); return nil })
 	g.Go(func() error { relay.Run(gctx); return nil })
 	g.Go(func() error { callbacks.Run(gctx); return nil })
 	g.Go(func() error { cleaner.Run(gctx); return nil })

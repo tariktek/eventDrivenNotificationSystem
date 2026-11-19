@@ -18,9 +18,18 @@ horizon of one second. Each delivery waits for its own slot. All workers
 share the key per channel, so the spacing holds across instances.
 
 If Redis is unreachable, each worker falls back to a local limiter at
-`rate / WORKER_EXPECTED_INSTANCES` and reports itself degraded; it retries
-Redis every few seconds. Each Redis call is bounded at 250 ms: an outage
-does not fail fast (with Redis stopped, the client retried its dials for
+`rate / workers` and reports itself degraded; it retries Redis every few
+seconds. The workers count each other every 5 s from their PostgreSQL
+connections (each names its connections `notification-worker:<id>` and
+holds one open for LISTEN): PostgreSQL stays reachable when Redis does
+not, and no worker delivers without it anyway. A configured count goes
+stale as soon as the workers are scaled: three workers configured as two
+would each send at 95/2 and together at ~142/s, against a 95/s limit.
+Counted live, that scenario (three workers, setting left at two, Redis
+stopped, 300 SMS) peaked at 92 in any second. `WORKER_EXPECTED_INSTANCES`
+is only the value before the first count.
+
+Each Redis call is bounded at 250 ms: an outage does not fail fast (with Redis stopped, the client retried its dials for
 79 s, and the channel sent nothing meanwhile). Bounded, 30 SMS went out
 in under 2 s with Redis down.
 

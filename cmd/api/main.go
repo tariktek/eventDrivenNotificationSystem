@@ -66,7 +66,7 @@ func run() error {
 		}
 	}()
 
-	pool, err := pgplatform.NewPool(ctx, cfg.Database)
+	pool, err := pgplatform.NewPool(ctx, cfg.Database, "notification-api")
 	if err != nil {
 		return err
 	}

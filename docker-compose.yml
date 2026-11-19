@@ -115,6 +115,8 @@ services:
       replicas: 2
     environment:
       <<: *app-env
+      # Starting value only: the workers count each other live from their
+      # database connections (it matters only while Redis is down).
       WORKER_EXPECTED_INSTANCES: "2"
 
   # Stand-in for the external provider, with fault injection and stats:

@@ -138,9 +138,10 @@ dashboard's "Oldest due pending" panel climbs.
 after 30 seconds.
 
 **What keeps working:** creating notifications and delivering them.
-Each worker rate-limits itself at `WORKER_RATE_LIMIT /
-WORKER_EXPECTED_INSTANCES` (keep that setting equal to the real replica
-count, or the provider may see more than the limit, or less).
+Each worker rate-limits itself at `WORKER_RATE_LIMIT` divided by the
+number of workers, which they count from their database connections
+every few seconds (metric `worker_instances`), so scaling during an
+outage keeps the total at the limit.
 
 **What pauses:** WebSocket events. They are safe in the `outbox_events`
 table and are published, in order, when Redis returns. Status callbacks

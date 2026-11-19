@@ -113,8 +113,10 @@ type WorkerConfig struct {
 	// on arrival, no second ever exceeds 100 (measured: see loadtest/).
 	RateLimit   int           `env:"RATE_LIMIT"   envDefault:"95"`
 	RateHorizon time.Duration `env:"RATE_HORIZON" envDefault:"1s"`
-	// ExpectedInstances sizes the local fallback limiter: if Redis is down,
-	// each worker sends at RateLimit / ExpectedInstances.
+	// ExpectedInstances is the starting worker count for the local fallback
+	// limiter (if Redis is down, each worker sends at RateLimit / count).
+	// Workers count each other from their database connections every few
+	// seconds, so this only matters until the first count.
 	ExpectedInstances int `env:"EXPECTED_INSTANCES" envDefault:"1"`
 }
 

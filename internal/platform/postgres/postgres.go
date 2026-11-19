@@ -18,7 +18,11 @@ const connectTimeout = 10 * time.Second
 // NewPool opens a connection pool and verifies the database is reachable, so
 // a wrong URL or unreachable server fails at startup rather than on the first
 // request.
-func NewPool(ctx context.Context, cfg config.DatabaseConfig) (*pgxpool.Pool, error) {
+//
+// appName names every connection (application_name), so pg_stat_activity
+// shows which process each one belongs to; workers also count each other
+// that way (see postgres.Store.CountLiveWorkers).
+func NewPool(ctx context.Context, cfg config.DatabaseConfig, appName string) (*pgxpool.Pool, error) {
 	pc, err := pgxpool.ParseConfig(cfg.URL)
 	if err != nil {
 		// Parse errors can echo the DSN, which contains the password.
@@ -26,6 +30,9 @@ func NewPool(ctx context.Context, cfg config.DatabaseConfig) (*pgxpool.Pool, err
 	}
 	pc.MaxConns = cfg.MaxConns
 	pc.MinConns = cfg.MinConns
+	if appName != "" {
+		pc.ConnConfig.RuntimeParams["application_name"] = appName
+	}
 	// Queries become spans inside the trace of the work running them (an
 	// API request, a delivery). Background polls start no trace of their
 	// own: see observability.SetupTracing.

@@ -282,3 +282,66 @@ func (s *stubLimiter) Reserve(_ context.Context, _ string, n int) (ratelimit.Res
 	}
 	return ratelimit.Reservation{Count: n, Interval: 10 * time.Millisecond}, nil
 }
+
+// TestFallback_LocalShareFollowsLiveInstances: with Redis down, each
+// worker's share is the full rate divided by the workers counted right
+// now, not by a configured number that scaling can leave stale. Three
+// workers configured as two would otherwise send 1.5× the limit together.
+func TestFallback_LocalShareFollowsLiveInstances(t *testing.T) {
+	clk := newClock()
+	live := 2
+	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
+		Primary: &flakyLimiter{down: true}, Rate: cfg, RetryEvery: time.Hour,
+		LiveInstances: func() int { return live },
+		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:           clk.now,
+	})
+
+	r, err := f.Reserve(t.Context(), "sms", 1)
+	require.NoError(t, err)
+	assert.Equal(t, 20*time.Millisecond, r.Interval, "two workers: 50/s each")
+
+	live = 3 // a worker was added
+	clk.advance(time.Second)
+	r, err = f.Reserve(t.Context(), "sms", 1)
+	require.NoError(t, err)
+	assert.Equal(t, time.Second/33, r.Interval, "three workers: 33/s each")
+	assert.Equal(t, 33, int(time.Second/r.Interval), "together at most the full rate")
+}
+
+// TestLocal_RateChangeKeepsGrantedSlots: lowering the rate does not move
+// or overlap slots already granted; the next slot follows the last one.
+func TestLocal_RateChangeKeepsGrantedSlots(t *testing.T) {
+	clk := newClock()
+	l := ratelimit.NewLocal(ratelimit.Config{Rate: 50, Horizon: time.Second}, clk.now)
+	r, err := l.Reserve(t.Context(), "sms", 10) // 10 slots, 20 ms apart: the last at 180 ms
+	require.NoError(t, err)
+	require.Equal(t, 10, r.Count)
+
+	l.SetConfig(ratelimit.Config{Rate: 25, Horizon: time.Second})
+	r, err = l.Reserve(t.Context(), "sms", 1)
+	require.NoError(t, err)
+	assert.Equal(t, 200*time.Millisecond, r.First, "after the slots already granted")
+	assert.Equal(t, 40*time.Millisecond, r.Interval)
+}
+
+func TestInstances(t *testing.T) {
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var (
+		n   = 3
+		err error
+	)
+	i := ratelimit.NewInstances(2, time.Hour, func(context.Context) (int, error) { return n, err }, quiet)
+	assert.Equal(t, 2, i.Get(), "the configured start until the first count")
+
+	i.Refresh(t.Context())
+	assert.Equal(t, 3, i.Get())
+
+	n, err = 0, errors.New("database unreachable")
+	i.Refresh(t.Context())
+	assert.Equal(t, 3, i.Get(), "a failed count keeps the last one")
+
+	err = nil // n is 0: the counting worker itself is running
+	i.Refresh(t.Context())
+	assert.Equal(t, 1, i.Get())
+}

@@ -26,7 +26,9 @@ import (
 // says how long to wait), then reserves on the new one.
 type Fallback struct {
 	primary    Limiter
-	local      Limiter
+	local      *Local
+	rate       Config     // the full rate, shared by all instances
+	instances  func() int // how many instances share it right now
 	log        *slog.Logger
 	now        func() time.Time
 	retryEvery time.Duration
@@ -49,9 +51,13 @@ type timeline struct {
 type FallbackConfig struct {
 	Primary Limiter
 	// Rate is the full per-key rate; the local share is Rate / Instances.
-	Rate      Config
-	Instances int
-	Log       *slog.Logger
+	Rate Config
+	// Instances is the number of workers sharing Rate. LiveInstances, if
+	// set, is asked on every local reservation instead (see Instances), so
+	// the share follows scaling without a configuration change.
+	Instances     int
+	LiveInstances func() int
+	Log           *slog.Logger
 	// RetryEvery is how long to stay on the local limiter after a failure.
 	RetryEvery time.Duration
 	// Timeout bounds each call to the shared limiter (default
@@ -72,9 +78,15 @@ func NewFallback(c FallbackConfig) *Fallback {
 	if c.Timeout <= 0 {
 		c.Timeout = DefaultFallbackTimeout
 	}
+	instances := c.LiveInstances
+	if instances == nil {
+		instances = func() int { return c.Instances }
+	}
 	return &Fallback{
 		primary:    c.Primary,
-		local:      NewLocal(LocalShare(c.Rate, c.Instances), c.Now),
+		local:      NewLocal(LocalShare(c.Rate, instances()), c.Now),
+		rate:       c.Rate,
+		instances:  instances,
 		log:        c.Log,
 		now:        c.Now,
 		retryEvery: c.RetryEvery,
@@ -117,6 +129,10 @@ func (f *Fallback) Reserve(ctx context.Context, key string, n int) (Reservation,
 	if wait := f.drain(key, true); wait > 0 {
 		return Reservation{First: wait}, nil
 	}
+	// The share follows the live worker count. Changing the rate keeps the
+	// key's timeline (TAT): slots already handed out stay where they are,
+	// and new ones are spaced at the new interval after them.
+	f.local.SetConfig(LocalShare(f.rate, f.instances()))
 	res, err := f.local.Reserve(ctx, key, n)
 	if err == nil {
 		f.note(key, true, res)
