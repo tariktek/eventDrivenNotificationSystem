@@ -169,6 +169,28 @@ none, events accumulate (safely). Worker logs show relay errors, if any.
 `OUTBOX_BATCH_SIZE` events per round back to back, ~several thousand per
 second.
 
+## Sends that outlived their lease
+
+Alert `SendRecoveredAfterLeaseLoss`; metric
+`delivery_recovered_after_lease_loss_total{channel, previous_status}`.
+
+A provider call took longer than the worker's lease (`WORKER_LEASE`,
+heartbeats included), so the reaper treated the worker as dead: it put the
+notification back to `pending`, or failed it on its last attempt, and it
+may have been cancelled after that. Then the provider accepted the
+original call. The worker recorded it as `sent` anyway, since the provider
+is the source of truth, and logged `lease was lost during the provider
+call`.
+
+What to check:
+
+1. If another worker claimed the notification in between, the recipient
+   got the message twice (at-least-once). Its attempts show two successes.
+2. Why heartbeats stopped extending the lease: a worker starved of CPU, a
+   database that could not be reached, or provider calls slower than the
+   lease (`provider_request_duration_seconds`). Raise `WORKER_LEASE` above
+   the slowest calls, or lower `PROVIDER_TIMEOUT` below it.
+
 ## A worker crashed or was killed
 
 Nothing to do. Its claimed notifications keep their lease for at most

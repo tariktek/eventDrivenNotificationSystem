@@ -14,14 +14,33 @@ groups:
           runbook: docs/runbook.md
 
       - alert: HighFailureRate
+        # A channel that has failed everything since the workers started has
+        # no notifications_sent_total series yet, and a sum with a missing
+        # series has no result at all: the "or ... * 0" counts it as zero
+        # sent, so 100% failure alerts instead of going silent.
         expr: |
           sum by (channel) (rate(notifications_failed_total[5m]))
-            / (sum by (channel) (rate(notifications_sent_total[5m])) + sum by (channel) (rate(notifications_failed_total[5m])))
+            / (
+                (sum by (channel) (rate(notifications_sent_total[5m])) or sum by (channel) (rate(notifications_failed_total[5m])) * 0)
+              + sum by (channel) (rate(notifications_failed_total[5m]))
+            )
           > 0.10
         for: 5m
         labels: { severity: critical }
         annotations:
           summary: "{{ $labels.channel }}: {{ $value | humanizePercentage }} of deliveries failing"
+          runbook: docs/runbook.md
+
+      - alert: SendRecoveredAfterLeaseLoss
+        # A provider call outlived the worker's lease: the reaper had already
+        # requeued or failed the notification when the provider accepted it.
+        # It was recorded as sent, but if another worker had claimed it in
+        # between, the recipient got it twice. Raise WORKER_LEASE above the
+        # slowest provider calls (or find why heartbeats stopped).
+        expr: sum by (channel) (increase(delivery_recovered_after_lease_loss_total[15m])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.channel }}: deliveries outlived their worker lease"
           runbook: docs/runbook.md
 
       - alert: CircuitBreakerOpen
