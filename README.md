@@ -282,6 +282,16 @@ stateDiagram-v2
 - **Outages.** When ≥50% of at least 20 deliveries in 10 s fail, the
   channel's breaker opens: nothing is claimed, so queued notifications
   keep their attempts. After 30 s a few probes test the provider.
+- **The rate limit fails closed.** Only the shared limiter in Redis knows
+  what every worker sends, so a worker that cannot reach it sends
+  nothing: it hands its claimed notifications back (attempts refunded)
+  and resumes when Redis answers. The limit holds even when only some
+  workers lose Redis; if all of them do, deliveries wait rather than
+  exceed the provider's limit ([ADR 003](docs/adr/003-rate-limiting.md)).
+- **Callbacks are lossless, live events best effort.** A callback is
+  queued in PostgreSQL by the status change itself, in its transaction,
+  and retried until delivered. WebSocket events come from a trimmed Redis
+  stream: a client that misses some reloads the state over REST.
 - **Dead letters.** `failed` is the dead-letter state: listable, retried
   singly or in bulk by filter. [`docs/runbook.md`](docs/runbook.md) has
   the procedures.
@@ -441,3 +451,11 @@ close handshakes at shutdown, a truncation that split UTF-8 characters
 and made callbacks retry forever, and the three performance problems the
 load tests exposed. Each was diagnosed to its root cause and has a test
 that fails without the fix.
+
+Reviewing the finished system end to end found more, each fixed the same
+way: a local rate-limit fallback that a partial Redis outage could push
+to 1.5× the limit (now fail-closed), callbacks that could be lost or
+reordered on their way through the event stream (now queued with the
+status change), a fallback that took 79 s to notice Redis was gone, a
+breaker log line hidden by its own PII masking, and a retention job the
+plan promised but the code lacked.
