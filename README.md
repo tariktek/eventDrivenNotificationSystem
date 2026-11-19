@@ -403,6 +403,12 @@ Known limits and the accepted security risks are in
   order: partition `notifications` by time (cheap retention: drop a
   partition), separate queue tables per channel, then move hot queues to a
   log (Kafka/Redpanda) while keeping PostgreSQL as the system of record.
+- **Data retention.** Published outbox events are pruned after
+  `OUTBOX_RETENTION`, but notifications and their attempts are kept
+  indefinitely: the retention job planned in the roadmap is not built yet.
+  Next step: a periodic, chunked delete of final-state notifications older
+  than a configurable age (their recipients and content are personal
+  data), and at scale monthly partitions dropped whole.
 - **Rate limits per tenant.** The limiter already takes a key; per-client
   quotas are a new key scheme plus configuration.
 - **Fairness inside a priority.** One huge batch delays later messages of

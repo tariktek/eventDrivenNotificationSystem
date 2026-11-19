@@ -57,3 +57,4 @@ production deployment would do:
 | API keys come from the environment; there is no key-management API. | A secrets manager, and keys stored hashed in the database with scopes. |
 | docker compose serves plain HTTP and uses development passwords. | TLS terminated at the load balancer; real secrets injected at deploy time. |
 | Delivery is at-least-once: a crash between the provider's 202 and recording it can resend a message. | The provider deduplicates by the `X-Idempotency-Key` header sent with every delivery. |
+| Notifications (recipients and content, which are personal data) are never deleted; only published outbox events are pruned. | A retention job deleting final-state notifications and their attempts after a configurable period, in chunks; time-based partitions at scale. |
