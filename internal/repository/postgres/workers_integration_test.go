@@ -4,6 +4,7 @@ package postgres_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -47,8 +48,12 @@ func TestCountLiveWorkers(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, n)
 
-	b.Close() // worker b stops
-	n, err = store.CountLiveWorkers(t.Context())
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
+	// Worker b stops. Its sessions leave pg_stat_activity once their
+	// server processes have exited, a moment after the client closed them
+	// (the workers recount every few seconds, so the lag does not matter).
+	b.Close()
+	assert.Eventually(t, func() bool {
+		n, err := store.CountLiveWorkers(t.Context())
+		return err == nil && n == 1
+	}, 5*time.Second, 20*time.Millisecond, "a stopped worker is no longer counted")
 }
