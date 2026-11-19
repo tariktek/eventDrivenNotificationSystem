@@ -345,9 +345,11 @@ func TestClaimCallbacks_OneNotificationInEventOrder(t *testing.T) {
 		id  int64
 		typ string
 	}{{10, "notification.failed"}, {20, "notification.sent"}} {
-		ok, err := store.EnqueueCallback(t.Context(), ev.id, n.ID, ev.typ, []byte(`{}`))
+		// Normally written by the outbox trigger on each final status
+		// (migration 19); inserted directly here to test the claim order.
+		_, err := pool.Exec(t.Context(), `INSERT INTO callback_deliveries (notification_id, event_id, event_type, url, payload)
+			VALUES ($1, $2, $3, 'https://hooks.example.com/x', '{}')`, n.ID, ev.id, ev.typ)
 		require.NoError(t, err)
-		require.True(t, ok)
 	}
 
 	first, err := store.ClaimCallbacks(t.Context(), now, time.Minute, 10, 5)

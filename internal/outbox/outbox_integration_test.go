@@ -319,6 +319,119 @@ func TestTriggers_DuplicatesDoNotCountTowardsTheBatch(t *testing.T) {
 	assert.Len(t, ofType(outboxRows(t), events.TypeBatchCompleted), 1, "1 of 1 created items finished")
 }
 
+// ---- callbacks (queued by the trigger) --------------------------------------
+
+type callbackRow struct {
+	EventID   int64
+	EventType string
+	URL       string
+	Body      map[string]any
+}
+
+func callbacks(t *testing.T, id uuid.UUID) []callbackRow {
+	t.Helper()
+	rows, err := pool.Query(t.Context(),
+		`SELECT event_id, event_type, url, payload FROM callback_deliveries WHERE notification_id = $1 ORDER BY event_id`, id)
+	require.NoError(t, err)
+	var out []callbackRow
+	for rows.Next() {
+		var c callbackRow
+		require.NoError(t, rows.Scan(&c.EventID, &c.EventType, &c.URL, &c.Body))
+		out = append(out, c)
+	}
+	require.NoError(t, rows.Err())
+	return out
+}
+
+func withCallback(t *testing.T, url string) *domain.Notification {
+	t.Helper()
+	n, err := domain.NewNotification(domain.NewNotificationParams{
+		Channel: domain.ChannelSMS, Recipient: "+905551234567", Content: "hi", CallbackURL: url,
+	}, time.Now())
+	require.NoError(t, err)
+	_, err = store.InsertNotifications(t.Context(), []*domain.Notification{n})
+	require.NoError(t, err)
+	return n
+}
+
+// TestTriggers_FinalStatusQueuesItsCallback: the callback row is written by
+// the status change itself, carrying that change's event, and only for
+// final statuses of notifications that asked for one. Nothing depends on
+// the event stream, so trimming it or losing Redis cannot lose a callback.
+func TestTriggers_FinalStatusQueuesItsCallback(t *testing.T) {
+	reset(t)
+	hooked := withCallback(t, "https://hooks.example.com/x")
+	plain := withCallback(t, "")
+
+	claimed := claim(t, 2) // pending → processing: not final, no callback
+	assert.Empty(t, callbacks(t, hooked.ID))
+	for _, n := range claimed {
+		complete(t, n, domain.StatusSent)
+	}
+
+	assert.Empty(t, callbacks(t, plain.ID), "no callback_url, no callback")
+	cbs := callbacks(t, hooked.ID)
+	require.Len(t, cbs, 1)
+	cb := cbs[0]
+	assert.Equal(t, "notification.sent", cb.EventType)
+	assert.Equal(t, "https://hooks.example.com/x", cb.URL)
+
+	var eventID int64
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT id FROM outbox_events
+		WHERE aggregate_id = $1 AND payload->>'status' = 'sent'`, hooked.ID).Scan(&eventID))
+	assert.Equal(t, eventID, cb.EventID, "the callback is the event of the change, in the same transaction")
+	assert.EqualValues(t, eventID, cb.Body["event_id"])
+	assert.Equal(t, "notification.sent", cb.Body["type"])
+	data, _ := cb.Body["data"].(map[string]any)
+	assert.Equal(t, "sent", data["status"])
+	assert.Equal(t, "processing", data["previous_status"])
+	assert.NotContains(t, data, "recipient", "callbacks carry state, never personal data")
+}
+
+// TestTriggers_CallbacksNeverGoBackwards: failed, then a redrive, then
+// sent. The client must receive failed before sent, never sent and then
+// failed, even when the failed callback is still waiting for a retry, and
+// a stale callback is never sent after a newer one was delivered.
+func TestTriggers_CallbacksNeverGoBackwards(t *testing.T) {
+	reset(t)
+	n := withCallback(t, "https://hooks.example.com/x")
+	complete(t, claim(t, 1)[0], domain.StatusFailed)
+	_, err := store.RetryNotification(t.Context(), n.ID, time.Now())
+	require.NoError(t, err)
+	complete(t, claim(t, 1)[0], domain.StatusSent)
+
+	cbs := callbacks(t, n.ID)
+	require.Len(t, cbs, 2)
+	assert.Equal(t, []string{"notification.failed", "notification.sent"}, []string{cbs[0].EventType, cbs[1].EventType},
+		"created in the order the changes committed")
+
+	due := time.Now().Add(time.Minute) // rows are due from their insert (database clock)
+	first, err := store.ClaimCallbacks(t.Context(), due, time.Minute, 10, 5)
+	require.NoError(t, err)
+	require.Len(t, first, 1, "the sent callback waits for the failed one")
+	assert.Equal(t, cbs[0].EventID, first[0].EventID)
+
+	// Suppose the newer one was delivered anyway (an older version, manual
+	// SQL): the older one must then never go out.
+	_, err = pool.Exec(t.Context(), `UPDATE callback_deliveries SET status = 'delivered' WHERE event_id = $1`, cbs[1].EventID)
+	require.NoError(t, err)
+	ok, err := store.FinishCallback(t.Context(), first[0], &postgres.CallbackOutcome{
+		Status: postgres.CallbackPending, NextAttemptAt: time.Now(), Error: "503", Now: time.Now(),
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	again, err := store.ClaimCallbacks(t.Context(), due.Add(time.Hour), time.Minute, 10, 5)
+	require.NoError(t, err)
+	assert.Empty(t, again, "a callback older than a delivered one is never claimed")
+	closed, err := store.SupersedeCallbacks(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), closed)
+	var status string
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT status FROM callback_deliveries WHERE event_id = $1`, cbs[0].EventID).Scan(&status))
+	assert.Equal(t, postgres.CallbackSuperseded, status)
+}
+
 // ---- relay -----------------------------------------------------------------
 
 func relayConfig() outbox.Config {
@@ -443,127 +556,6 @@ func publish(t *testing.T, n int) {
 		}
 	}
 	require.NoError(t, events.NewPublisher(rdb, events.DefaultStream, 10000).Publish(t.Context(), evs))
-}
-
-// TestGroup_SharesWorkAndRetriesFailures runs two members of one consumer
-// group. Each event must be handled successfully exactly once, including
-// one whose first handling failed (it comes back after MinIdle).
-func TestGroup_SharesWorkAndRetriesFailures(t *testing.T) {
-	reset(t)
-	var (
-		mu      sync.Mutex
-		handled = map[int64]int{}
-		by      = map[string]int{}
-		failed  bool
-	)
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	for _, name := range []string{"c1", "c2"} {
-		g := events.NewGroup(rdb, events.GroupConfig{
-			Stream: events.DefaultStream, Group: "callbacks", Consumer: name, Count: 10,
-			Block: 50 * time.Millisecond, MinIdle: 300 * time.Millisecond, RetryEvery: 50 * time.Millisecond, Log: quiet,
-		})
-		require.NoError(t, g.Ensure(ctx))
-		go g.Run(ctx, func(_ context.Context, e events.Event) error {
-			time.Sleep(time.Millisecond) // let the other member get a share
-			mu.Lock()
-			defer mu.Unlock()
-			if e.ID == 7 && !failed {
-				failed = true
-				return errors.New("transient")
-			}
-			handled[e.ID]++
-			by[name]++
-			return nil
-		})
-	}
-	publish(t, 100)
-
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(handled) == 100
-	}, 10*time.Second, 20*time.Millisecond)
-	time.Sleep(400 * time.Millisecond) // a wrong redelivery would show up now
-
-	mu.Lock()
-	defer mu.Unlock()
-	for id, n := range handled {
-		assert.Equal(t, 1, n, "event %d handled once", id)
-	}
-	assert.Positive(t, by["c1"])
-	assert.Positive(t, by["c2"])
-	pending, err := rdb.XPending(t.Context(), events.DefaultStream, "callbacks").Result()
-	require.NoError(t, err)
-	assert.Zero(t, pending.Count, "everything acknowledged")
-}
-
-func TestGroup_ConsumerCrashIsTakenOver(t *testing.T) {
-	reset(t)
-	publish(t, 5)
-	// A consumer reads the events and dies without acknowledging them.
-	_, err := rdb.XGroupCreateMkStream(t.Context(), events.DefaultStream, "callbacks", "0").Result()
-	require.NoError(t, err)
-	res, err := rdb.XReadGroup(t.Context(), &goredis.XReadGroupArgs{
-		Group: "callbacks", Consumer: "dead", Streams: []string{events.DefaultStream, ">"},
-	}).Result()
-	require.NoError(t, err)
-	require.Len(t, res[0].Messages, 5)
-
-	var mu sync.Mutex
-	got := map[int64]bool{}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	go events.NewGroup(rdb, events.GroupConfig{
-		Stream: events.DefaultStream, Group: "callbacks", Consumer: "alive", Count: 10,
-		Block: 50 * time.Millisecond, MinIdle: 200 * time.Millisecond, RetryEvery: 50 * time.Millisecond, Log: quiet,
-	}).Run(ctx, func(_ context.Context, e events.Event) error {
-		mu.Lock()
-		got[e.ID] = true
-		mu.Unlock()
-		return nil
-	})
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(got) == 5
-	}, 5*time.Second, 20*time.Millisecond)
-}
-
-// TestGroup_LostGroupIsRecreatedFromTheStart: if Redis loses the group
-// (a restart without persistence) while the relay keeps publishing, the
-// events published before the group is back must still be consumed.
-func TestGroup_LostGroupIsRecreatedFromTheStart(t *testing.T) {
-	reset(t)
-	g := events.NewGroup(rdb, events.GroupConfig{
-		Stream: events.DefaultStream, Group: "callbacks", Consumer: "c1", Count: 10,
-		Block: 50 * time.Millisecond, MinIdle: time.Minute, RetryEvery: 50 * time.Millisecond, Log: quiet,
-	})
-	require.True(t, g.WaitEnsured(t.Context()))
-
-	var mu sync.Mutex
-	got := map[int64]bool{}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	go g.Run(ctx, func(_ context.Context, e events.Event) error {
-		mu.Lock()
-		got[e.ID] = true
-		mu.Unlock()
-		return nil
-	})
-	seen := func(n int) func() bool {
-		return func() bool { mu.Lock(); defer mu.Unlock(); return len(got) == n }
-	}
-	publish(t, 3)
-	require.Eventually(t, seen(3), 5*time.Second, 10*time.Millisecond)
-
-	// Redis loses the stream and its group; the relay publishes on.
-	require.NoError(t, rdb.Del(t.Context(), events.DefaultStream).Err())
-	mu.Lock()
-	clear(got)
-	mu.Unlock()
-	publish(t, 5)
-	require.Eventually(t, seen(5), 5*time.Second, 10*time.Millisecond, "nothing published meanwhile is skipped")
 }
 
 func TestTail_FansOutToEveryReader(t *testing.T) {

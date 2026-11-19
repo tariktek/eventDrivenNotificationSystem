@@ -27,18 +27,27 @@ Consumers:
 
 - **WebSocket hubs** (each API instance) tail the stream: every instance
   sees every event.
-- **Callbacks**: a consumer group shares the events among workers, with
-  acknowledgement and takeover of events left by a dead consumer. A new
-  group starts at the end of the stream, so a deployment does not act on
-  history.
+- **Callbacks** do not read the stream. The same trigger writes a
+  `callback_deliveries` row when a notification with a `callback_url`
+  reaches a final status, in the transaction of the change (migration 19),
+  and dispatchers on every worker claim those rows. They first went
+  through the stream with a consumer group; that lost callbacks when the
+  stream was trimmed or Redis lost its last second of writes, and the group
+  spread one notification's events over several workers, so an older
+  callback (failed) could reach the client after a newer one (sent).
 
 ## Consequences
 
 - An event exists if and only if its change committed. Redis down: events
   wait in the table and are published in order when it returns.
 - At least once: a relay that crashes after publishing republishes;
-  consumers deduplicate by event id (`callback_deliveries.event_id` is
-  unique).
+  the WebSocket hub drops repeats by event id.
+- Guarantees differ by consumer: the outbox table and callbacks are
+  lossless; the stream, and so WebSocket, is a best-effort live feed (a
+  client that misses an event reloads the state over REST).
+- One notification's callbacks are created in commit order and sent in
+  that order; one older than an already delivered callback is never sent
+  (`superseded`).
 - One notification's events are always in order (each change commits
   after the previous one). Events of different notifications are not
   globally ordered.

@@ -142,21 +142,19 @@ Each worker rate-limits itself at `WORKER_RATE_LIMIT /
 WORKER_EXPECTED_INSTANCES` (keep that setting equal to the real replica
 count, or the provider may see more than the limit, or less).
 
-**What pauses:** WebSocket events and status callbacks. Events are
-safe in the `outbox_events` table and are published, in order, when
-Redis returns. Nothing needs replaying by hand.
+**What pauses:** WebSocket events. They are safe in the `outbox_events`
+table and are published, in order, when Redis returns. Status callbacks
+keep going: they are queued in PostgreSQL with each status change, not
+read from Redis. Nothing needs replaying by hand.
 
 **Act:** restore Redis (`docker compose up -d redis`). Workers switch
 back to the shared limiter within seconds; the outbox backlog drains
 (watch `outbox_backlog_events` fall to zero).
 
 **If Redis lost its data** (compose runs it with an append-only file, so
-a restart does not): the callback consumer group is recreated
-automatically. Events that were already published to the stream but not
-yet consumed are gone with it, so their callbacks are not sent; the
-events themselves remain in `outbox_events` for `OUTBOX_RETENTION`.
-WebSocket clients are unaffected beyond the outage (they resync over
-REST when they reconnect).
+a restart does not): no callback is affected. WebSocket clients may have
+missed the events of the outage; they resync over REST when they
+reconnect. The events remain in `outbox_events` for `OUTBOX_RETENTION`.
 
 ## Outbox lag without a Redis outage
 

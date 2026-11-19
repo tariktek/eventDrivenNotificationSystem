@@ -3,7 +3,6 @@ package callback
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -16,49 +15,19 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/tariktek/eventDrivenNotificationSystem/internal/events"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/metrics"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/retry"
 )
 
-// finalStatuses are the statuses clients are called back about.
-var finalStatuses = map[string]bool{"sent": true, "failed": true, "cancelled": true}
-
-// Body is the JSON a client receives.
+// Body is the JSON a client receives. The outbox trigger builds it when a
+// notification reaches a final status (migration 19); this type documents
+// it for receivers.
 type Body struct {
 	EventID    int64           `json:"event_id"`
 	Type       string          `json:"type"` // notification.sent, notification.failed, notification.cancelled
 	OccurredAt time.Time       `json:"occurred_at"`
 	Data       json.RawMessage `json:"data"` // the notification event payload
-}
-
-// Enqueuer turns final-status events into pending callback deliveries.
-// It runs as a consumer-group handler: each event is handled by one
-// worker, and a repeat (at-least-once delivery) is absorbed by the unique
-// event id.
-type Enqueuer struct {
-	Store *postgres.Store
-}
-
-// Handle implements the events.Group handler.
-func (q *Enqueuer) Handle(ctx context.Context, e events.Event) error {
-	if e.Type != events.TypeNotificationStatusChanged {
-		return nil
-	}
-	var p events.NotificationPayload
-	if err := json.Unmarshal(e.Payload, &p); err != nil {
-		return nil //nolint:nilerr // undecodable: retrying cannot fix it
-	}
-	if !finalStatuses[p.Status] {
-		return nil
-	}
-	body, err := json.Marshal(Body{EventID: e.ID, Type: "notification." + p.Status, OccurredAt: p.OccurredAt, Data: e.Payload})
-	if err != nil {
-		return fmt.Errorf("encode callback body: %w", err)
-	}
-	_, err = q.Store.EnqueueCallback(ctx, e.ID, p.NotificationID, "notification."+p.Status, body)
-	return err
 }
 
 // DispatcherConfig tunes a Dispatcher.
@@ -122,6 +91,12 @@ func (d *Dispatcher) Run(ctx context.Context) {
 			continue
 		} else if n > 0 {
 			d.log.WarnContext(ctx, "callbacks failed: attempts exhausted without a recorded outcome", "count", n)
+		}
+		if n, err := d.store.SupersedeCallbacks(ctx); err != nil {
+			d.fail(ctx, "supersede callbacks", err)
+			continue
+		} else if n > 0 {
+			d.log.WarnContext(ctx, "callbacks not sent: a newer callback of the same notification was already delivered", "count", n)
 		}
 		due, err := d.store.ClaimCallbacks(ctx, now, d.cfg.Lease, free, d.cfg.MaxAttempts)
 		if err != nil {

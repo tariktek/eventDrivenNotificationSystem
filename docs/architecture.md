@@ -22,7 +22,7 @@ flowchart TB
         deliver[Deliveries]
         reaper[Heartbeat and reaper]
         relay[Outbox relay]
-        cbc[Callback consumer and dispatcher]
+        cbc[Callback dispatcher]
     end
 
     pg[(PostgreSQL<br/>notifications · batches · templates<br/>attempts · outbox_events · callback_deliveries)]
@@ -40,8 +40,7 @@ flowchart TB
     relay -->|read outbox, count batches, NOTIFY| pg
     relay -->|XADD| redis
     redis -->|XREAD| hub
-    redis -->|XREADGROUP| cbc
-    cbc --> pg
+    pg -->|claim callback rows| cbc
     cbc -->|signed POST| hook
 ```
 
@@ -55,7 +54,7 @@ flowchart TB
 | Delivery | Worker | Waits for its slot, calls the provider, records the outcome and the attempt in one transaction |
 | Heartbeat, reaper | Worker | Extends leases of in-flight deliveries; requeues work of workers that stopped heartbeating |
 | Outbox relay | Worker (one at a time) | Publishes outbox events to the stream in order, counts batch progress, wakes workers |
-| Callback consumer, dispatcher | Worker | Turns final-status events into callback rows; sends them signed, with retries |
+| Callback dispatcher | Worker | Sends the callback rows the outbox trigger queues with each final status, signed, one notification's in order, with retries |
 
 ## The life of a notification
 
@@ -93,7 +92,7 @@ sequenceDiagram
 
     Note over P,R: Relay: publish "status_changed", count batch progress
     R-->>A: event (tail) → WebSocket clients subscribed to it
-    R-->>W: event (consumer group) → callback row if callback_url
+    Note over W,P: final status with callback_url: the trigger queued a callback row in the same transaction
     W->>H: POST, X-Signature: sha256=HMAC(secret, ts.body)
 ```
 
@@ -176,7 +175,7 @@ clients and logs. Callback bodies wrap the event: `{event_id, type
 | Worker stops (deploy) | Stops claiming, lets started deliveries finish within the grace period, hands back the rest with their attempt refunded |
 | Provider down | Breaker opens per channel after ≥50% failures over ≥20 deliveries; nothing is claimed; probes after 30 s |
 | Provider slow | Bounded by `PROVIDER_TIMEOUT`; slots keep pacing; leases are extended by the heartbeat |
-| Redis down | Rate limiting falls back to a local limiter (rate ÷ expected instances); events wait in the outbox and are published, in order, once Redis returns; readiness reports `degraded` |
+| Redis down | Rate limiting falls back to a local limiter (rate ÷ expected instances); events wait in the outbox and are published, in order, once Redis returns; callbacks keep going (they are queued in PostgreSQL); readiness reports `degraded` |
 | PostgreSQL down | API returns 500 and readiness reports `down`; workers retry claims; nothing is lost because nothing was accepted |
-| Relay crashes after publishing | The next round publishes the same events again; consumers deduplicate by event id; batch progress is counted in the relay's transaction, so exactly once |
+| Relay crashes after publishing | The next round publishes the same events again; the WebSocket hub drops repeats by event id; batch progress is counted in the relay's transaction, so exactly once |
 | Callback receiver down | Retried with backoff up to `CALLBACK_MAX_ATTEMPTS`, then `failed` |

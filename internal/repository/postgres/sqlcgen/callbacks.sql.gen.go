@@ -13,6 +13,7 @@ import (
 )
 
 const claimCallbacks = `-- name: ClaimCallbacks :many
+
 UPDATE callback_deliveries c
 SET attempts = c.attempts + 1, next_attempt_at = $1
 WHERE c.id IN (
@@ -21,6 +22,9 @@ WHERE c.id IN (
       AND NOT EXISTS (
           SELECT 1 FROM callback_deliveries e
           WHERE e.notification_id = d.notification_id AND e.status = 'pending' AND e.event_id < d.event_id)
+      AND NOT EXISTS (
+          SELECT 1 FROM callback_deliveries e
+          WHERE e.notification_id = d.notification_id AND e.status = 'delivered' AND e.event_id > d.event_id)
     ORDER BY d.next_attempt_at
     LIMIT $4
     FOR UPDATE SKIP LOCKED
@@ -45,6 +49,10 @@ type ClaimCallbacksRow struct {
 	Attempts       int32
 }
 
+// Status callbacks. A row per final status change of a notification with a
+// callback_url, written by the outbox trigger in the transaction of the
+// change (migration 19); delivery state lives here, so retries survive
+// restarts.
 // Claim due callbacks. Pushing next_attempt_at forward by the lease hides
 // them from other dispatchers; if this one dies, they become due again
 // when the lease runs out. attempts doubles as the fencing token.
@@ -55,6 +63,12 @@ type ClaimCallbacksRow struct {
 // for its retry could reach the client after the sent callback of a
 // successful redrive, and the client would move the notification back to
 // failed. A callback that gave up (failed) no longer holds the next one.
+//
+// Since callbacks are created by the status change itself (migration 19),
+// every earlier callback exists before a later one does, so this rule
+// sees all of them. As a second guard, a callback is never claimed once a
+// newer one of the same notification was delivered: the client already
+// has a later state, and this one would move it backwards.
 func (q *Queries) ClaimCallbacks(ctx context.Context, arg ClaimCallbacksParams) ([]ClaimCallbacksRow, error) {
 	rows, err := q.db.Query(ctx, claimCallbacks,
 		arg.LeaseUntil,
@@ -86,39 +100,6 @@ func (q *Queries) ClaimCallbacks(ctx context.Context, arg ClaimCallbacksParams) 
 		return nil, err
 	}
 	return items, nil
-}
-
-const enqueueCallback = `-- name: EnqueueCallback :execrows
-
-INSERT INTO callback_deliveries (notification_id, event_id, event_type, url, payload)
-SELECT n.id, $1, $2, n.callback_url, $3
-FROM notifications n
-WHERE n.id = $4 AND n.callback_url IS NOT NULL
-ON CONFLICT (event_id) DO NOTHING
-`
-
-type EnqueueCallbackParams struct {
-	EventID        int64
-	EventType      string
-	Payload        []byte
-	NotificationID uuid.UUID
-}
-
-// Status callbacks. A row per (event, notification with a callback_url);
-// delivery state lives here, so retries survive restarts.
-// Enqueue only if the notification has a callback_url; a redelivered
-// event hits the unique event_id and does nothing.
-func (q *Queries) EnqueueCallback(ctx context.Context, arg EnqueueCallbackParams) (int64, error) {
-	result, err := q.db.Exec(ctx, enqueueCallback,
-		arg.EventID,
-		arg.EventType,
-		arg.Payload,
-		arg.NotificationID,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
 }
 
 const expireExhaustedCallbacks = `-- name: ExpireExhaustedCallbacks :execrows
@@ -256,6 +237,26 @@ func (q *Queries) MarkCallbackRetry(ctx context.Context, arg MarkCallbackRetryPa
 		arg.ID,
 		arg.Attempts,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const supersedeCallbacks = `-- name: SupersedeCallbacks :execrows
+UPDATE callback_deliveries d
+SET status = 'superseded', last_error = 'a newer callback of this notification was already delivered'
+WHERE d.status = 'pending'
+  AND EXISTS (
+      SELECT 1 FROM callback_deliveries e
+      WHERE e.notification_id = d.notification_id AND e.status = 'delivered' AND e.event_id > d.event_id)
+`
+
+// Pending callbacks of a notification whose newer callback was already
+// delivered will never be claimed (see ClaimCallbacks): close them as
+// superseded instead of leaving them pending.
+func (q *Queries) SupersedeCallbacks(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, supersedeCallbacks)
 	if err != nil {
 		return 0, err
 	}

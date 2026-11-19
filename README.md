@@ -161,7 +161,7 @@ flowchart LR
     worker -->|outcome| pg
     pg -->|outbox relay| stream[[Redis Stream]]
     stream -->|tail| api
-    stream -->|consumer group| cb[Callback dispatcher]
+    pg -->|callback rows, same transaction| cb[Callback dispatcher]
     cb -->|signed POST| hook([Client webhook])
 ```
 
@@ -171,10 +171,13 @@ flowchart LR
    priority first, reserve send slots from the shared **rate limiter**,
    call the provider and record the outcome (sent, retry later, failed).
 3. Every status change writes an **event to the outbox table** in the
-   same transaction (a trigger). The **relay** publishes those events in
-   order to a Redis Stream.
+   same transaction (a trigger); a final status of a notification with a
+   `callback_url` also queues its **signed callback** there. The **relay**
+   publishes the events in order to a Redis Stream.
 4. API instances tail the stream and push matching events to **WebSocket**
-   clients; a consumer group turns final statuses into **signed callbacks**.
+   clients: a live feed, best effort (a client that misses something
+   reloads over REST). Callbacks do not depend on the stream: they are
+   queued in PostgreSQL and sent with retries, so none is lost.
 
 Diagrams of a notification's life, the state machine and the data model:
 [`docs/architecture.md`](docs/architecture.md).

@@ -15,6 +15,9 @@ const (
 	CallbackPending   = "pending"
 	CallbackDelivered = "delivered"
 	CallbackFailed    = "failed"
+	// CallbackSuperseded: never sent, a newer callback of the same
+	// notification was delivered first.
+	CallbackSuperseded = "superseded"
 )
 
 // CallbackDelivery is a status callback to send to a client's URL.
@@ -30,19 +33,6 @@ type CallbackDelivery struct {
 	LastStatusCode int
 	LastError      string
 	DeliveredAt    *time.Time
-}
-
-// EnqueueCallback records a callback for the event if the notification
-// has a callback_url. It reports whether a row was created (false also for
-// an event already enqueued).
-func (r *Repo) EnqueueCallback(ctx context.Context, eventID int64, notificationID uuid.UUID, eventType string, payload []byte) (bool, error) {
-	n, err := r.q.EnqueueCallback(ctx, sqlcgen.EnqueueCallbackParams{
-		EventID: eventID, EventType: eventType, Payload: payload, NotificationID: notificationID,
-	})
-	if err != nil {
-		return false, fmt.Errorf("enqueue callback: %w", err)
-	}
-	return n == 1, nil
 }
 
 // ClaimCallbacks takes up to limit due callbacks with attempts left for
@@ -80,6 +70,17 @@ func (r *Repo) ExpireExhaustedCallbacks(ctx context.Context, now time.Time, maxA
 	n, err := r.q.ExpireExhaustedCallbacks(ctx, sqlcgen.ExpireExhaustedCallbacksParams{MaxAttempts: attempts, Now: now})
 	if err != nil {
 		return 0, fmt.Errorf("expire exhausted callbacks: %w", err)
+	}
+	return n, nil
+}
+
+// SupersedeCallbacks closes pending callbacks whose notification already had
+// a newer callback delivered; they would move the client backwards and are
+// never claimed. It returns how many it closed.
+func (r *Repo) SupersedeCallbacks(ctx context.Context) (int64, error) {
+	n, err := r.q.SupersedeCallbacks(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("supersede callbacks: %w", err)
 	}
 	return n, nil
 }

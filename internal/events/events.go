@@ -3,21 +3,17 @@
 // Events are born in PostgreSQL: triggers write every notification status
 // change into the outbox_events table, in the same transaction as the
 // change itself (the transactional outbox). The outbox relay
-// (package outbox) moves them to a Redis stream in order. Consumers read
-// them in one of two ways:
+// (package outbox) moves them to a Redis stream in order. Readers use
+// Tail: every reader sees every event, from the moment it starts. That
+// serves fan-out to live connections (WebSocket): a live feed, best
+// effort, where a client that misses something reloads the state over the
+// REST API. Work that must not be lost (status callbacks) does not go
+// through the stream: the outbox trigger queues it in PostgreSQL, in the
+// transaction of the change.
 //
-//   - Tail: every reader sees every event, from the moment it starts.
-//     For fan-out to live connections (WebSocket), where events from
-//     before the process started do not matter.
-//   - Group: a consumer group shares the events among its members. Each
-//     event is processed by one member and acknowledged, and an event
-//     whose consumer died is claimed by another one. For work that must
-//     happen exactly once per event (status callbacks).
-//
-// Delivery is at least once on both ends: the relay may publish an event
-// again if it crashes before marking it published, and a group consumer
-// may process one again if it dies before acknowledging. Event.ID (the
-// outbox id) is the deduplication key.
+// Delivery is at least once: the relay may publish an event again if it
+// crashes before marking it published. Event.ID (the outbox id) is the
+// deduplication key.
 package events
 
 import (

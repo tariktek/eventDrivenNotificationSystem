@@ -181,14 +181,8 @@ func run() error {
 			OnPublished:   m.ObserveEvents, // status counters: see package metrics
 		}, log)
 
-	// Status callbacks: one consumer group shared by all workers turns
-	// final-status events into callback_deliveries rows; dispatchers on
-	// every worker send them.
-	enqueuer := &callback.Enqueuer{Store: store}
-	callbackEvents := events.NewGroup(rdb, events.GroupConfig{
-		Stream: cfg.Events.Stream, Group: "callbacks", Consumer: id,
-		Count: 100, Block: 5 * time.Second, MinIdle: 30 * time.Second, RetryEvery: time.Second, Log: log,
-	})
+	// Status callbacks: the outbox trigger queues them in callback_deliveries
+	// with the status change; dispatchers on every worker send them.
 	callbacks := callback.NewDispatcher(store, callback.DispatcherConfig{
 		Client: callback.ClientConfig{
 			Timeout: cfg.Callback.Timeout, AllowInsecure: cfg.Callback.AllowInsecure, AllowPrivate: cfg.Callback.AllowPrivate,
@@ -220,18 +214,8 @@ func run() error {
 	// If either part fails (e.g. the ops port is taken), stop the other too
 	// rather than run half alive.
 	g, gctx := errgroup.WithContext(ctx)
-	// The relay publishes only once the callback group exists: a group
-	// created later starts at the end of the stream and would never see the
-	// events published before it, so their callbacks would be lost. If
-	// Redis is down at startup, events simply wait in the outbox meanwhile.
 	g.Go(func() error { return w.Run(gctx) })
-	g.Go(func() error {
-		if callbackEvents.WaitEnsured(gctx) {
-			relay.Run(gctx)
-		}
-		return nil
-	})
-	g.Go(func() error { callbackEvents.Run(gctx, enqueuer.Handle); return nil })
+	g.Go(func() error { relay.Run(gctx); return nil })
 	g.Go(func() error { callbacks.Run(gctx); return nil })
 	g.Go(func() error { cleaner.Run(gctx); return nil })
 	g.Go(func() error {

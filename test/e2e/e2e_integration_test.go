@@ -199,13 +199,7 @@ func start(t *testing.T, opts ...func(*system)) *system {
 		BatchSize: 500, PollInterval: 20 * time.Millisecond, RetryEvery: 50 * time.Millisecond, Retention: time.Hour, PruneInterval: time.Hour,
 	}, quiet)
 	wg.Go(func() { relay.Run(ctx) })
-	enq := &callback.Enqueuer{Store: store}
-	group := events.NewGroup(rdb, events.GroupConfig{
-		Stream: stream, Group: "callbacks", Consumer: "e2e", Count: 100, Block: 100 * time.Millisecond,
-		MinIdle: time.Second, RetryEvery: 50 * time.Millisecond, Log: quiet,
-	})
-	require.NoError(t, group.Ensure(ctx))
-	wg.Go(func() { group.Run(ctx, enq.Handle) })
+	// Callbacks are queued by the outbox trigger; only the dispatcher runs.
 	disp := callback.NewDispatcher(store, callback.DispatcherConfig{
 		Client: callback.ClientConfig{Timeout: 2 * time.Second, AllowInsecure: true, AllowPrivate: true},
 		Secret: secret, Concurrency: 10, MaxAttempts: 5, Backoff: retry.Policy{Base: 50 * time.Millisecond, Max: time.Second},

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -27,9 +26,8 @@ func NewPublisher(rdb redis.UniversalClient, stream string, maxLen int64) *Publi
 
 // Publish appends events in order, in one round trip. On error some of
 // them may have been appended; the relay then publishes them all again
-// and consumers deduplicate by Event.ID: the callback enqueuer through a
-// unique key on it, the WebSocket hub per aggregate (realtime.dedup).
-// Tail itself passes on whatever is in the stream.
+// and the WebSocket hub drops repeats per aggregate by Event.ID
+// (realtime.dedup). Tail itself passes on whatever is in the stream.
 func (p *Publisher) Publish(ctx context.Context, evs []Event) error {
 	_, err := p.rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		for i := range evs {
@@ -108,176 +106,6 @@ func Tail(ctx context.Context, rdb redis.UniversalClient, cfg TailConfig, handle
 				handle(e)
 			}
 		}
-	}
-}
-
-// GroupConfig configures a Group consumer.
-type GroupConfig struct {
-	Stream   string
-	Group    string
-	Consumer string // unique per process
-	Count    int64
-	Block    time.Duration
-	// MinIdle is how long an event may stay unacknowledged before another
-	// consumer takes it over (its consumer is presumed dead).
-	MinIdle    time.Duration
-	RetryEvery time.Duration
-	Log        *slog.Logger
-}
-
-// Group consumes a stream as a member of a consumer group.
-type Group struct {
-	rdb redis.UniversalClient
-	cfg GroupConfig
-}
-
-// NewGroup returns a Group consumer.
-func NewGroup(rdb redis.UniversalClient, cfg GroupConfig) *Group {
-	return &Group{rdb: rdb, cfg: cfg}
-}
-
-// Ensure creates the consumer group if it does not exist. A new group
-// starts at the end of the stream: deploying a new consumer must not act on
-// history (a new callback group would otherwise call clients back about
-// notifications that finished days ago). Publishing must wait until Ensure
-// succeeded, or the first events after a deployment are missed for good;
-// WaitEnsured does that.
-func (g *Group) Ensure(ctx context.Context) error {
-	return g.ensure(ctx, "$")
-}
-
-// WaitEnsured retries Ensure until it succeeds or ctx is done, and reports
-// whether it succeeded.
-func (g *Group) WaitEnsured(ctx context.Context) bool {
-	for ctx.Err() == nil {
-		err := g.Ensure(ctx)
-		if err == nil {
-			return true
-		}
-		g.fail(ctx, "create consumer group; publishing waits for it", err)
-	}
-	return false
-}
-
-func (g *Group) ensure(ctx context.Context, start string) error {
-	err := g.rdb.XGroupCreateMkStream(ctx, g.cfg.Stream, g.cfg.Group, start).Err()
-	if err != nil && !strings.HasPrefix(err.Error(), "BUSYGROUP") {
-		return fmt.Errorf("create consumer group %s: %w", g.cfg.Group, err)
-	}
-	return nil
-}
-
-// Run calls handle for each event and acknowledges it when handle returns
-// nil. An event whose handle failed stays pending and is retried after
-// MinIdle, by this or another consumer, as is one whose consumer died.
-// Run returns when ctx is done.
-//
-// If Redis loses the group while Run is running (a restart without
-// persistence, a deleted stream), Run recreates it at the start of the
-// stream, not the end: whatever the stream holds then was published after
-// the loss and was never consumed. Handlers must tolerate seeing an event
-// again (they do: at-least-once), not missing one.
-func (g *Group) Run(ctx context.Context, handle func(context.Context, Event) error) {
-	var (
-		nextClaim time.Time
-		ensured   bool
-		start     = "$" // first creation: skip history; recreation: see above
-	)
-	for ctx.Err() == nil {
-		if !ensured {
-			if err := g.ensure(ctx, start); err != nil {
-				g.fail(ctx, "ensure consumer group", err)
-				continue
-			}
-			ensured, start = true, "0"
-		}
-		if time.Now().After(nextClaim) {
-			if err := g.claimStale(ctx, handle); err != nil {
-				ensured = !strings.HasPrefix(err.Error(), "NOGROUP")
-				g.fail(ctx, "claim stale events", err)
-				continue
-			}
-			nextClaim = time.Now().Add(g.cfg.MinIdle / 2)
-		}
-		res, err := g.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    g.cfg.Group,
-			Consumer: g.cfg.Consumer,
-			Streams:  []string{g.cfg.Stream, ">"},
-			Count:    g.cfg.Count,
-			Block:    g.cfg.Block,
-		}).Result()
-		switch {
-		case errors.Is(err, redis.Nil):
-			continue
-		case err != nil:
-			// NOGROUP: Redis lost the group (restart without persistence,
-			// stream deleted); recreate it on the next round.
-			ensured = !strings.HasPrefix(err.Error(), "NOGROUP")
-			g.fail(ctx, "read consumer group", err)
-			continue
-		}
-		for _, s := range res {
-			g.process(ctx, s.Messages, handle)
-		}
-	}
-}
-
-// claimStale takes over events left unacknowledged for MinIdle: their
-// consumer crashed, or their handler failed and they are due a retry.
-func (g *Group) claimStale(ctx context.Context, handle func(context.Context, Event) error) error {
-	// XAUTOCLAIM pages through the pending list; "0-0" means it wrapped.
-	for start := "0-0"; ctx.Err() == nil; {
-		msgs, next, err := g.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
-			Stream:   g.cfg.Stream,
-			Group:    g.cfg.Group,
-			Consumer: g.cfg.Consumer,
-			MinIdle:  g.cfg.MinIdle,
-			Start:    start,
-			Count:    g.cfg.Count,
-		}).Result()
-		if err != nil {
-			return err
-		}
-		g.process(ctx, msgs, handle)
-		if next == "0-0" {
-			break
-		}
-		start = next
-	}
-	return nil
-}
-
-func (g *Group) process(ctx context.Context, msgs []redis.XMessage, handle func(context.Context, Event) error) {
-	for _, m := range msgs {
-		e, err := Decode(m)
-		if err != nil {
-			// Retrying cannot fix it: acknowledge so it does not come back.
-			g.cfg.Log.ErrorContext(ctx, "skip malformed event", "error", err)
-			g.ack(ctx, m.ID)
-			continue
-		}
-		if err := handle(ctx, e); err != nil {
-			if ctx.Err() == nil {
-				g.cfg.Log.WarnContext(ctx, "event handler failed; will retry", "event_id", e.ID, "type", e.Type, "error", err)
-			}
-			continue
-		}
-		g.ack(ctx, m.ID)
-	}
-}
-
-func (g *Group) ack(ctx context.Context, id string) {
-	if err := g.rdb.XAck(ctx, g.cfg.Stream, g.cfg.Group, id).Err(); err != nil && ctx.Err() == nil {
-		// Not fatal: the event is redelivered after MinIdle and handled
-		// again, which handlers tolerate (at-least-once).
-		g.cfg.Log.WarnContext(ctx, "acknowledge event", "stream_id", id, "error", err)
-	}
-}
-
-func (g *Group) fail(ctx context.Context, what string, err error) {
-	if ctx.Err() == nil {
-		g.cfg.Log.WarnContext(ctx, what, "group", g.cfg.Group, "error", err)
-		sleep(ctx, g.cfg.RetryEvery)
 	}
 }
 

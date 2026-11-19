@@ -2,11 +2,13 @@
 // final status (sent, failed, cancelled) and was created with a
 // callback_url, the client gets a signed POST.
 //
-// Flow: a consumer-group member reads the event stream and records a row
-// in callback_deliveries for each final-status event of a notification
-// with a callback_url (Enqueuer). A Dispatcher claims due rows, POSTs them
-// and records the outcome, retrying with backoff. Delivery state lives in
-// PostgreSQL, so retries survive restarts.
+// Flow: when a notification with a callback_url reaches a final status,
+// the outbox trigger writes a callback_deliveries row in the same
+// transaction (migration 19), so a callback exists exactly when its status
+// change committed, and one notification's callbacks are created in order.
+// A Dispatcher claims due rows, one notification's in event order, POSTs
+// them and records the outcome, retrying with backoff. Delivery state lives
+// in PostgreSQL, so retries survive restarts.
 //
 // Every request is signed so the receiver can check that it came from us
 // and is not a replay. See Sign and Verify.
