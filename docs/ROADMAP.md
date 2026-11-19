@@ -6,6 +6,10 @@
 >
 > This is the plan as written before and during implementation. Where the code differs, the code,
 > the [ADRs](adr/), [architecture.md](architecture.md) and the [README](../README.md) are authoritative.
+> The two largest departures came from the final review: the rate limiter fails closed instead of
+> falling back to a local limiter when Redis is unreachable ([ADR 003](adr/003-rate-limiting.md)), and
+> status callbacks are queued by the status change itself instead of read from a Redis consumer group
+> ([ADR 002](adr/002-transactional-outbox.md)).
 
 ## What changed from v1?
 
@@ -612,7 +616,7 @@ Commits follow the **Conventional Commits** format (`feat:`, `fix:`, `test:`, `d
 - [x] 26. **Final OpenAPI:** Examples and error responses.
 - [x] 27. **Documentation:** README, architecture.md, ADRs, runbook, `requests.http`.
 - [x] 28. **Clean install rehearsal:** The repo is cloned from scratch and everything is verified to work with only `docker-compose up` and the steps in the README. The commit history is reviewed.
-- [ ] 29. **Delivery:** The repository link is shared.
+- [x] 29. **Delivery:** The repository link is shared.
 
 ---
 
