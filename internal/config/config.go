@@ -30,20 +30,21 @@ type Config struct {
 	Env             Environment   `env:"APP_ENV"          envDefault:"development"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"20s"`
 
-	Log      LogConfig      `envPrefix:"LOG_"`
-	HTTP     HTTPConfig     `envPrefix:"HTTP_"`
-	Database DatabaseConfig `envPrefix:"DATABASE_"`
-	Redis    RedisConfig    `envPrefix:"REDIS_"`
-	Callback CallbackConfig `envPrefix:"CALLBACK_"`
-	Auth     AuthConfig
-	Provider ProviderConfig `envPrefix:"PROVIDER_"`
-	Worker   WorkerConfig   `envPrefix:"WORKER_"`
-	Retry    RetryConfig    `envPrefix:"RETRY_"`
-	Breaker  BreakerConfig  `envPrefix:"BREAKER_"`
-	Events   EventsConfig   `envPrefix:"EVENTS_"`
-	Outbox   OutboxConfig   `envPrefix:"OUTBOX_"`
-	WS       WSConfig       `envPrefix:"WS_"`
-	Tracing  TracingConfig  `envPrefix:"TRACING_"`
+	Log       LogConfig      `envPrefix:"LOG_"`
+	HTTP      HTTPConfig     `envPrefix:"HTTP_"`
+	Database  DatabaseConfig `envPrefix:"DATABASE_"`
+	Redis     RedisConfig    `envPrefix:"REDIS_"`
+	Callback  CallbackConfig `envPrefix:"CALLBACK_"`
+	Auth      AuthConfig
+	Provider  ProviderConfig  `envPrefix:"PROVIDER_"`
+	Worker    WorkerConfig    `envPrefix:"WORKER_"`
+	Retry     RetryConfig     `envPrefix:"RETRY_"`
+	Breaker   BreakerConfig   `envPrefix:"BREAKER_"`
+	Events    EventsConfig    `envPrefix:"EVENTS_"`
+	Outbox    OutboxConfig    `envPrefix:"OUTBOX_"`
+	Retention RetentionConfig `envPrefix:"RETENTION_"`
+	WS        WSConfig        `envPrefix:"WS_"`
+	Tracing   TracingConfig   `envPrefix:"TRACING_"`
 }
 
 // TracingConfig controls OpenTelemetry tracing.
@@ -81,6 +82,16 @@ type OutboxConfig struct {
 	PollInterval  time.Duration `env:"POLL_INTERVAL"  envDefault:"100ms"`
 	Retention     time.Duration `env:"RETENTION"      envDefault:"24h"`
 	PruneInterval time.Duration `env:"PRUNE_INTERVAL" envDefault:"10m"`
+}
+
+// RetentionConfig tunes the deletion of data the system no longer needs.
+type RetentionConfig struct {
+	// Notifications is how long a notification (with its attempts and
+	// callbacks) is kept after reaching a final status. 0 keeps them
+	// forever; otherwise at least an hour.
+	Notifications time.Duration `env:"NOTIFICATIONS" envDefault:"720h"`
+	Interval      time.Duration `env:"INTERVAL"      envDefault:"1h"`
+	ChunkSize     int           `env:"CHUNK_SIZE"    envDefault:"1000"`
 }
 
 // WorkerConfig tunes the delivery pipeline.
@@ -325,6 +336,15 @@ func (c Config) Validate() error {
 	}
 	if c.Outbox.PollInterval <= 0 || c.Outbox.Retention <= 0 || c.Outbox.PruneInterval <= 0 {
 		errs = append(errs, errors.New("OUTBOX_POLL_INTERVAL/OUTBOX_RETENTION/OUTBOX_PRUNE_INTERVAL: must be positive"))
+	}
+	if r := c.Retention.Notifications; r < 0 || (r > 0 && r < time.Hour) {
+		errs = append(errs, errors.New("RETENTION_NOTIFICATIONS: must be 0 (keep forever) or at least 1h"))
+	}
+	if c.Retention.Interval <= 0 {
+		errs = append(errs, errors.New("RETENTION_INTERVAL: must be positive"))
+	}
+	if c.Retention.ChunkSize < 1 || c.Retention.ChunkSize > 10000 {
+		errs = append(errs, errors.New("RETENTION_CHUNK_SIZE: must be between 1 and 10000"))
 	}
 
 	if c.Tracing.SampleRatio < 0 || c.Tracing.SampleRatio > 1 {

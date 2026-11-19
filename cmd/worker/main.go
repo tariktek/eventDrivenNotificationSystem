@@ -33,6 +33,7 @@ import (
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/provider"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/ratelimit"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/repository/postgres"
+	"github.com/tariktek/eventDrivenNotificationSystem/internal/retention"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/retry"
 	"github.com/tariktek/eventDrivenNotificationSystem/internal/worker"
 )
@@ -201,6 +202,13 @@ func run() error {
 		Metrics:      m,
 	}, log)
 
+	// Deletes expired data; one worker at a time (advisory lock).
+	cleaner := retention.New(store, retention.Config{
+		Notifications: cfg.Retention.Notifications,
+		Interval:      cfg.Retention.Interval,
+		ChunkSize:     cfg.Retention.ChunkSize,
+	}, m.RetentionDeleted, log)
+
 	// The worker has no public API; this small "ops" server exposes probes
 	// and Prometheus metrics for the orchestrator and the scraper.
 	mux := http.NewServeMux()
@@ -225,6 +233,7 @@ func run() error {
 	})
 	g.Go(func() error { callbackEvents.Run(gctx, enqueuer.Handle); return nil })
 	g.Go(func() error { callbacks.Run(gctx); return nil })
+	g.Go(func() error { cleaner.Run(gctx); return nil })
 	g.Go(func() error {
 		log.Info("ops server listening", "addr", cfg.HTTP.Addr)
 		return httpserver.ListenAndServe(gctx, srv, cfg.ShutdownTimeout)

@@ -14,7 +14,7 @@ risks are accepted on purpose.
 | Callback authenticity | `X-Signature: sha256=HMAC(secret, timestamp + "." + body)`; the timestamp is signed too, so captured requests cannot be replayed later (`callback.Verify` checks a 5-minute window). |
 | Templates | Go `text/template` with an allowlist of functions, no `define`/`template`, no nested `range`, output capped at 256 KB: a template cannot be used to exhaust the server. |
 | Errors | 5xx responses say only "An unexpected error occurred." plus a correlation ID; details go to the log. |
-| Personal data | Recipients and content never appear in events, metrics or traces; the logger masks phone numbers and emails in every record (`+90555***4567`). |
+| Personal data | Recipients and content never appear in events, metrics or traces; the logger masks phone numbers and emails in every record (`+90555***4567`). Notifications are deleted 30 days after their final status (`RETENTION_NOTIFICATIONS`). |
 | WebSocket | Same API key (header, or `api_key` query parameter for browsers; only paths are logged, never query strings); browser origin checked; per-client buffer and connection cap. |
 | Containers | Distroless base (no shell, no package manager), non-root user, read-only root filesystem, all Linux capabilities dropped, `no-new-privileges`. |
 | Configuration | Validated at startup, all errors reported at once; production refuses development secrets and insecure callback settings. |
@@ -57,4 +57,3 @@ production deployment would do:
 | API keys come from the environment; there is no key-management API. | A secrets manager, and keys stored hashed in the database with scopes. |
 | docker compose serves plain HTTP and uses development passwords. | TLS terminated at the load balancer; real secrets injected at deploy time. |
 | Delivery is at-least-once: a crash between the provider's 202 and recording it can resend a message. | The provider deduplicates by the `X-Idempotency-Key` header sent with every delivery. |
-| Notifications (recipients and content, which are personal data) are never deleted; only published outbox events are pruned. | A retention job deleting final-state notifications and their attempts after a configurable period, in chunks; time-based partitions at scale. |

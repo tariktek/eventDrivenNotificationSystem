@@ -326,7 +326,7 @@ or with Go installed: `go test -count=1 -p 1 -tags=integration ./...`
 |---|---|
 | Unit | Validation tables, SMS segmenting, state machine, backoff, error classification, templates, HMAC, SSRF filter, breaker, rate limiter math |
 | Contract | Every API response matches the OpenAPI spec; every example in the spec matches its schema |
-| Integration | SQL against real PostgreSQL: concurrent claims never take a row twice, cancel vs claim races, idempotency under concurrency, migrations up and down; the Redis limiter never exceeds its rate |
+| Integration | SQL against real PostgreSQL: concurrent claims never take a row twice, cancel vs claim races, idempotency under concurrency, migrations up and down, retention deleting only expired data (one worker at a time); the Redis limiter never exceeds its rate |
 | Worker | Priority order, retries, permanent failures, the breaker keeping attempts (and reserving no send slots while open), crash recovery, graceful shutdown, slow claims not bursting past the limit, the provider never seeing more than 100 in any sliding second at the default rate (two workers; busiest measured: 96), chaos (two workers, 30% random faults, one stopped midway: everything delivered exactly once) |
 | End-to-end | A batch watched over WebSocket (every change, in order) with verified callbacks; scheduled sends; retry chains; batch cancel; callback retries |
 | Fuzz | Request validation, SMS analysis, templates, pagination cursors never panic |
@@ -368,6 +368,7 @@ production refuses development secrets). Defaults suit local development;
 | Worker | `WORKER_RATE_LIMIT` (95/s per channel), `WORKER_RATE_HORIZON` (1s), `WORKER_CONCURRENCY` (100), `WORKER_BATCH_SIZE` (50), `WORKER_POLL_INTERVAL` (1s), `WORKER_LEASE` (30s), `WORKER_REAP_INTERVAL` (10s), `WORKER_PRIORITY_AGING` (5m), `WORKER_EXPECTED_INSTANCES` (1), `WORKER_ID` |
 | Retry and breaker | `RETRY_BASE_DELAY` (2s), `RETRY_MAX_DELAY` (5m), `BREAKER_WINDOW` (10s), `BREAKER_MIN_REQUESTS` (20), `BREAKER_FAILURE_RATIO` (0.5), `BREAKER_OPEN_TIMEOUT` (30s), `BREAKER_PROBES` (5) |
 | Events | `EVENTS_STREAM`, `EVENTS_STREAM_MAX_LEN` (100,000), `OUTBOX_BATCH_SIZE` (500), `OUTBOX_POLL_INTERVAL` (100ms), `OUTBOX_RETENTION` (24h), `OUTBOX_PRUNE_INTERVAL` (10m) |
+| Retention | `RETENTION_NOTIFICATIONS` (720h = 30 days after a final status; 0 keeps them), `RETENTION_INTERVAL` (1h), `RETENTION_CHUNK_SIZE` (1000) |
 | Callbacks | `CALLBACK_SIGNING_SECRET`, `CALLBACK_TIMEOUT` (5s), `CALLBACK_MAX_ATTEMPTS` (5), `CALLBACK_CONCURRENCY` (20), `CALLBACK_RETRY_BASE_DELAY` (5s), `CALLBACK_RETRY_MAX_DELAY` (10m), `CALLBACK_LEASE` (1m), `CALLBACK_POLL_INTERVAL` (1s), `CALLBACK_ALLOW_INSECURE` / `_PRIVATE` (false; development only) |
 | WebSocket | `WS_MAX_CLIENTS` (1000), `WS_BUFFER_SIZE` (256), `WS_ALLOWED_ORIGINS` |
 | Tracing | `TRACING_ENABLED` (false; true in compose), `TRACING_ENDPOINT`, `TRACING_SAMPLE_RATIO` (1) |
@@ -403,12 +404,12 @@ Known limits and the accepted security risks are in
   order: partition `notifications` by time (cheap retention: drop a
   partition), separate queue tables per channel, then move hot queues to a
   log (Kafka/Redpanda) while keeping PostgreSQL as the system of record.
-- **Data retention.** Published outbox events are pruned after
-  `OUTBOX_RETENTION`, but notifications and their attempts are kept
-  indefinitely: the retention job planned in the roadmap is not built yet.
-  Next step: a periodic, chunked delete of final-state notifications older
-  than a configurable age (their recipients and content are personal
-  data), and at scale monthly partitions dropped whole.
+- **Data retention at scale.** A worker deletes notifications 30 days
+  (`RETENTION_NOTIFICATIONS`) after their final status, with their attempts
+  and callbacks, plus emptied batches and expired idempotency keys, in
+  bounded chunks. Recipients and content are personal data, so they are
+  not kept longer than that. At much larger volumes, monthly partitions
+  dropped whole would replace the row-by-row deletes.
 - **Rate limits per tenant.** The limiter already takes a key; per-client
   quotas are a new key scheme plus configuration.
 - **Fairness inside a priority.** One huge batch delays later messages of

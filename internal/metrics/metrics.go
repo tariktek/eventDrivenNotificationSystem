@@ -56,6 +56,8 @@ type Metrics struct {
 
 	CallbackDeliveries *prometheus.CounterVec
 	WebSocketClients   prometheus.Gauge
+
+	RetentionDeleted *prometheus.CounterVec
 }
 
 // New creates the collectors on a fresh registry, with Go runtime and
@@ -104,6 +106,10 @@ func New() *Metrics {
 
 		CallbackDeliveries: f.counterVec("callback_deliveries_total", "Status callback attempts by result.", "result"),
 		WebSocketClients:   f.gauge("websocket_clients", "Connected WebSocket clients."),
+
+		RetentionDeleted: f.counterVec("retention_deleted_rows_total",
+			"Rows deleted by retention: expired final notifications (attempts and callbacks go with them), empty batches, expired idempotency keys.",
+			"table"),
 	}
 }
 
