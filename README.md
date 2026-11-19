@@ -29,8 +29,8 @@ open http://localhost:8080/docs
 
 ## Quick start
 
-Requirements: Docker with Compose. Go 1.27 only to run the tests outside
-Docker.
+Requirements: Docker with Compose. Nothing else, not even for the tests
+(see [Testing](#testing)); Go 1.27 only to run them outside Docker.
 
 ```bash
 git clone https://github.com/tariktek/eventDrivenNotificationSystem.git
@@ -38,6 +38,10 @@ cd eventDrivenNotificationSystem
 docker compose up -d        # first run builds the image: ~2 minutes
 docker compose ps           # api, worker ×2 and mockprovider become "healthy"
 ```
+
+A host port already taken (a local PostgreSQL on 5432, say)? Override it in
+`.env`, e.g. `POSTGRES_PORT=15432`; the other knobs are `REDIS_PORT`,
+`API_PORT`, `MOCK_PORT`, `PROMETHEUS_PORT`, `GRAFANA_PORT` and `JAEGER_PORT`.
 
 | What | Where |
 |---|---|
@@ -60,15 +64,54 @@ curl -s localhost:8080/api/v1/notifications/<id> -H 'X-API-Key: dev-api-key-chan
 # "status":"sent", "delivery_attempts":[{"attempt_no":1,"outcome":"success","status_code":202,…}]
 ```
 
-**Using webhook.site as the provider.** The stack delivers to the bundled
-mock provider by default (webhook.site's free tier caps requests, which
-the load tests would exceed). To deliver to webhook.site instead, set the
-URL and restart the workers:
+### Demo with webhook.site as the provider
 
-```bash
-echo 'PROVIDER_URL=https://webhook.site/<your-id>' > .env
-docker compose up -d worker
-```
+The stack delivers to the bundled mock provider by default: the load and
+fault tests need a provider under our control, and webhook.site's free
+tier caps the number of requests. To see deliveries reach webhook.site:
+
+1. **Open https://webhook.site** and copy your unique URL
+   (`https://webhook.site/<your-id>`).
+2. **Set the response** with *Edit* at the top of the page, as the
+   provider contract defines it:
+   - Default status code: **`202`**
+   - Content type: **`application/json`**
+   - Response body:
+     ```json
+     {"messageId": "$request.uuid$", "status": "accepted", "timestamp": "$time$"}
+     ```
+     (`$request.uuid$` and `$time$` are webhook.site variables: a fresh
+     message id and an ISO 8601 timestamp per request.)
+
+   An unconfigured URL answers `200` with an empty body: the delivery
+   still counts as sent (a 2xx means the provider took it), but the
+   attempt carries the note `unexpected_provider_response` and no
+   provider message id.
+3. **Point the workers at it** and restart them:
+   ```bash
+   echo 'PROVIDER_URL=https://webhook.site/<your-id>' > .env
+   docker compose up -d worker
+   ```
+4. **Send a notification and watch it arrive:**
+   ```bash
+   curl -s localhost:8080/api/v1/notifications \
+     -H 'X-API-Key: dev-api-key-change-me' -H 'Content-Type: application/json' \
+     -d '{"channel":"sms","recipient":"+905551234567","content":"Hello from the demo"}'
+   # {"id":"<id>","status":"pending",…}
+
+   curl -s localhost:8080/api/v1/notifications/<id> -H 'X-API-Key: dev-api-key-change-me'
+   # "status":"sent", "provider_message_id":"<webhook.site request uuid>",
+   # "delivery_attempts":[{"attempt_no":1,"outcome":"success","status_code":202,…}]
+   ```
+   The request appears on your webhook.site page: `POST` with
+   `{"to":"+905551234567","channel":"sms","content":"Hello from the demo"}`
+   and the headers `X-Idempotency-Key` (the notification id) and
+   `X-Correlation-ID`.
+5. Back to the mock: delete the line from `.env` and run
+   `docker compose up -d worker` again.
+
+The client is also tested against a live endpoint, skipped unless a URL is
+given: `PROVIDER_LIVE_URL=https://webhook.site/<your-id> go test -run Live ./internal/provider/`.
 
 Every request in [`examples/requests.http`](examples/requests.http) runs
 with one click in VS Code (REST Client) or JetBrains IDEs.
@@ -85,22 +128,22 @@ How each requirement of the assessment is met:
 | Cancel pending | `POST /notifications/{id}/cancel`, `POST /batches/{id}/cancel`; a race with a worker claiming it is resolved by the database (one of the two wins) |
 | List with filters and pagination | `GET /notifications?status=&channel=&priority=&batch_id=&created_from=&created_to=`, cursor pagination (stable under inserts, fast at any depth) |
 | Asynchronous processing with workers | PostgreSQL work queue (`FOR UPDATE SKIP LOCKED`), leases with heartbeats, a reaper for crashed workers; 2 worker replicas in compose |
-| 100 messages/second per channel | A shared GCRA limiter in Redis hands out send slots 10 ms apart across all workers; local fallback if Redis is down. Verified from the receiving side under load |
+| 100 messages/second per channel | A shared GCRA limiter in Redis hands out evenly spaced send slots across all workers; local fallback if Redis is down. The default rate is **95/s**: sends leave exactly 1/95 s apart, and the 5% headroom absorbs the network jitter that bunches arrivals, so the provider never counts more than 100 in a second. Checked on the receiving side with no tolerance (a test and the load test, see [Testing](#testing)) |
 | Priority (high, normal, low) | Claimed highest effective priority first; waiting work ages one level every 5 minutes so low priority never starves |
 | Content validation | Per-channel rules above, plus strict JSON (unknown fields rejected), UTF-8 and NUL checks; every problem reported at once, by field path |
-| Idempotency | `Idempotency-Key` header (Stripe-style replay of the original response) and a per-notification `idempotency_key` (duplicates in a batch are reported, not recreated) |
+| Idempotency | `Idempotency-Key` header (Stripe-style replay of the original response; what the request creates and the stored response commit in one transaction, so a crash or a failed write in between can never let a retry create twice) and a per-notification `idempotency_key` (a repeat of the same request is reported as a duplicate, not recreated; the same key with a different request is rejected with `422 idempotency_key_reused`) |
 | Delivery and retry logic | Transient errors retried with exponential backoff and full jitter, `Retry-After` honoured; permanent errors fail at once; a per-channel circuit breaker pauses a failing channel without spending attempts; failed notifications form a dead-letter queue with single and bulk redrive |
 | Metrics endpoint | `GET /api/v1/metrics`: queue depth per channel and priority, success and failure rates over 1/5/15 minutes, latency percentiles. Plus Prometheus at `/metrics` |
 | Structured logging with correlation IDs | JSON logs; `X-Correlation-ID` is accepted or generated, stored with the notification and carried into the worker, the provider call and callbacks; personal data masked |
 | Health check | `/health` (liveness) and `/ready` (dependencies, `degraded` when Redis is down or a breaker is open) |
-| webhook.site as provider | `PROVIDER_URL` (one per channel possible); a fault-injecting mock provider is the default |
+| webhook.site as provider | `PROVIDER_URL` (one per channel possible), with a step-by-step [demo](#demo-with-webhooksite-as-the-provider); a fault-injecting mock provider is the default |
 | **Bonus:** advanced failure handling | Circuit breaker, dead-letter queue, leases and reaper, graceful shutdown, Redis fallback, lossless event delivery through the outbox |
 | **Bonus:** scheduled notifications | `scheduled_at`; cancellable until due |
 | **Bonus:** templates | `/api/v1/templates`: versioned, variables extracted and validated, preview endpoint, sandboxed functions |
 | **Bonus:** real-time status over WebSocket | `GET /api/v1/ws`: subscribe to notifications, batches, channels; ordered per notification; slow clients disconnected |
 | **Bonus:** distributed tracing | OpenTelemetry to Jaeger: request, SQL, Redis and provider spans; the delivery trace links back to the request that created it |
 | **Bonus:** CI/CD | GitHub Actions: lint, generated-code check, unit and integration tests, govulncheck, gitleaks, Trivy-scanned image pushed to GHCR, Dependabot |
-| `docker-compose up`, OpenAPI, migrations, one-command tests | This page; [`api/openapi.yaml`](api/openapi.yaml) served at `/docs`; [`migrations/`](migrations) (versioned, up and down, applied by the `migrate` service); `make test` |
+| `docker-compose up`, OpenAPI, migrations, one-command tests | This page; [`api/openapi.yaml`](api/openapi.yaml) served at `/docs`; [`migrations/`](migrations) (versioned, up and down, applied by the `migrate` service); `make test`, or with only Docker: `docker compose --profile test run --rm test` |
 
 Beyond the brief: signed status callbacks, Grafana dashboard with alert
 rules, k6 load tests, PII masking in logs.
@@ -217,7 +260,18 @@ stateDiagram-v2
 - **At least once.** A worker that dies mid-delivery loses its lease; the
   reaper hands the notification to another worker. If the provider had
   already accepted it, it is sent again, with the same `X-Idempotency-Key`
-  so the provider can drop the repeat.
+  so the provider can drop the repeat. This is the one duplicate window
+  left, and a deliberate trade-off ([ADR 005](docs/adr/005-at-least-once-delivery.md)).
+- **The provider is the source of truth.** Any 2xx is a send: a response
+  body outside the contract is noted on the attempt, never retried (a
+  retry would deliver the message twice). A send the provider accepted
+  after the worker lost its lease (a call slower than the lease) is still
+  recorded as sent, correcting a `pending`, `failed` or `cancelled` the
+  reaper left; it is counted in `delivery_recovered_after_lease_loss_total`
+  and alerted on.
+- **Complete history.** Every attempt is a row in the notification's
+  history, numbered across manual retries and redrives (`attempt_no` keeps
+  counting; the attempt budget starts over).
 - **Retries.** Transient failures (5xx, 429, timeouts, connection errors)
   retry after `random(0, min(2s · 2^attempt, 5m))`, or the provider's
   `Retry-After`, up to `max_attempts` (default 5, 1–10 per notification).
@@ -229,7 +283,10 @@ stateDiagram-v2
   singly or in bulk by filter. [`docs/runbook.md`](docs/runbook.md) has
   the procedures.
 - **Order.** Per channel, by effective priority, then due time. One
-  notification's events reach WebSocket clients and callbacks in order.
+  notification's events reach WebSocket clients and callbacks in order:
+  the WebSocket hub drops an event it already forwarded (the relay may
+  publish twice) or one older than that, and a notification's next
+  callback waits until the previous one is delivered or given up.
 
 ## Observability
 
@@ -239,8 +296,10 @@ stateDiagram-v2
   provider latency, rate-limit waits, breaker state, outbox lag, callbacks,
   HTTP traffic.
 - **Dashboard and alerts:** the Grafana dashboard (provisioned) shows them
-  live; Prometheus alerts on a stale backlog, a failure rate over 10%, a
-  breaker open over 2 minutes, outbox lag and limiter fallback.
+  live; Prometheus alerts on a stale backlog (overdue scheduled sends
+  included), a failure rate over 10% (also on a channel that has never
+  succeeded), a breaker open over 2 minutes, outbox lag, limiter fallback
+  and sends that outlived their lease.
 - **Logs:** JSON with `correlation_id`, `trace_id`, `span_id`; phone
   numbers and emails masked in every record.
 - **Traces:** an API request, its SQL, and later each delivery attempt
@@ -252,6 +311,7 @@ stateDiagram-v2
 
 ```bash
 make test        # everything: unit, integration, end-to-end (needs Docker; real PostgreSQL and Redis via testcontainers)
+make test-docker # the same with nothing but Docker installed: docker compose --profile test run --rm test
 make test-unit   # no Docker, seconds
 make test-e2e    # API + worker + relay + WebSocket + callbacks in one process
 make test-fuzz   # input parsers
@@ -259,14 +319,15 @@ make test-load   # k6 against the running stack
 make cover       # coverage report
 ```
 
-Without `make` (e.g. Windows PowerShell): `go test -count=1 -p 1 -tags=integration ./...`
+Without `make` (e.g. Windows PowerShell): `docker compose --profile test run --rm test`,
+or with Go installed: `go test -count=1 -p 1 -tags=integration ./...`
 
 | Layer | What it proves |
 |---|---|
 | Unit | Validation tables, SMS segmenting, state machine, backoff, error classification, templates, HMAC, SSRF filter, breaker, rate limiter math |
 | Contract | Every API response matches the OpenAPI spec; every example in the spec matches its schema |
 | Integration | SQL against real PostgreSQL: concurrent claims never take a row twice, cancel vs claim races, idempotency under concurrency, migrations up and down; the Redis limiter never exceeds its rate |
-| Worker | Priority order, retries, permanent failures, the breaker keeping attempts, crash recovery, graceful shutdown, slow claims not bursting past the limit, chaos (two workers, 30% random faults, one stopped midway: everything delivered exactly once) |
+| Worker | Priority order, retries, permanent failures, the breaker keeping attempts (and reserving no send slots while open), crash recovery, graceful shutdown, slow claims not bursting past the limit, the provider never seeing more than 100 in any sliding second at the default rate (two workers; busiest measured: 96), chaos (two workers, 30% random faults, one stopped midway: everything delivered exactly once) |
 | End-to-end | A batch watched over WebSocket (every change, in order) with verified callbacks; scheduled sends; retry chains; batch cancel; callback retries |
 | Fuzz | Request validation, SMS analysis, templates, pagination cursors never panic |
 
@@ -281,12 +342,12 @@ k6 against the compose stack on a laptop (details and the scenarios:
 | Scenario | Result |
 |---|---|
 | 150 creates/s for 2 minutes | p50 **24 ms**, p95 **70 ms**, p99 **122 ms** |
-| Flash sale: 50,000 in 60 s | Batches accepted in p99 393 ms; all delivered in **188 s** (~90/s per channel at a 100/s limit); busiest second **101–103**; 0 lost, 0 duplicated |
+| Flash sale: 50,000 in 60 s | Batches accepted in p99 393 ms; all delivered in **188 s** (~90/s per channel); 0 lost, 0 duplicated. Sending at 100/s, the busiest second at the provider was **101–103** (network jitter bunches arrivals): hence the default of 95/s, and the load test now fails on any second over 100 |
 | Provider failing 25% of calls | 5,993 of 5,998 delivered after 1,879 retries; 5 dead-lettered (expected ≈ 6) |
 
 The first runs failed, and fixing them improved the design: a NOTIFY in
 every write serialized the API (p50 855 ms → 27 ms), slots reserved
-before slow claims went stale and burst to **175/s** (now 101–103), and a
+before slow claims went stale and burst to **175/s** (now within the limit), and a
 per-batch row lock capped delivery at ~52/s per channel (now ~90/s).
 Each has a regression test; [ADR 007](docs/adr/007-relay-owned-side-effects.md)
 records the change.
@@ -301,10 +362,10 @@ production refuses development secrets). Defaults suit local development;
 |---|---|
 | General | `APP_ENV` (development), `SHUTDOWN_TIMEOUT` (20s), `LOG_LEVEL` (info), `LOG_FORMAT` (json) |
 | HTTP | `HTTP_ADDR` (:8080), `HTTP_READ_HEADER_TIMEOUT` (5s), `HTTP_READ_TIMEOUT` (15s), `HTTP_WRITE_TIMEOUT` (15s), `HTTP_IDLE_TIMEOUT` (60s), `HTTP_MAX_BODY_BYTES` (5 MiB) |
-| Auth | `API_KEYS` (comma-separated; dev key), `IDEMPOTENCY_TTL` (24h) |
+| Auth | `API_KEYS` (comma-separated; dev key), `IDEMPOTENCY_TTL` (24h), `IDEMPOTENCY_STALE_AFTER` (1m) |
 | Storage | `DATABASE_URL`, `DATABASE_MAX_CONNS` (20), `DATABASE_MIN_CONNS` (2), `REDIS_URL` |
 | Provider | `PROVIDER_URL` (mock), `PROVIDER_URL_SMS` / `_EMAIL` / `_PUSH` (per-channel overrides), `PROVIDER_TIMEOUT` (10s) |
-| Worker | `WORKER_RATE_LIMIT` (100/s per channel), `WORKER_RATE_HORIZON` (1s), `WORKER_CONCURRENCY` (100), `WORKER_BATCH_SIZE` (50), `WORKER_POLL_INTERVAL` (1s), `WORKER_LEASE` (30s), `WORKER_REAP_INTERVAL` (10s), `WORKER_PRIORITY_AGING` (5m), `WORKER_EXPECTED_INSTANCES` (1), `WORKER_ID` |
+| Worker | `WORKER_RATE_LIMIT` (95/s per channel), `WORKER_RATE_HORIZON` (1s), `WORKER_CONCURRENCY` (100), `WORKER_BATCH_SIZE` (50), `WORKER_POLL_INTERVAL` (1s), `WORKER_LEASE` (30s), `WORKER_REAP_INTERVAL` (10s), `WORKER_PRIORITY_AGING` (5m), `WORKER_EXPECTED_INSTANCES` (1), `WORKER_ID` |
 | Retry and breaker | `RETRY_BASE_DELAY` (2s), `RETRY_MAX_DELAY` (5m), `BREAKER_WINDOW` (10s), `BREAKER_MIN_REQUESTS` (20), `BREAKER_FAILURE_RATIO` (0.5), `BREAKER_OPEN_TIMEOUT` (30s), `BREAKER_PROBES` (5) |
 | Events | `EVENTS_STREAM`, `EVENTS_STREAM_MAX_LEN` (100,000), `OUTBOX_BATCH_SIZE` (500), `OUTBOX_POLL_INTERVAL` (100ms), `OUTBOX_RETENTION` (24h), `OUTBOX_PRUNE_INTERVAL` (10m) |
 | Callbacks | `CALLBACK_SIGNING_SECRET`, `CALLBACK_TIMEOUT` (5s), `CALLBACK_MAX_ATTEMPTS` (5), `CALLBACK_CONCURRENCY` (20), `CALLBACK_RETRY_BASE_DELAY` (5s), `CALLBACK_RETRY_MAX_DELAY` (10m), `CALLBACK_LEASE` (1m), `CALLBACK_POLL_INTERVAL` (1s), `CALLBACK_ALLOW_INSECURE` / `_PRIVATE` (false; development only) |

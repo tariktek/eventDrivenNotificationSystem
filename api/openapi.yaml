@@ -42,6 +42,8 @@ info:
     `{"action":"subscribe","notification_ids":[...],"batch_ids":[...],"channels":[...]}`,
     to receive `notification.created`, `notification.status_changed` and
     `batch.completed` events. See that operation for the full protocol.
+    Each event is delivered once per connection, in order per notification:
+    a repeat (`event_id` already sent) or an older event is dropped.
   contact:
     name: Tarık Tek
 
@@ -155,8 +157,11 @@ paths:
       description: |
         All-or-nothing: if any item is invalid, nothing is stored and the
         `422` response lists every problem by item index. Items whose
-        `idempotency_key` already exists are not created again; they are
-        returned with `duplicate: true`.
+        `idempotency_key` already exists for the same request are not
+        created again; they are returned with `duplicate: true`. An item
+        whose key exists for a different request fails the whole batch with
+        `422 idempotency_key_reused` (field `items[i].idempotency_key`). A
+        batch of duplicates only is complete at once.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
@@ -780,7 +785,13 @@ components:
           type: string
           minLength: 1
           maxLength: 255
-          description: At most one notification ever exists per key.
+          description: |
+            At most one notification ever exists per key. Repeating the
+            same request returns the existing notification (`duplicate:
+            true` in a batch); the same key with a different request
+            (another recipient, content, template, schedule, ...) is
+            rejected with `422 idempotency_key_reused` instead of silently
+            returning the other notification.
         max_attempts:
           type: integer
           minimum: 1
@@ -856,12 +867,22 @@ components:
       example: { attempt_no: 1, outcome: transient_error, status_code: 503, error_code: http_503, error: "provider unavailable", duration_ms: 48, created_at: "2026-11-18T10:00:00.051Z" }
       required: [attempt_no, outcome, duration_ms, created_at]
       properties:
-        attempt_no: { type: integer }
+        attempt_no:
+          type: integer
+          description: |
+            1, 2, 3, ... across the notification's whole life: it keeps
+            counting after a manual retry or redrive (which only reset the
+            attempt budget).
         outcome:
           type: string
           enum: [success, transient_error, permanent_error]
         status_code: { type: integer, description: Provider HTTP status; absent on network errors. }
-        error_code: { type: string }
+        error_code:
+          type: string
+          description: |
+            Why the attempt failed. On a success, `unexpected_provider_response`
+            notes a 2xx whose body did not follow the provider contract: it
+            still counts as delivered (resending would duplicate it).
         error: { type: string }
         provider_message_id: { type: string }
         duration_ms: { type: integer }
@@ -932,7 +953,7 @@ components:
         status: { $ref: "#/components/schemas/Status" }
         duplicate:
           type: boolean
-          description: True when the item's idempotency_key already existed and no new notification was created.
+          description: True when the item's idempotency_key already existed for the same request and no new notification was created.
 
     Batch:
       type: object
@@ -1058,7 +1079,9 @@ components:
         pending_by_priority:
           type: object
           additionalProperties: { type: integer, format: int64 }
-        oldest_pending_age_seconds: { type: number }
+        oldest_pending_age_seconds:
+          type: number
+          description: How long the oldest due notification has been waiting, pending or scheduled (a scheduled one counts from its scheduled time).
 
     WindowStats:
       type: object
