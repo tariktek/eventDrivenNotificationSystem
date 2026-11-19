@@ -66,6 +66,36 @@ jobs:
       - name: Test (testcontainers, Docker is preinstalled on the runner)
         run: make test
 
+  # The evaluator's path: nothing but Docker on the machine.
+  test-docker:
+    name: All tests with only Docker (docker compose --profile test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test
+        run: docker compose --profile test run --rm test
+
+  # The README quick start, from scratch: the whole stack comes up and
+  # delivers a notification.
+  compose-smoke:
+    name: Compose quick start (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start the stack and send one notification
+        run: bash scripts/compose-smoke.sh
+
+  # Same on arm64 (Apple Silicon users run the arm64 images). GitHub's arm64
+  # runners are free for public repositories only.
+  compose-smoke-arm64:
+    name: Compose quick start (arm64)
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start the stack and send one notification
+        run: bash scripts/compose-smoke.sh
+
   build:
     name: Build
     runs-on: ubuntu-latest

@@ -88,6 +88,10 @@ FUZZTIME ?= 30s
 test: ## Run every test: unit, integration and end-to-end (needs Docker)
 	go test $(RACE) -count=1 -p 1 -tags=integration ./...
 
+.PHONY: test-docker
+test-docker: ## Run every test with only Docker installed (no Go, no make needed: see the command below)
+	docker compose --profile test run --rm test
+
 .PHONY: test-unit
 test-unit: ## Run unit tests only (no Docker, seconds)
 	go test $(RACE) -count=1 ./...

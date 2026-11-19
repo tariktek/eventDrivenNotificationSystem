@@ -1,5 +1,10 @@
 name: notification-system
 
+# Host ports are the usual ones by default. If one is already taken on your
+# machine (a local PostgreSQL on 5432, say), override it in .env, e.g.
+# POSTGRES_PORT=15432. The containers talk to each other over the compose
+# network, so only your browser and tools see the change.
+
 # Settings shared by every application container.
 x-app: &app
   build:
@@ -59,7 +64,7 @@ services:
       POSTGRES_PASSWORD: notification
       POSTGRES_DB: notification
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -74,7 +79,7 @@ services:
     # Append-only file so Redis Streams survive a container restart.
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
     healthcheck:
@@ -100,7 +105,7 @@ services:
   api:
     <<: *app
     ports:
-      - "8080:8080"
+      - "${API_PORT:-8080}:8080"
 
   worker:
     <<: *app
@@ -125,7 +130,7 @@ services:
       MOCK_PERMANENT_FAILURE_RATE: ${MOCK_PERMANENT_FAILURE_RATE:-0}
       MOCK_CALLBACK_SECRET: ${CALLBACK_SIGNING_SECRET:-dev-callback-secret-change-me}
     ports:
-      - "9000:9000"
+      - "${MOCK_PORT:-9000}:9000"
     healthcheck:
       test: ["CMD", "/app/healthcheck", "http://127.0.0.1:9000/health"]
       interval: 5s
@@ -140,7 +145,7 @@ services:
     volumes:
       - ./deploy/prometheus:/etc/prometheus:ro
     ports:
-      - "9090:9090"
+      - "${PROMETHEUS_PORT:-9090}:9090"
     restart: unless-stopped
 
   # Grafana: http://localhost:3000 (dashboard "Notification System";
@@ -156,7 +161,7 @@ services:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3000}:3000"
     depends_on: [prometheus]
     restart: unless-stopped
 
@@ -170,7 +175,7 @@ services:
       COLLECTOR_OTLP_ENABLED: "true"
       MEMORY_MAX_TRACES: "20000"
     ports:
-      - "16686:16686"
+      - "${JAEGER_PORT:-16686}:16686"
     restart: unless-stopped
 
   # Load tests (not started by "up"): make test-load, or
@@ -188,6 +193,30 @@ services:
       api:
         condition: service_healthy
 
+  # Every test (unit, integration, end-to-end) with nothing but Docker on
+  # the machine: no Go, no make. The integration tests start their own
+  # PostgreSQL and Redis containers through the mounted Docker socket.
+  #   docker compose --profile test run --rm test
+  test:
+    image: golang:1.27-alpine
+    profiles: ["test"]
+    working_dir: /src
+    volumes:
+      - .:/src
+      - /var/run/docker.sock:/var/run/docker.sock
+      - gomodcache:/go/pkg/mod
+      - gobuildcache:/root/.cache/go-build
+    environment:
+      CGO_ENABLED: "0"
+      # The test containers' ports are published on the Docker host, which
+      # this container reaches as host.docker.internal.
+      TESTCONTAINERS_HOST_OVERRIDE: host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["go", "test", "-count=1", "-p", "1", "-tags=integration", "./..."]
+
 volumes:
   pgdata:
   redisdata:
+  gomodcache:
+  gobuildcache:
