@@ -276,3 +276,34 @@ func TestSubscriptionLimitCountsDistinctNewIDs(t *testing.T) {
 	send(t, c, map[string]any{"action": "subscribe", "batch_ids": more})
 	assert.Equal(t, "error", read(t, c).Type, "1001 distinct ids is over the limit")
 }
+
+// TestRepublishedEventsAreForwardedOnce: the relay publishes events again
+// when it could not mark them published. A client must not see them twice,
+// nor a notification go from sent back to an earlier status.
+func TestRepublishedEventsAreForwardedOnce(t *testing.T) {
+	s := newServer(t, realtime.Config{MaxClients: 10, BufferSize: 64})
+	c := dial(t, s, "all=true")
+	waitClients(t, s, 1)
+
+	n := uuid.New()
+	pending := notificationEvent(n, uuid.New(), "sms", "pending")
+	sent := notificationEvent(n, uuid.New(), "sms", "sent")
+	other := notificationEvent(uuid.New(), uuid.New(), "sms", "pending")
+	// Event ids only increase per notification: a lower id of another
+	// notification arriving later is still news.
+	other.ID = pending.ID - 1
+	for _, e := range []events.Event{pending, sent, pending, sent, other} {
+		s.hub.Publish(e)
+	}
+
+	var got []int64
+	for range 3 {
+		got = append(got, read(t, c).EventID)
+	}
+	assert.Equal(t, []int64{pending.ID, sent.ID, other.ID}, got)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	_, _, err := c.Read(ctx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded, "nothing else arrives")
+}

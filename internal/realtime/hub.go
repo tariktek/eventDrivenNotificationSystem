@@ -7,7 +7,8 @@
 //
 // Ordering: the hub handles events one at a time, in stream order, and
 // each client has a FIFO queue, so a client sees one notification's status
-// changes in the order they happened.
+// changes in the order they happened. Events the relay published twice are
+// forwarded once, and none older than one already forwarded (see dedup).
 //
 // Backpressure: a client's queue holds BufferSize messages. A client that
 // cannot keep up is disconnected instead of making the hub wait or buffer
@@ -37,6 +38,9 @@ type Config struct {
 	BufferSize int
 	// Clients, if set, tracks the number of connections.
 	Clients prometheus.Gauge
+	// DedupAggregates is how many notifications and batches the hub
+	// remembers the last forwarded event of (default 100,000; about 3 MB).
+	DedupAggregates int
 }
 
 // Hub fans events out to subscribed clients.
@@ -46,11 +50,15 @@ type Hub struct {
 
 	mu      sync.RWMutex
 	clients map[*client]struct{}
+	seen    *dedup
 }
 
 // NewHub returns a Hub.
 func NewHub(cfg Config, log *slog.Logger) *Hub {
-	return &Hub{cfg: cfg, log: log, clients: map[*client]struct{}{}}
+	if cfg.DedupAggregates <= 0 {
+		cfg.DedupAggregates = 100_000
+	}
+	return &Hub{cfg: cfg, log: log, clients: map[*client]struct{}{}, seen: newDedup(cfg.DedupAggregates)}
 }
 
 // ErrFull is returned when the hub has MaxClients connections.
@@ -107,6 +115,9 @@ type outMessage struct {
 func (h *Hub) Publish(e events.Event) {
 	if h.Clients() == 0 {
 		return // the usual case: nobody is watching, skip decoding
+	}
+	if !h.seen.fresh(e.AggregateID, e.ID) {
+		return // republished, or older than what clients already have
 	}
 	var k eventKeys
 	if err := json.Unmarshal(e.Payload, &k); err != nil {
