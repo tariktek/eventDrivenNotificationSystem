@@ -18,6 +18,14 @@ func TestMaskRecipient(t *testing.T) {
 	assert.Equal(t, "a***@example.com", MaskRecipient("ada.lovelace@example.com"))
 	assert.Equal(t, "***", MaskRecipient("fcm:device-token-abc"))
 	assert.Equal(t, "***", MaskPhone("+1234"))
+	// Short numbers the API accepts must still have digits hidden.
+	assert.Equal(t, "+123***789", MaskPhone("+123456789"))
+	assert.Equal(t, "+123***78", MaskPhone("+12345678"))
+	for _, n := range []string{"+12345678", "+123456789", "+1234567890", "+905551234567", "+123456789012345"} {
+		masked := MaskPhone(n)
+		hidden := len(n) - (len(masked) - len("***"))
+		assert.GreaterOrEqual(t, hidden, 3, "%s → %s hides too little", n, masked)
+	}
 	assert.Equal(t, "***", MaskEmail("@nobody"))
 }
 

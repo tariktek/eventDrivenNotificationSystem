@@ -25,12 +25,18 @@ var (
 )
 
 // MaskPhone keeps enough of a number to tell numbers apart in a support
-// case: "+905551234567" → "+90555***4567".
+// case, "+905551234567" → "+90555***4567", but always hides at least three
+// digits (a quarter of a long number): a short number such as
+// "+123456789" becomes "+123***789", not all of its digits on show.
 func MaskPhone(s string) string {
-	if len(s) <= 8 {
+	digits := len(s) - 1 // after the "+"
+	if digits < 6 {
 		return "***"
 	}
-	return s[:6] + "***" + s[len(s)-4:]
+	visible := digits - max(3, digits/4)
+	suffix := min(4, visible/2)
+	prefix := min(5, visible-suffix)
+	return s[:1+prefix] + "***" + s[len(s)-suffix:]
 }
 
 // MaskEmail keeps the first letter and the domain: "ada@example.com" →
